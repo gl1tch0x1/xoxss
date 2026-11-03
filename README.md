@@ -1,8 +1,8 @@
 <div align="center">
-  <img src="assets/logo.png" alt="XOX$$ logo" width="240">
+  <img src="assets/logo.svg" alt="XOXSS logo" width="240">
 </div>
 
-# XOX$$
+<h1 align="center">XOXSS</h1>
 
 <div align="center">
 
@@ -19,11 +19,11 @@
 <br/>
 
 > [!WARNING]
-> XOX$$ sends attack payloads. Use it only against systems you own or have explicit
+> XOXSS sends attack payloads. Use it only against systems you own or have explicit
 > written permission to test. You are responsible for the targets you scan and for the
 > data your payloads, callbacks and reports collect.
 
-XOX$$ (`xoxss`) is a Python XSS scanner built around one rule: **evidence before
+XOXSS (`xoxss`) is a Python XSS scanner built around one rule: **evidence before
 findings**. It probes over HTTP first, classifies the reflection context, and only then
 asks a real browser to prove execution. The same engine also covers passive
 reconnaissance, JavaScript intelligence, OpenAPI operations, blind XSS through
@@ -844,7 +844,7 @@ unconfirmed finding promoted to `confirmed` without evidence.
 
 ## Security and legal
 
-- Use XOX$$ only against systems you own or have explicit written permission to test.
+- Use XOXSS only against systems you own or have explicit written permission to test.
 - Respect scope files, rate limits and program rules. A scanner that ignores scope is a
   liability, not a tool.
 - Blind payloads may send cookies and page URLs to a collector; use only collectors you
