@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -570,17 +571,24 @@ class PlaywrightEngine:
             self.console.error(f"Could not start Playwright: {exc}")
             return False
 
-        attempts: List[Dict[str, Any]] = [launch, dict(launch, channel="chrome"), dict(launch, channel="msedge")]
+        attempts: List[Dict[str, Any]] = [launch]
+        if not self.binary:
+            # Branded builds are opportunistic fallbacks; with --binary the
+            # operator pinned the executable and channels are irrelevant.
+            attempts += [dict(launch, channel="chrome"), dict(launch, channel="msedge")]
         last_error: Optional[Exception] = None
+        first_error: Optional[Exception] = None
         for attempt in attempts:
             try:
                 self._browser = await self._pw.chromium.launch(**attempt)
                 break
             except Exception as exc:  # try the next channel
                 last_error = exc
+                if first_error is None:
+                    first_error = exc
         if self._browser is None:
             await self.stop()
-            self.console.error(f"Could not start Playwright Chromium: {last_error}")
+            self._report_launch_failure(first_error or last_error)
             return False
 
         context_options: Dict[str, Any] = {
@@ -607,6 +615,47 @@ class PlaywrightEngine:
             important=False,
         )
         return True
+
+    def _report_launch_failure(self, error: Optional[Exception]) -> None:
+        """Turn a raw playwright launch stack into an actionable diagnosis.
+
+        The channel-fallback chain means the *last* exception often describes an
+        unrelated branded build (chrome/msedge); the primary report therefore
+        focuses on why the bundled Chromium failed and keeps stack details in
+        the debug channel.
+        """
+        text = str(error or "").strip()
+        lowered = text.lower()
+        missing = (
+            "executable doesn't exist" in lowered
+            or "not found at" in lowered
+            or "no such file" in lowered
+        )
+        if missing:
+            channel: Optional[str] = None
+            match = re.search(r"distribution '([^']+)'", text)
+            if match:
+                channel = match.group(1)
+            if channel:
+                hint = (
+                    f"the '{channel}' Chromium build is not installed on this machine - "
+                    "run `playwright install chromium` for the bundled build, "
+                    f"or install {channel} system-wide"
+                )
+            elif "ms-playwright" in text or "chromium" in lowered:
+                # The bundled download lives under ~/.cache/ms-playwright/.
+                hint = (
+                    "the bundled Chromium build is not downloaded - "
+                    "run `playwright install chromium`"
+                )
+            else:
+                hint = "no usable Chromium was found - run `playwright install chromium`"
+            self.console.error(f"Could not start Playwright Chromium: {hint}")
+            self.console.debug(f"playwright launch error: {text}")
+        else:
+            base = text.splitlines()[0] if text else "unknown error"
+            self.console.error(f"Could not start Playwright Chromium: {base}")
+            self.console.debug(f"playwright launch error: {text}")
 
     async def stop(self) -> None:
         for resource in (self._context, self._browser):
