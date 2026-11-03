@@ -1,0 +1,6 @@
+{
+  "include": ["xoxss.py"],
+  "exclude": ["**/__pycache__", ".venv"],
+  "venvPath": ".",
+  "venv": ".venv"
+}
