@@ -28,17 +28,44 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
+sys.path.insert(0, str(ROOT))
+try:
+    from xoxss.utils import ui
+except Exception:  # engine optional; keep the updater alive on broken checkouts
+    ui = None
+
+
+def _emit(label: str, color: str, message: str, stream=sys.stdout) -> None:
+    if ui is not None and ui.enabled():
+        print(
+            f"{ui.paint('[', ui.GREY)}{ui.paint(label, color)}"
+            f"{ui.paint(']', ui.GREY)} {message}", file=stream,
+        )
+    else:
+        print(f"[{label}] {message}", file=stream)
+
 
 def info(message: str) -> None:
-    print(f"[+] {message}")
+    _emit("+", ui.GREEN if ui else "", message)
 
 
 def warn(message: str) -> None:
-    print(f"[!] {message}")
+    _emit("!", ui.YELLOW if ui else "", message)
 
 
 def step(message: str) -> None:
-    print(f"->  {message}")
+    if ui is not None and ui.enabled():
+        print(f"{ui.paint(ui.glyphs()['arrow'] + ' ', ui.BRAND_BRIGHT, ui.BOLD)}{message}")
+    else:
+        print(f"->  {message}")
+
+
+def version_line(old: str, new: str) -> str:
+    if ui is not None and ui.enabled():
+        return (f"{ui.paint(old, ui.GREY)} "
+                f"{ui.paint('\u2192', ui.BRAND, ui.BOLD)} "
+                f"{ui.paint(new, ui.GREEN, ui.BOLD)}")
+    return f"{old} -> {new}"
 
 
 def die(message: str, code: int = 1) -> "None":
@@ -100,19 +127,36 @@ def fetch_state(branch: str) -> tuple[int, int]:
 
 
 def check_only(branch: str) -> int:
-    print("XOXSS update check")
-    print("=" * 60)
-    info(f"installed / checked-out version: {local_version()}")
+    if ui is not None and ui.enabled():
+        print(ui.panel("xoxss updater - update check", [
+            f"{ui.paint('version', ui.GREY)}  {local_version()}",
+            f"{ui.paint('branch', ui.GREY)}   {branch}",
+        ]))
+    else:
+        print("XOXSS update check")
+        print("=" * 60)
     behind, ahead = fetch_state(branch)
-    info(f"{branch}: {behind} commit(s) behind origin, {ahead} ahead")
     if behind:
+        info(f"{behind} commit(s) behind origin, {ahead} ahead - an update is available")
         log = out(git(["log", "--oneline", f"HEAD..origin/{branch}", "-n", "15"]))
-        print("    incoming commits:")
-        for line in log.splitlines():
-            print(f"      {line}")
+        lines = [
+            f"{ui.paint(ui.glyphs()['bullet'] + ' ' + commit, ui.CYAN)}"
+            if ui is not None and ui.enabled() else f"      {commit}"
+            for commit in log.splitlines()
+        ]
+        if ui is not None and ui.enabled():
+            print(ui.panel("incoming commits", lines, accent=ui.CYAN))
+        else:
+            print("    incoming commits:")
+            for line_text in lines:
+                print(f"    {line_text}")
         warn("run `python updater.py` to update")
         return 1
-    info("already up to date")
+    if ui is not None and ui.enabled():
+        print(f"{ui.paint(ui.glyphs()['tick'] + ' already up to date', ui.GREEN)} "
+              f"{ui.paint(f'({ahead} ahead)', ui.DIM)}")
+    else:
+        info(f"already up to date ({ahead} ahead)")
     return 0
 
 
@@ -130,9 +174,16 @@ def stash_if_needed(auto_yes: bool) -> None:
 
 def update(branch: str, auto_yes: bool, extras: list[str]) -> int:
     old_version = local_version()
-    print("XOXSS updater")
-    print("=" * 60)
-    info(f"current version: {old_version}")
+    if ui is not None and ui.enabled():
+        print(ui.panel("xoxss updater", [
+            f"{ui.paint('version', ui.GREY)}  {old_version}",
+            f"{ui.paint('branch', ui.GREY)}   {branch}",
+            f"{ui.paint('policy', ui.GREY)}   fast-forward only - history is never rewritten",
+        ]))
+    else:
+        print("XOXSS updater")
+        print("=" * 60)
+        info(f"current version: {old_version}")
 
     stash_if_needed(auto_yes)
     behind, ahead = fetch_state(branch)
@@ -141,13 +192,25 @@ def update(branch: str, auto_yes: bool, extras: list[str]) -> int:
         warn(f"local branch is {ahead} commit(s) ahead of origin/{branch}; "
              "your commits stay intact, the update only fast-forwards shared history.")
     if behind == 0:
-        info("code is already up to date")
+        if ui is not None and ui.enabled():
+            print(f"{ui.paint(ui.glyphs()['tick'] + ' code is already up to date', ui.GREEN)}")
+        else:
+            info("code is already up to date")
+        new_version = old_version
     else:
         log = out(git(["log", "--oneline", f"HEAD..origin/{branch}", "-n", "15"]))
         incoming = len(out(git(["rev-list", f"HEAD..origin/{branch}"])).splitlines())
-        info(f"{incoming} new commit(s) available:")
-        for line in log.splitlines():
-            print(f"      {line}")
+        log_lines = [
+            f"{ui.paint(ui.glyphs()['bullet'] + ' ' + commit, ui.CYAN)}"
+            if ui is not None and ui.enabled() else commit
+            for commit in log.splitlines()
+        ]
+        if ui is not None and ui.enabled():
+            print(ui.panel(f"{incoming} incoming commit(s)", log_lines, accent=ui.CYAN))
+        else:
+            info(f"{incoming} new commit(s) available:")
+            for line_text in log_lines:
+                print(f"      {line_text}")
 
         step(f"Fast-forwarding {branch} to origin/{branch}")
         result = git(["pull", "--ff-only", "origin", branch], check=False)
@@ -155,7 +218,8 @@ def update(branch: str, auto_yes: bool, extras: list[str]) -> int:
             die(f"update failed:\n{(result.stderr or result.stdout).strip()}\n"
                 "If you rebased or rewrote history locally, resolve it manually "
                 "or re-clone.", 1)
-        info(f"updated {branch}: {old_version} -> {local_version()}")
+        new_version = local_version()
+        info(f"updated {branch}: {version_line(old_version, new_version)}")
 
     # Refresh the installed package so the running tool matches the new code.
     step("Refreshing the installed package (pip install -U .)")
@@ -177,7 +241,11 @@ def update(branch: str, auto_yes: bool, extras: list[str]) -> int:
         text=True, timeout=60)
     new_version = result.stdout.strip() or "unknown"
     if result.returncode == 0:
-        info(f"scanner now reports: {new_version}")
+        if ui is not None and ui.enabled():
+            print(f"{ui.paint(ui.glyphs()['tick'] + ' scanner now reports', ui.GREEN)} "
+                  f"{ui.paint(new_version, ui.BOLD)}")
+        else:
+            info(f"scanner now reports: {new_version}")
     info(f"verify with: {sys.executable} -m xoxss --doctor")
     return 0
 

@@ -189,11 +189,10 @@ from xoxss.reports.sarif import (  # noqa: E402
     sarif_rule_id,
 )
 
-
-from xoxss.reports.sarif import (  # noqa: E402
-    build_sarif_document,
-    sarif_rule_id,
-)
+try:
+    from xoxss.utils import ui as _ui
+except Exception:  # pragma: no cover - standalone checkout edge case
+    _ui = None
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never executed
     # These imports exist purely for static analysis. The runtime import below is
@@ -710,7 +709,26 @@ class Console:
         if not label:
             return ""
         colour = colors.get(level, "")
-        return f"{colour}{label}{bcolors.ENDC} " if colour else f"{label} "
+        if not colour:
+            return f"{label} "
+        if level == "error":
+            # Errors stay loud: bold red, no subtlety.
+            return f"{bcolors.FAIL}{bcolors.BOLD}{label}{bcolors.ENDC} "
+        # Dim brackets, loud glyph - the level reads instantly when scrolling.
+        return (
+            f"{bcolors.GREY}[{bcolors.ENDC}{colour}{label[1]}{bcolors.ENDC}"
+            f"{bcolors.GREY}]{bcolors.ENDC} "
+        )
+
+    def rule(self, text: str = "", *, important: bool = True) -> None:
+        """Styled section header (`-- TITLE ---------------` on plain encodings)."""
+        if self.quiet:
+            return
+        if _ui is not None:
+            line = _ui.rule(text, width=self._width() - 1)
+        else:
+            line = f"-- {text.upper()} ".ljust(self._width(), "-")
+        self._emit("raw", line, important=True)
 
     def _wrap(self, message: str, width: int) -> str:
         lines: List[str] = []
@@ -731,8 +749,13 @@ class Console:
             return
         width = self._width()
         prefix = self._prefix(level)
-        body = self._wrap(sanitize_text(message), width - 4)
-        body_lines = body.split("\n")
+        if level == "raw":
+            # Hand-formatted output (banner, rules, tables, panels) is laid out
+            # by its caller; re-wrapping it would break columns and rules.
+            body_lines = sanitize_text(message).split("\n")
+        else:
+            body = self._wrap(sanitize_text(message), width - 4)
+            body_lines = body.split("\n")
         text = prefix + body_lines[0]
         for line in body_lines[1:]:
             text += "\n    " + line
@@ -781,20 +804,27 @@ class Console:
         self._emit("raw", message, important=True)
 
     def finding(self, finding: "Finding") -> None:
+        confidence_style = {
+            "confirmed": f"{bcolors.FAIL}{bcolors.BOLD}",
+            "high": f"{bcolors.WARNING}{bcolors.BOLD}",
+            "medium": f"{bcolors.WARNING}",
+            "low": f"{bcolors.GREY}",
+        }.get(finding.confidence, bcolors.ENDC)
         lines = [
-            f"{finding.kind}  [{finding.confidence}]",
-            f"URL        : {finding.url}",
-            f"Parameter  : {finding.parameter} ({finding.method})",
-            f"Payload    : {finding.payload}",
+            f"{bcolors.BOLD}{finding.kind}{bcolors.ENDC}  "
+            f"{confidence_style}[{finding.confidence}]{bcolors.ENDC}",
+            f"{bcolors.GREY}URL        :{bcolors.ENDC} {finding.url}",
+            f"{bcolors.GREY}Parameter  :{bcolors.ENDC} {finding.parameter} ({finding.method})",
+            f"{bcolors.GREY}Payload    :{bcolors.ENDC} {finding.payload}",
         ]
         if finding.context:
-            lines.append(f"Context    : {finding.context}")
+            lines.append(f"{bcolors.GREY}Context    :{bcolors.ENDC} {finding.context}")
         if finding.evidence:
-            lines.append(f"Evidence   : {finding.evidence}")
+            lines.append(f"{bcolors.GREY}Evidence   :{bcolors.ENDC} {truncate(finding.evidence, 240)}")
         if finding.detail:
-            lines.append(f"Detail     : {finding.detail}")
+            lines.append(f"{bcolors.GREY}Detail     :{bcolors.ENDC} {finding.detail}")
         if finding.screenshot:
-            lines.append(f"Screenshot : {finding.screenshot}")
+            lines.append(f"{bcolors.GREY}Screenshot :{bcolors.ENDC} {finding.screenshot}")
         self._emit("ok", "\n".join(lines), important=True)
 
 
@@ -828,21 +858,27 @@ def banner(console: Optional[Console] = None) -> None:
     except (UnicodeEncodeError, LookupError):
         art = BANNER_ASCII
 
-    painted = art.replace("█", f"{bcolors.OKCYAN}█{bcolors.ENDC}").replace(
-        "╗", f"{bcolors.OKCYAN}╗{bcolors.ENDC}"
-    )
-    if art is BANNER_ASCII:
-        painted = f"{bcolors.OKCYAN}{art}{bcolors.ENDC}"
+    painted = _ui.paint_ramp(art) if _ui is not None else None
+    if painted is None:
+        if art is BANNER_ASCII:
+            painted = f"{bcolors.OKCYAN}{art}{bcolors.ENDC}"
+        else:
+            painted = art.replace("█", f"{bcolors.OKCYAN}█{bcolors.ENDC}").replace(
+                "╗", f"{bcolors.OKCYAN}╗{bcolors.ENDC}"
+            )
 
     subtitle = (
         f"  {bcolors.BOLD}{bcolors.OKCYAN}{APP_NAME}{bcolors.ENDC}"
-        f"{bcolors.DIM} - Advanced Automated XSS Scanner{bcolors.ENDC}"
-        f"  {bcolors.WARNING}v{VERSION}{bcolors.ENDC}"
+        f"{bcolors.DIM}  -  Advanced Automated XSS Scanner  -  v{VERSION}{bcolors.ENDC}"
+        f"  {bcolors.WARNING}{bcolors.BOLD}{CODENAME}{bcolors.ENDC}"
     )
     meta = (
         f"  {bcolors.DIM}stateful / context-aware / browser-verified / "
         f"{CODENAME.lower()}{bcolors.ENDC}"
     )
+    if _ui is not None and _ui.enabled():
+        underline = _ui.rule("", width=46)
+        meta = f"{meta}\n  {underline}"
     text = f"{painted}\n{subtitle}\n{meta}"
     if console is not None:
         console.raw(text)
@@ -2799,6 +2835,7 @@ class XSSScanner:
             )
 
         try:
+            self.console.rule("recon & waf fingerprint")
             self.waf = await WAFDetector(self.http, self.console, self.target).detect()
             self.state.waf = list(self.waf.names)
 
@@ -2814,7 +2851,10 @@ class XSSScanner:
             urls = await self.prepare_urls()
             self.stats.urls_total = len(urls)
             self.console.info(f"Scanning {len(urls)} URL(s) with {self.args.threads} worker(s)")
+            self.console.rule("attack")
             await self._scan_urls(urls)
+            await self._run_external_findings(urls)
+            await self._drain_oob()
             await self._run_external_findings(urls)
             await self._drain_oob()
         except asyncio.CancelledError:
@@ -2840,6 +2880,7 @@ class XSSScanner:
             self.state.extra["endpoints"] = sorted(self.endpoints)[:5000]
             self.state.save(force=True)
 
+        self.console.rule("reports & summary")
         self.print_summary()
         self.write_reports()
 
@@ -3058,16 +3099,46 @@ class XSSScanner:
 
     async def _status_loop(self) -> None:
         last = self.stats.requests
+        tick = 0
+        rps = 0
+        spin = 0
         while not self._stop.is_set():
-            await asyncio.sleep(1.0)
-            rps = self.stats.requests - last
-            last = self.stats.requests
-            self.console.set_status(
-                f"{bcolors.DIM}[ rps {rps:>3} | req {self.stats.requests:>6} | "
-                f"urls {self.stats.urls_done}/{self.stats.urls_total} | "
-                f"points {self.stats.points} | payloads {self.stats.payloads} | "
-                f"findings {len(self.findings)} ]{bcolors.ENDC}"
-            )
+            await asyncio.sleep(0.25)
+            tick += 1
+            if tick % 4 == 0:
+                rps = self.stats.requests - last
+                last = self.stats.requests
+            spin = (spin + 1) % 10
+            self.console.set_status(self._render_status(rps, spin))
+
+    def _render_status(self, rps: int, spin: int) -> str:
+        s = self.stats
+        dim = bcolors.DIM
+        label = bcolors.GREY
+        bold = bcolors.BOLD
+        if _ui is not None and _ui.enabled():
+            spinner = _ui.paint(_ui.SPINNER[spin % len(_ui.SPINNER)], _ui.BRAND_BRIGHT)
+            sep = _ui.paint("|", bcolors.GREY)
+        else:
+            spinner = ""
+            sep = "|"
+        findings_word = "findings "
+        findings_val = len(self.findings)
+        findings_part = (
+            f"{bcolors.FAIL}{bcolors.BOLD}{findings_word}{findings_val}{bcolors.ENDC}"
+            if findings_val
+            else f"{label}{findings_word}{findings_val}{bcolors.ENDC}"
+        )
+        return (
+            f"{spinner} {dim}[ {bcolors.ENDC}"
+            f"{label}rps{bcolors.ENDC} {bold}{rps:>3}{bcolors.ENDC} {dim}{sep}{bcolors.ENDC} "
+            f"{label}req{bcolors.ENDC} {bold}{s.requests:>6}{bcolors.ENDC} {dim}{sep}{bcolors.ENDC} "
+            f"{label}urls{bcolors.ENDC} {bold}{s.urls_done}/{s.urls_total}{bcolors.ENDC} {dim}{sep}{bcolors.ENDC} "
+            f"{label}points{bcolors.ENDC} {bold}{s.points}{bcolors.ENDC} {dim}{sep}{bcolors.ENDC} "
+            f"{label}payloads{bcolors.ENDC} {bold}{s.payloads}{bcolors.ENDC} {dim}{sep}{bcolors.ENDC} "
+            f"{findings_part} "
+            f"{dim}]{bcolors.ENDC}"
+        )
 
     # -- discovery --------------------------------------------------------------------
     async def prepare_urls(self) -> List[str]:
@@ -4689,7 +4760,8 @@ class XSSScanner:
             return
         stats = self.stats
         self.console.raw("")
-        self.console.raw(f"{bcolors.BOLD}{bcolors.OKCYAN}Scan summary{bcolors.ENDC}")
+        self.console.rule("scan summary")
+        self.console.raw("")
         rows = [
             ("Target", self.target),
             ("Duration", fmt_duration(stats.elapsed)),
@@ -4720,8 +4792,30 @@ class XSSScanner:
             ("State file", str(self.state.path) if self.state.enabled else "disabled"),
         ]
         width = max(len(label) for label, _ in rows)
+        waf_label = self.waf.label().lower()
         for label, value in rows:
-            self.console.raw(f"  {bcolors.DIM}{label.ljust(width)}{bcolors.ENDC}  {value}")
+            value_style = ""
+            if label == "Findings":
+                value_style = f"{bcolors.FAIL}{bcolors.BOLD}" if self.findings else bcolors.GREY
+            elif label == "WAF" and waf_label not in ("none", "not detected"):
+                value_style = bcolors.WARNING
+            elif label == "Duration":
+                value_style = bcolors.ENDC
+            self.console.raw(
+                f"  {bcolors.DIM}{label.rjust(width)}{bcolors.ENDC}  "
+                f"{value_style}{value}{bcolors.ENDC}"
+            )
+
+        if self.findings:
+            self.console.raw(
+                f"  {bcolors.FAIL}{bcolors.BOLD}\u00bb {len(self.findings)} XSS finding(s) - "
+                f"triage the JSON/SARIF reports for full evidence{bcolors.ENDC}"
+            )
+        else:
+            self.console.raw(
+                f"  {bcolors.GREY}\u00bb no confirmed XSS findings in this pass "
+                f"(consider blind-XSS coverage){bcolors.ENDC}"
+            )
 
         if self.vulnerable_libs:
             self.console.raw("")
@@ -5991,11 +6085,18 @@ def run_doctor(console: Console, args: argparse.Namespace) -> int:
         elif status == "warn":
             warnings += 1
         colour = {"ok": bcolors.OKGREEN, "warn": bcolors.WARNING, "fail": bcolors.FAIL}[status]
-        label = {"ok": "ok  ", "warn": "warn", "fail": "fail"}[status]
-        console.raw(f"  {colour}{label}{bcolors.ENDC}  {name:<22} {detail}")
+        if _ui is not None and _ui.enabled():
+            gl = _ui.glyphs()
+            glyph = {"ok": gl["tick"], "warn": gl["warn"], "fail": gl["cross"]}[status]
+            glyph_part = f"{colour}{glyph}{bcolors.ENDC} "
+        else:
+            glyph_part = ""
+        label_style = f"{colour}{status:<4}{bcolors.ENDC}"
+        console.raw(f"  {glyph_part}{label_style} {bcolors.GREY}{name:<20}{bcolors.ENDC} {detail}")
 
     console.raw("")
-    console.raw(f"{APP_NAME} {VERSION} - environment check")
+    console.rule("environment check")
+    console.raw(f"  {bcolors.DIM}{APP_NAME} {VERSION} - verifying the installation{bcolors.ENDC}")
     console.raw("")
 
     if sys.version_info >= (3, 9):
@@ -6065,6 +6166,8 @@ def run_doctor(console: Console, args: argparse.Namespace) -> int:
         console.error(f"{problems} required component(s) missing, {warnings} warning(s)")
         return 1
     console.ok(f"Ready. {warnings} optional warning(s).")
+    if _ui is not None and _ui.enabled():
+        console.raw(f"  {_ui.rule('')}")
     return 0
 
 
@@ -6544,6 +6647,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.no_color or os.environ.get("NO_COLOR"):
         bcolors.disable()
+        if _ui is not None:
+            _ui.disable()
     if args.list_payloads:
         print_payloads()
         return 0
@@ -6595,7 +6700,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if token.startswith("--") and token.split("=", 1)[0] not in ("--god", "--yolo")
         }
         apply_god_preset(args, console, user_flags)
-        console.info("GOD MODE engaged: full-automatic maximum-aggression preset applied", important=True)
+        if _ui is not None and _ui.enabled() and not console.quiet:
+            diamond = _ui.glyphs()["diamond"]
+            console.raw(
+                f"  {bcolors.FAIL}{bcolors.BOLD}{diamond} GOD MODE ENGAGED{bcolors.ENDC}"
+                f"{bcolors.DIM}  full-automatic maximum-aggression preset  "
+                f"{bcolors.FAIL}{diamond}{bcolors.ENDC}"
+            )
+        else:
+            console.info("GOD MODE engaged: full-automatic maximum-aggression preset applied", important=True)
         console.info(
             f"god preset: crawl depth {args.crawl_depth}/{args.max_urls} URLs/{args.js_files} JS files, "
             f"{args.max_payloads} payloads per point, {args.threads} workers x {args.concurrency} requests, "
