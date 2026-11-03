@@ -234,6 +234,39 @@ pip install ".[interactsh]"        # native interactsh client
 pip install ".[playwright]"        # Playwright backend, then: playwright install chromium
 ```
 
+### Automated setup and updates
+
+The repository ships two helper scripts for hands-off setup and maintenance.
+Both run every pip call through the interpreter that started them
+(`sys.executable -m pip`), so they are safe inside virtual environments.
+
+```bash
+# interactive installer: installs the package, then asks about each optional extra
+python installer.py
+
+# non-interactive: installs everything, optional extras included
+python installer.py -y
+
+# skip the extras, or only verify prerequisites and current state
+python installer.py --no-extras
+python installer.py --check
+
+# update an existing git clone: fetch, fast-forward, refresh the install
+python updater.py
+
+# report whether an update is available, without changing anything
+python updater.py --check
+
+# auto-stash uncommitted changes, and refresh extras after updating
+python updater.py -y
+python updater.py -y --extras interactsh,playwright
+```
+
+The installer refuses to run outside a repository checkout and falls back to
+the core scanner even when an optional extra fails. The updater never rewrites
+history — it uses `git pull --ff-only` and aborts on uncommitted changes unless
+`-y` (auto-stash) is given.
+
 The bundled Docker image is intentionally HTTP-only: no browser, no external scanners,
 non-root user — suitable for reflection checks in CI:
 
