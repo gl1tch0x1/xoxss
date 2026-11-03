@@ -411,10 +411,10 @@ same options by workflow and include the default where one exists.
 | `--proto-pollution` | Runtime prototype-pollution proof, gadget fingerprinting and gadget URLs. |
 | `--dom-clobbering` | DOM clobbering analysis. |
 | `--trusted-types` | Trusted Types CSP analysis. |
-| `--graphql` | GraphQL endpoint XSS checks. |
-| `--websocket` | WebSocket XSS checks. |
-| `--file-upload` | File upload XSS analysis. |
-| `--postmessage` | `postMessage` handler analysis. |
+| `--graphql` | GraphQL endpoint detection and introspection exposure. |
+| `--websocket` | WebSocket sink analysis (`onmessage`/`eval` flows). |
+| `--file-upload` | File upload form discovery. |
+| `--postmessage` | `postMessage` handler analysis (origin validation). |
 | `--polyglot` | Use polyglot payloads for faster coverage. |
 | `--per-char-probe` | Per-character probing for precise context detection. |
 | `--smart-rate` | Adaptive smart rate limiting instead of a fixed token bucket. |
@@ -549,8 +549,9 @@ best-of-everything configuration and retries degraded setups instead of asking q
 - **Injection**: ≥ 16 payloads per injection point, ≥ 1500 remote payloads (plus the
   bundled LazyXss pack), header injection, stored-XSS hunting (20 pages) and
   reflection reporting.
-- **Analyzers**: polyglots, JSONP, prototype pollution, mXSS, CSP and CORS analysis and
-  adaptive smart rate limiting.
+- **Analyzers**: polyglots, JSONP, prototype pollution, mXSS, CSP and CORS analysis,
+  Trusted Types audit, DOM clobbering, `postMessage`, WebSocket, file-upload form and
+  GraphQL (introspection) detection, and adaptive smart rate limiting.
 - **Verification**: the fastest browser available (Playwright if importable, otherwise
   Chrome/Edge/Firefox found on PATH, with an explicit binary path where needed), two
   headless workers and automatic screenshots for confirmed findings. With no browser at
