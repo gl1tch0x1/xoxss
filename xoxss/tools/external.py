@@ -297,26 +297,47 @@ class ToolRunner:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd,
             )
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout or self.timeout
-            )
+            stdout_data = await self._read_stream(proc.stdout, MAX_OUTPUT)
+            stderr_data = await self._read_stream(proc.stderr, MAX_OUTPUT // 4 + 256)
+            await asyncio.wait_for(proc.wait(), timeout=timeout or self.timeout)
             return ToolResult(
                 tool=tool,
                 command=command,
                 returncode=proc.returncode or 0,
-                stdout=(stdout or b"").decode("utf-8", "replace")[:MAX_OUTPUT],
-                stderr=(stderr or b"").decode("utf-8", "replace")[:MAX_OUTPUT // 4],
+                stdout=stdout_data.decode("utf-8", "replace"),
+                stderr=stderr_data.decode("utf-8", "replace"),
             )
         except asyncio.TimeoutError:
             if proc is not None:
                 try:
                     proc.kill()
-                    await proc.communicate()
                 except Exception:
                     pass
             return ToolResult(tool=tool, command=command, returncode=-1, timed_out=True, stderr="timeout")
         except Exception as exc:
             return ToolResult(tool=tool, command=command, returncode=-1, stderr=str(exc))
+
+    @staticmethod
+    async def _read_stream(stream: Optional[asyncio.StreamReader], limit: int) -> bytes:
+        """Read a child stream while keeping at most ``limit`` bytes in memory.
+
+        Trailing output beyond the cap is drained (not stored) so the child
+        never deadlocks on a full pipe, but a runaway tool cannot exhaust the
+        host's memory either.
+        """
+        if stream is None:
+            return b""
+        buffer = bytearray()
+        try:
+            while True:
+                block = await stream.read(65536)
+                if not block:
+                    break
+                if len(buffer) < limit:
+                    buffer.extend(block[: limit - len(buffer)])
+        except Exception:
+            pass
+        return bytes(buffer)
 
 
 class ExternalToolkit:
@@ -407,7 +428,9 @@ class ExternalToolkit:
     async def discover(self, target: str, wordlist: Optional[str] = None) -> List[Dict[str, Any]]:
         if not self.enabled("ffuf"):
             return []
-        wordlist = wordlist or self._default_wordlist()
+        temp_path: Optional[str] = None
+        if not wordlist:
+            wordlist, temp_path = self._default_wordlist()
         if not wordlist:
             return []
         url = target.rstrip("/") + "/FUZZ"
@@ -421,28 +444,37 @@ class ExternalToolkit:
             "-timeout", "10",
             "-fc", "404",
         ]
-        result = await self.runner.run("ffuf", args, timeout=self.timeout)
-        rows = parse_ffuf(result.stdout)
-        if rows:
-            self.console.debug(f"ffuf: {len(rows)} path(s) found")
-        return rows[: self.max_results]
+        try:
+            result = await self.runner.run("ffuf", args, timeout=self.timeout)
+            rows = parse_ffuf(result.stdout)
+            if rows:
+                self.console.debug(f"ffuf: {len(rows)} path(s) found")
+            return rows[: self.max_results]
+        finally:
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
 
-    def _default_wordlist(self) -> str:
+    def _default_wordlist(self) -> Tuple[str, Optional[str]]:
+        """Return ``(selected_wordlist, temp_path_to_unlink)``."""
         for candidate in (
             "/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt",
             "/usr/share/wordlists/dirb/common.txt",
             "/usr/share/seclists/Discovery/Web-Content/common.txt",
         ):
             if os.path.exists(candidate):
-                return candidate
-        # Generate a tiny temporary wordlist so ffuf still runs.
+                return candidate, None
+        # Generate a tiny temporary wordlist so ffuf still runs; the caller
+        # unlinks it after the run.
         words = ["admin", "api", "app", "backup", "config", "dashboard", "docs",
                  "graphql", "login", "robots.txt", "sitemap.xml", "swagger",
                  "uploads", "user", "v1", "v2", "webhook"]
         handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
         with handle:
             handle.write("\n".join(words))
-        return handle.name
+        return handle.name, handle.name
 
     async def dalfox(self, url: str, *, blind: str = "", extra_args: Optional[Sequence[str]] = None) -> List[ExternalFinding]:
         if not self.enabled("dalfox"):

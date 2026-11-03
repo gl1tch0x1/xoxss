@@ -14,7 +14,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 try:  # pragma: no cover
     from typing import Protocol
@@ -222,9 +222,12 @@ class PassiveURLCollector:
         return getattr(response, "text", "") or ""
 
     async def _wayback(self, domain: str) -> List[str]:
+        # Domain is user-supplied (target list): encode it or a stray space or
+        # '<' breaks the CDX query outright.
+        safe_domain = quote(domain, safe="")
         url = (
             "https://web.archive.org/cdx/search/cdx?url=*."
-            f"{domain}&output=json&fl=original&collapse=urlkey&filter=statuscode:200"
+            f"{safe_domain}&output=json&fl=original&collapse=urlkey&filter=statuscode:200"
             f"&limit={self.limit}"
         )
         return parse_wayback(await self._fetch(url), domain)
@@ -241,7 +244,7 @@ class PassiveURLCollector:
         if not index_url:
             raise RuntimeError("could not resolve the latest Common Crawl index")
         sep = "&" if "?" in index_url else "?"
-        url = f"{index_url}{sep}url=*.{domain}&output=json&limit={self.limit}"
+        url = f"{index_url}{sep}url=*.{quote(domain, safe='')}&output=json&limit={self.limit}"
         return parse_commoncrawl(await self._fetch(url), domain)
 
     async def _urlscan(self, domain: str) -> List[str]:

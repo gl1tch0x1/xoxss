@@ -1011,6 +1011,10 @@ class StateStore:
         self.waf: List[str] = []
         self.extra: Dict[str, Any] = {}
         self._lock = threading.RLock()
+        self._last_save = 0.0
+        # Periodic per-URL saves hit the disk hundreds of times on big scans;
+        # debounced saves keep resume safety without the write storm.
+        self.min_save_interval = 1.0
 
     def load(self) -> bool:
         if not self.enabled or not self.path.exists():
@@ -1028,9 +1032,16 @@ class StateStore:
         self.extra = dict(data.get("extra", {}))
         return True
 
-    def save(self) -> None:
+    def save(self, force: bool = False) -> None:
         if not self.enabled:
             return
+        now = time.monotonic()
+        if not force and (now - self._last_save) < self.min_save_interval:
+            # Debounced: a periodic save is skipped, but a forced one (finding
+            # added, scan finished/cancelled) always goes through so crash
+            # resume never loses findings.
+            return
+        self._last_save = now
         payload = {
             "schema": self.SCHEMA,
             "tool": f"{APP_NAME} {VERSION}",
@@ -1329,6 +1340,17 @@ class HttpEngine:
             # drop the oldest entry (dicts keep insertion order)
             self._cache.pop(next(iter(self._cache)), None)
         self._cache[key] = (time.monotonic() + self.cache_ttl, response)
+
+    def peek(self, url: str) -> Optional[HttpResponse]:
+        """Cached GET response for ``url`` without any network activity."""
+        cache_key = self._cache_key("GET", url, None, None, None)
+        entry = self._cache.get(cache_key)
+        if entry is None:
+            return None
+        expiry, cached = entry
+        if expiry <= time.monotonic():
+            return None
+        return HttpResponse(**{**cached.__dict__, "from_cache": True})
 
     @staticmethod
     def _retry_delay(response: ClientResponse, attempt: int) -> float:
@@ -2571,6 +2593,12 @@ class XSSScanner:
         self.mxss_findings: List[Dict] = []
         self.proto_pollution_findings: List[Dict] = []
         self.cors_issues: List[Dict] = []
+        self.trusted_types_issues: List[Dict] = []
+        self.dom_clobber_findings: List[Dict] = []
+        self.postmessage_findings: List[Dict] = []
+        self.websocket_findings: List[Dict] = []
+        self.file_upload_findings: List[Dict] = []
+        self.graphql_endpoints: List[Dict] = []
         # Adaptive rate limiting is handled above via HttpEngine.enable_smart_rate(),
         # which installs an internal SmartRateLimiter and records every request;
         # replacing self.http.limiter here would bypass that mechanism.
@@ -2791,7 +2819,7 @@ class XSSScanner:
             await self._drain_oob()
         except asyncio.CancelledError:
             self.console.warn("Scan cancelled - saving checkpoint")
-            self.state.save()
+            self.state.save(force=True)
             raise
         finally:
             self._stop.set()
@@ -2810,7 +2838,7 @@ class XSSScanner:
                 self._status_task = None
             self.stats.endpoints = len(self.endpoints)
             self.state.extra["endpoints"] = sorted(self.endpoints)[:5000]
-            self.state.save()
+            self.state.save(force=True)
 
         self.print_summary()
         self.write_reports()
@@ -2929,7 +2957,7 @@ class XSSScanner:
             finding.payload = registration.payload or finding.payload
             finding.tags = list(dict.fromkeys([*finding.tags, "oob", "confirmed"]))
             self.state.findings = [item.to_dict() for item in self.findings]
-            self.state.save()
+            self.state.save(force=True)
             self.console.finding(finding)
             return
         self.add_finding(
@@ -3402,8 +3430,8 @@ class XSSScanner:
                         discovered.append(name)
             
             # Check script tags for vulnerable libraries
+            scripts = extract_scripts(url, text)
             if getattr(self.args, "check_libs", True):
-                scripts = extract_scripts(url, text)
                 for script in scripts:
                     if not script.inline:
                         vulns = check_vulnerable_libs(script.url)
@@ -3414,7 +3442,7 @@ class XSSScanner:
                                     f"Vulnerable library: {vuln.name} {vuln.version} ({vuln.severity}) - {vuln.cve} @ {truncate(vuln.url, 80)}"
                                 )
             
-            links.extend(await self._endpoints_from_scripts(extract_scripts(url, text), url))
+            links.extend(await self._endpoints_from_scripts(scripts, url))
         else:
             links.extend(extract_endpoints_from_text(text, url))
         # Follow .js files that were reached through links (not only <script src>).
@@ -3668,14 +3696,20 @@ class XSSScanner:
             if HAS_ADVANCED and getattr(self.args, 'jsonp', False):
                 await self._test_jsonp(url)
             
-            # Advanced: CSP analysis
+            # Advanced: CSP analysis (also runs the Trusted Types audit)
             if HAS_ADVANCED and getattr(self.args, 'csp_analyze', False):
                 await self._analyze_csp(url)
-            
+
             # Advanced: CORS analysis
             if HAS_ADVANCED and getattr(self.args, 'cors_analyze', False):
                 await self._analyze_cors(url)
             
+            # Advanced: GraphQL endpoint detection (uses the cached page when possible)
+            if HAS_ADVANCED and getattr(self.args, 'graphql', False):
+                cached = self.http.peek(url) or await self.http.get(url, cache=True)
+                if not cached.error and cached.text:
+                    self._analyze_graphql(url, cached.text, cached.header("content-type", ""))
+
             if HAS_ADVANCED and getattr(self.args, "proto_pollution", False):
                 await self.test_proto_pollution(url)
 
@@ -4188,7 +4222,7 @@ class XSSScanner:
         self.findings.append(finding)
         self.stats.findings = len(self.findings)
         self.state.add_finding(finding)
-        self.state.save()
+        self.state.save(force=True)
         self.console.finding(finding)
         return True
 
@@ -4280,6 +4314,76 @@ class XSSScanner:
 
         candidates = static_dom_candidates(scripts)
         inline_sink = any(has_dom_sink(script.content) for script in scripts if script.content)
+
+        # --postmessage / --websocket: analyze inline scripts for sink handlers
+        if scripts and (self.args.postmessage or self.args.websocket):
+            from xoxss.analysis.postmessage import PostMessageAnalyzer
+            from xoxss.analysis.websocket import WebSocketAnalyzer
+            marker = unique_token()
+            for script in scripts:
+                if not script.content or self._stop.is_set():
+                    continue
+                if self.args.postmessage:
+                    try:
+                        for vuln in PostMessageAnalyzer().analyze_postmessage_handlers(
+                            script.content, marker
+                        ):
+                            self.postmessage_findings.append({
+                                'url': script.url or url,
+                                'sink': vuln.sink_type.value,
+                                'origin_validated': vuln.has_origin_validation,
+                                'description': vuln.description,
+                            })
+                    except Exception as exc:
+                        self.console.debug(f"postMessage analysis failed: {exc}")
+                if self.args.websocket:
+                    try:
+                        for vuln in WebSocketAnalyzer().analyze_websocket_handlers(
+                            script.content, marker
+                        ):
+                            self.websocket_findings.append({
+                                'url': script.url or url,
+                                'sink': vuln.sink_type.value,
+                                'location': vuln.location[:160],
+                                'description': vuln.description,
+                            })
+                    except Exception as exc:
+                        self.console.debug(f"WebSocket analysis failed: {exc}")
+            if self.postmessage_findings or self.websocket_findings:
+                self.console.debug(
+                    f"postMessage/WebSocket sinks on {url}: "
+                    f"{len(self.postmessage_findings)} pm, {len(self.websocket_findings)} ws"
+                )
+
+        # --dom-clobbering: static check on the page markup
+        if self.args.dom_clobbering and response.text:
+            from xoxss.analysis.dom_clobbering import DOMClobberingDetector
+            try:
+                for vuln in DOMClobberingDetector().detect_dom_clobbering(response.text, url):
+                    self.dom_clobber_findings.append({
+                        'url': url,
+                        'type': vuln.clobbering_type.value,
+                        'property': vuln.target_property,
+                        'element': vuln.element[:120],
+                        'severity': vuln.severity,
+                    })
+                    self.console.warn(
+                        f"DOM clobbering ({vuln.clobbering_type.value}): "
+                        f"{vuln.target_property} @ {truncate(url, 90)}"
+                    )
+            except Exception as exc:
+                self.console.debug(f"DOM clobbering analysis failed: {exc}")
+
+        # --file-upload: look for upload forms so the operator gets an endpoint list
+        if self.args.file_upload and response.text:
+            from xoxss.analysis.file_upload import FileUploadAnalyzer
+            try:
+                if FileUploadAnalyzer().detect_file_upload_endpoint(response.text):
+                    self.file_upload_findings.append({'url': url})
+                    self.console.info(f"File upload form found: {url}", important=False)
+            except Exception as exc:
+                self.console.debug(f"File upload analysis failed: {exc}")
+
         if candidates:
             self.console.debug(
                 f"DOM source/sink candidates on {url}: "
@@ -4424,6 +4528,53 @@ class XSSScanner:
             bypasses = analyzer.suggest_bypass_payloads(analysis, marker)
             for bypass in bypasses:
                 self.console.debug(f"CSP bypass suggestion: {bypass[:60]}...")
+
+        # Trusted Types directive audit (--trusted-types)
+        if getattr(self.args, "trusted_types", False):
+            from xoxss.analysis.trusted_types import TrustedTypesAnalyzer
+            tt_analysis = TrustedTypesAnalyzer().analyze_trusted_types(csp_header)
+            if tt_analysis.issues:
+                self.trusted_types_issues.append({
+                    'url': url,
+                    'issues': [
+                        f"{issue.issue_type} ({issue.severity}): {issue.description}"
+                        for issue in tt_analysis.issues
+                    ],
+                })
+                self.console.debug(f"Trusted Types audit: {len(tt_analysis.issues)} issue(s) on {url}")
+
+    def _analyze_graphql(self, url: str, body: str, content_type: str) -> None:
+        """Detect GraphQL endpoints and flag open introspection (--graphql)."""
+        if not HAS_ADVANCED or not getattr(self.args, "graphql", False):
+            return
+        path = urlsplit(url).path.rstrip("/").lower()
+        if ("application/json" not in content_type
+                and not path.endswith(("graphql", "graphiql", "api/graphql"))):
+            return
+        from xoxss.analysis.graphql import GraphQLAnalyzer
+
+        analyzer = GraphQLAnalyzer()
+        try:
+            if not analyzer.detect_graphql_endpoint(url, body):
+                return
+        except Exception as exc:
+            self.console.debug(f"GraphQL detection failed for {url}: {exc}")
+            return
+        if any(item.get("url") == url for item in self.graphql_endpoints):
+            return
+        introspection_open = False
+        try:
+            introspection_open = analyzer.check_introspection(body)
+        except Exception:
+            pass
+        self.graphql_endpoints.append({
+            'url': url,
+            'introspection': introspection_open,
+        })
+        if introspection_open:
+            self.console.warn(f"GraphQL introspection enabled: {url}")
+        else:
+            self.console.info(f"GraphQL endpoint found: {url}", important=False)
     
     async def _analyze_cors(self, url: str) -> None:
         """Analyze CORS headers for misconfigurations."""
@@ -4559,6 +4710,12 @@ class XSSScanner:
             ("JSONP findings", str(len(self.jsonp_findings))),
             ("CSP issues", str(len(self.csp_issues))),
             ("CORS issues", str(len(self.cors_issues))),
+            ("Trusted Types issues", str(len(self.trusted_types_issues))),
+            ("DOM clobbering", str(len(self.dom_clobber_findings))),
+            ("postMessage sinks", str(len(self.postmessage_findings))),
+            ("WebSocket sinks", str(len(self.websocket_findings))),
+            ("File upload forms", str(len(self.file_upload_findings))),
+            ("GraphQL endpoints", str(len(self.graphql_endpoints))),
             ("Findings", str(len(self.findings))),
             ("State file", str(self.state.path) if self.state.enabled else "disabled"),
         ]
@@ -4602,6 +4759,54 @@ class XSSScanner:
                 self.console.raw(f"  URL: {truncate(issue['url'], 120)}")
                 for sub_issue in issue['issues'][:2]:
                     self.console.raw(f"    - {sub_issue}")
+
+        if self.trusted_types_issues:
+            self.console.raw("")
+            self.console.raw(f"{bcolors.BOLD}Trusted Types issues{bcolors.ENDC}")
+            for item in self.trusted_types_issues[:5]:
+                self.console.raw(f"  URL: {truncate(item['url'], 120)}")
+                for sub_issue in item['issues'][:2]:
+                    self.console.raw(f"    - {sub_issue}")
+
+        if self.dom_clobber_findings:
+            self.console.raw("")
+            self.console.raw(f"{bcolors.BOLD}DOM clobbering{bcolors.ENDC}")
+            for item in self.dom_clobber_findings[:5]:
+                self.console.raw(
+                    f"  [{item['severity']}]{bcolors.ENDC} {item['type']} "
+                    f"-> {item['property']}  ({truncate(item['url'], 110)})"
+                )
+
+        if self.postmessage_findings:
+            self.console.raw("")
+            self.console.raw(f"{bcolors.BOLD}postMessage sinks{bcolors.ENDC}")
+            for item in self.postmessage_findings[:5]:
+                validated = "origin validated" if item['origin_validated'] else "NO origin check"
+                self.console.raw(
+                    f"  {item['sink']} ({validated}) - {truncate(item['url'], 110)}"
+                )
+
+        if self.websocket_findings:
+            self.console.raw("")
+            self.console.raw(f"{bcolors.BOLD}WebSocket sinks{bcolors.ENDC}")
+            for item in self.websocket_findings[:5]:
+                self.console.raw(
+                    f"  {item['sink']} - {truncate(item['url'], 110)}"
+                )
+                self.console.raw(f"      {truncate(item['location'], 140)}")
+
+        if self.file_upload_findings:
+            self.console.raw("")
+            self.console.raw(f"{bcolors.BOLD}File upload forms{bcolors.ENDC}")
+            for item in self.file_upload_findings[:5]:
+                self.console.raw(f"  {truncate(item['url'], 120)}")
+
+        if self.graphql_endpoints:
+            self.console.raw("")
+            self.console.raw(f"{bcolors.BOLD}GraphQL endpoints{bcolors.ENDC}")
+            for item in self.graphql_endpoints[:5]:
+                flag = "introspection ENABLED" if item['introspection'] else "introspection off"
+                self.console.raw(f"  {flag} - {truncate(item['url'], 120)}")
 
         if self.findings:
             self.console.raw("")
@@ -4714,6 +4919,12 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
         "csp_issues": scanner.csp_issues,
         "cors_issues": scanner.cors_issues,
         "proto_pollution_sources": scanner.proto_pollution_findings,
+        "trusted_types_issues": scanner.trusted_types_issues,
+        "dom_clobbering": scanner.dom_clobber_findings,
+        "postmessage": scanner.postmessage_findings,
+        "websocket": scanner.websocket_findings,
+        "file_upload": scanner.file_upload_findings,
+        "graphql": scanner.graphql_endpoints,
         "blind_markers": scanner.blind_markers,
         "findings": [finding.to_dict() for finding in scanner.findings],
     }
@@ -4761,6 +4972,62 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
         f"- **XSS Findings:** {len(scanner.findings)}",
         "",
     ]
+
+    if scanner.trusted_types_issues:
+        lines += ["## Trusted Types issues", "",
+                  "| # | URL | Issue |", "|---|-----|-------|"]
+        for index, item in enumerate(scanner.trusted_types_issues, 1):
+            lines.append(f"| {index} | {item['url']} | {'; '.join(item['issues'])} |")
+        lines += [""]
+
+    if scanner.dom_clobber_findings:
+        lines += ["## DOM clobbering", "",
+                  "| # | URL | Type | Property | Element | Severity |",
+                  "|---|-----|------|----------|---------|----------|"]
+        for index, item in enumerate(scanner.dom_clobber_findings, 1):
+            lines.append(
+                f"| {index} | {item['url']} | {item['type']} | {item['property']} "
+                f"| {item['element'].replace('|', '%7C')} | {item['severity']} |"
+            )
+        lines += [""]
+
+    if scanner.postmessage_findings:
+        lines += ["## postMessage sinks", "",
+                  "| # | Script | Sink | Origin validated | Description |",
+                  "|---|--------|------|------------------|-------------|"]
+        for index, item in enumerate(scanner.postmessage_findings, 1):
+            origin = "yes" if item['origin_validated'] else "**no**"
+            lines.append(
+                f"| {index} | {item['url']} | {item['sink']} | {origin} "
+                f"| {item['description'].replace('|', '%7C')} |"
+            )
+        lines += [""]
+
+    if scanner.websocket_findings:
+        lines += ["## WebSocket sinks", "",
+                  "| # | Script | Sink | Snippet | Description |", "|---|--------|------|---------|-------------|"]
+        for index, item in enumerate(scanner.websocket_findings, 1):
+            lines.append(
+                f"| {index} | {item['url']} | {item['sink']} "
+                f"| {item['location'].replace('|', '%7C')} "
+                f"| {item['description'].replace('|', '%7C')} |"
+            )
+        lines += [""]
+
+    if scanner.file_upload_findings:
+        lines += ["## File upload forms", ""]
+        for item in scanner.file_upload_findings:
+            lines.append(f"- {item['url']}")
+        lines += [""]
+
+    if scanner.graphql_endpoints:
+        lines += ["## GraphQL endpoints", "",
+                  "| # | URL | Introspection open |", "|---|-----|--------------------|"]
+        for index, item in enumerate(scanner.graphql_endpoints, 1):
+            lines.append(
+                f"| {index} | {item['url']} | {'**yes**' if item['introspection'] else 'no'} |"
+            )
+        lines += [""]
     
     if scanner.vulnerable_libs:
         lines += [
@@ -4910,6 +5177,12 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
             _card("JSONP", len(scanner.jsonp_findings)),
             _card("CSP issues", len(scanner.csp_issues)),
             _card("CORS issues", len(scanner.cors_issues)),
+            _card("Trusted Types", len(scanner.trusted_types_issues)),
+            _card("DOM clobbering", len(scanner.dom_clobber_findings)),
+            _card("postMessage", len(scanner.postmessage_findings)),
+            _card("WebSocket", len(scanner.websocket_findings)),
+            _card("Upload forms", len(scanner.file_upload_findings)),
+            _card("GraphQL", len(scanner.graphql_endpoints)),
             _card("XSS Findings", len(scanner.findings)),
         ]
     )
@@ -4982,7 +5255,107 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
             "<table><thead><tr><th>URL</th><th>Issues</th></tr></thead>"
             "<tbody>" + "".join(cors_rows) + "</tbody></table>"
         )
-    
+
+    if scanner.trusted_types_issues:
+        tt_rows = []
+        for item in scanner.trusted_types_issues:
+            tt_rows.append(
+                "<tr>"
+                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
+                f"<td>{html_lib.escape(' | '.join(item['issues'][:3]))}</td>"
+                "</tr>"
+            )
+        content_parts.append(
+            "<h2>Trusted Types Issues</h2>"
+            "<table><thead><tr><th>URL</th><th>Issues</th></tr></thead>"
+            "<tbody>" + "".join(tt_rows) + "</tbody></table>"
+        )
+
+    if scanner.dom_clobber_findings:
+        clob_rows = []
+        for item in scanner.dom_clobber_findings:
+            clob_rows.append(
+                "<tr>"
+                f'<td><span class="badge {html_lib.escape(item["severity"])}">'
+                f"{html_lib.escape(item['severity'])}</span></td>"
+                f"<td>{html_lib.escape(item['type'])}</td>"
+                f"<td><code>{html_lib.escape(item['property'])}</code></td>"
+                f"<td><code>{html_lib.escape(truncate(item['element'], 160))}</code></td>"
+                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
+                "</tr>"
+            )
+        content_parts.append(
+            "<h2>DOM Clobbering</h2>"
+            "<table><thead><tr><th>Severity</th><th>Type</th><th>Property</th>"
+            "<th>Element</th><th>URL</th></tr></thead>"
+            "<tbody>" + "".join(clob_rows) + "</tbody></table>"
+        )
+
+    if scanner.postmessage_findings:
+        pm_rows = []
+        for item in scanner.postmessage_findings:
+            origin = "yes" if item['origin_validated'] else '<span class="badge high">no</span>'
+            pm_rows.append(
+                "<tr>"
+                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
+                f"<td>{html_lib.escape(item['sink'])}</td>"
+                f"<td>{origin}</td>"
+                f"<td>{html_lib.escape(truncate(item['description'], 220))}</td>"
+                "</tr>"
+            )
+        content_parts.append(
+            "<h2>postMessage Sinks</h2>"
+            "<table><thead><tr><th>Script</th><th>Sink</th><th>Origin Validated</th>"
+            "<th>Description</th></tr></thead>"
+            "<tbody>" + "".join(pm_rows) + "</tbody></table>"
+        )
+
+    if scanner.websocket_findings:
+        ws_rows = []
+        for item in scanner.websocket_findings:
+            ws_rows.append(
+                "<tr>"
+                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
+                f"<td>{html_lib.escape(item['sink'])}</td>"
+                f"<td><code>{html_lib.escape(truncate(item['location'], 200))}</code></td>"
+                f"<td>{html_lib.escape(truncate(item['description'], 220))}</td>"
+                "</tr>"
+            )
+        content_parts.append(
+            "<h2>WebSocket Sinks</h2>"
+            "<table><thead><tr><th>Script</th><th>Sink</th><th>Location</th>"
+            "<th>Description</th></tr></thead>"
+            "<tbody>" + "".join(ws_rows) + "</tbody></table>"
+        )
+
+    if scanner.file_upload_findings:
+        upload_rows = []
+        for item in scanner.file_upload_findings:
+            upload_rows.append(
+                f'<tr><td><code>{html_lib.escape(truncate(item["url"], 300))}</code></td></tr>'
+            )
+        content_parts.append(
+            "<h2>File Upload Forms</h2>"
+            "<table><thead><tr><th>URL</th></tr></thead>"
+            "<tbody>" + "".join(upload_rows) + "</tbody></table>"
+        )
+
+    if scanner.graphql_endpoints:
+        gql_rows = []
+        for item in scanner.graphql_endpoints:
+            flag = '<span class="badge high">enabled</span>' if item['introspection'] else "off"
+            gql_rows.append(
+                "<tr>"
+                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
+                f"<td>{flag}</td>"
+                "</tr>"
+            )
+        content_parts.append(
+            "<h2>GraphQL Endpoints</h2>"
+            "<table><thead><tr><th>URL</th><th>Introspection</th></tr></thead>"
+            "<tbody>" + "".join(gql_rows) + "</tbody></table>"
+        )
+
     if scanner.findings:
         rows = []
         for finding in scanner.findings:
@@ -5162,6 +5535,12 @@ def apply_god_preset(
     args.proto_pollution = True
     args.mxss = True
     args.smart_rate = True
+    args.dom_clobbering = True
+    args.trusted_types = True
+    args.graphql = True
+    args.websocket = True
+    args.file_upload = True
+    args.postmessage = True
 
     # -- network -------------------------------------------------------------------------
     bump("threads", 20, "--threads")
@@ -5354,7 +5733,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         help="extra GitHub raw payload URL (repeatable)",
     )
-    injection.add_argument("--payload-limit", type=int, default=600, help="maximum remote payloads to keep (default: 600)")
+    injection.add_argument("--payload-limit", type=int, default=600, help="maximum remote payloads to keep (0 = unlimited, capped internally; default: 600)")
     injection.add_argument("--payload-tmp-dir", help="temp directory for downloaded payloads (default: system temp)")
     injection.add_argument("--keep-payloads", action="store_true", help="keep downloaded payloads after the scan")
     injection.add_argument(
@@ -6208,10 +6587,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if getattr(args, "god", False):
         raw_tokens = list(argv) if argv is not None else sys.argv[1:]
+        # Normalize `--flag=value` tokens so explicit user settings claim their
+        # flag (otherwise god mode would override them).
         user_flags = {
-            token
+            token.split("=", 1)[0]
             for token in raw_tokens
-            if token.startswith("--") and token not in ("--god", "--yolo")
+            if token.startswith("--") and token.split("=", 1)[0] not in ("--god", "--yolo")
         }
         apply_god_preset(args, console, user_flags)
         console.info("GOD MODE engaged: full-automatic maximum-aggression preset applied", important=True)

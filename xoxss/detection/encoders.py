@@ -103,10 +103,18 @@ def _js_unicode(value: str) -> str:
 def _js_hex(value: str) -> str:
     out: List[str] = []
     for ch in value:
+        code = ord(ch)
         if ch.isalnum() or ch in " \t\r\n":
             out.append(ch)
+        elif code <= 0xFF:
+            out.append(f"\\x{code:02x}")
+        elif code <= 0xFFFF:
+            out.append(f"\\u{code:04x}")
         else:
-            out.append(f"\\x{ord(ch):02x}")
+            # \xXX / single \uXXXX cannot represent code points above 0xFFFF
+            # ('\x1f600' would decode as \x1f followed by literal '600'); keep
+            # the raw character, which is still valid inside a JS string.
+            out.append(ch)
     return "".join(out)
 
 

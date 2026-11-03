@@ -349,6 +349,8 @@ def sources_from_sourcemap(data: str, base_url: str = "") -> Tuple[List[str], Li
         payload = json.loads(data)
     except Exception:
         return [], []
+    if not isinstance(payload, dict):
+        return [], []
     sources: List[str] = []
     contents: List[str] = []
     for index, source in enumerate(payload.get("sources", []) or []):

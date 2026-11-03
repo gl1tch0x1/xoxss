@@ -8,8 +8,12 @@ from datetime import datetime, timezone
 
 def truncate(text: str, max_length: int) -> str:
     """Truncate text to a maximum length."""
+    if max_length <= 0:
+        return ""
     if len(text) <= max_length:
         return text
+    if max_length <= 3:
+        return text[:max_length]
     return text[:max_length - 3] + "..."
 
 

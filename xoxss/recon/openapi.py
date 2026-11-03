@@ -325,6 +325,10 @@ def parse_spec_text(text: str, spec_url: str) -> List[APIOperation]:
     text = (text or "").strip()
     if not text:
         return []
+    if len(text) > 8_000_000:
+        # A fetched "spec" this large is either a bombed YAML (alias
+        # expansion) or a giant phishing page; parsing it is wasted risk.
+        return []
     document: Optional[Dict[str, Any]] = None
     if text.startswith("{"):
         try:

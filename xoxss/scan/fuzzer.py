@@ -284,7 +284,12 @@ class DirFuzzer:
                 if not isinstance(item, FuzzResult):
                     continue
                 results.append(item)
-                if recursive and depth < max_depth and item.url.endswith("/"):
+                if (
+                    recursive
+                    and depth < max_depth
+                    and item.url.endswith("/")
+                    and _origin(item.url) == origin
+                ):
                     queue.append((item.url, depth + 1))
             self.console.debug(
                 f"Directory fuzzing {base}: {len(results)} hit(s) so far"
@@ -378,6 +383,11 @@ class ParameterMiner:
 
         for url in urls:
             baseline = await self._baseline(url)
+            if baseline is None or getattr(baseline, "error", None):
+                # Without a usable baseline every response looks like a huge
+                # delta, which would report the entire wordlist as "found".
+                self.console.debug(f"Parameter mining: no baseline for {url}, skipping")
+                continue
             group = await asyncio.gather(
                 *(check(url, name, baseline) for name in names), return_exceptions=True
             )

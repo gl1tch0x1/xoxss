@@ -139,6 +139,18 @@ class ScanConfig:
 
     def __post_init__(self):
         """Validate and normalize configuration."""
+        # Programmatic users often pass plain strings for the enum fields;
+        # coerce instead of failing with a type error in deep comparisons.
+        if isinstance(self.browser, str):
+            try:
+                self.browser = BrowserType(self.browser)
+            except ValueError:
+                raise ValueError(f"unknown browser type: {self.browser!r}") from None
+        if isinstance(self.confirm, str):
+            try:
+                self.confirm = VerificationStrategy(self.confirm)
+            except ValueError:
+                raise ValueError(f"unknown verification strategy: {self.confirm!r}") from None
         if self.deep:
             self.crawl_depth = 5
             self.max_urls = 1500

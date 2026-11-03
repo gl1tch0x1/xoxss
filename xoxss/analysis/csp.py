@@ -223,8 +223,14 @@ class CSPAnalyzer:
         # Determine if bypass is possible
         bypass_possible = len(bypasses) > 0
 
-        # Determine if CSP is strict
-        is_strict = not bypass_possible and len(issues) == 0
+        # "Strict" means an attacker gains nothing from the policy: no usable
+        # bypass and no high-impact weakness. Requiring a completely
+        # empty issues list would keep flagging every policy that merely
+        # misses a recommended directive (base-uri, form-action, ...).
+        high_severity = any(
+            issue.severity in (CSPSeverity.CRITICAL, CSPSeverity.HIGH) for issue in issues
+        )
+        is_strict = not bypass_possible and not high_severity
 
         analysis = CSPAnalysis(
             is_strict=is_strict,

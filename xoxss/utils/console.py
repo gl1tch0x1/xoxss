@@ -28,26 +28,37 @@ class Console:
         self.verbose = verbose
         self.no_color = no_color
 
-    def _colorize(self, text: str, color: str) -> str:
+    def _colorize(self, text: str, color: str, bold: bool = False) -> str:
         """Apply color to text if colors are enabled."""
         if self.no_color or not sys.stdout.isatty():
             return text
-        return f"{color}{text}{bcolors.ENDC}"
+        prefix = bcolors.BOLD if bold else ""
+        return f"{prefix}{color}{text}{bcolors.ENDC}"
 
-    def info(self, message: str) -> None:
-        """Print an info message."""
+    def info(self, message: str, important: bool = False) -> None:
+        """Print an info message; ``important`` keeps CompatConsole parity."""
         if not self.quiet:
-            print(self._colorize(f"[*] {message}", bcolors.OKBLUE))
+            print(self._colorize(f"[*] {message}", bcolors.OKBLUE, bold=important))
 
-    def success(self, message: str) -> None:
+    def ok(self, message: str, important: bool = False) -> None:
+        """Alias of :meth:`success` with CompatConsole-compatible keyword."""
+        self.success(message)
+
+    def rule(self, text: str = "") -> None:
+        """Print a horizontal rule (CompatConsole parity)."""
+        if not self.quiet:
+            width = 72
+            print(f"-- {text} ".ljust(width, "-") if text else "-" * width)
+
+    def success(self, message: str, important: bool = False) -> None:
         """Print a success message."""
         if not self.quiet:
-            print(self._colorize(f"[+] {message}", bcolors.OKGREEN))
+            print(self._colorize(f"[+] {message}", bcolors.OKGREEN, bold=important))
 
-    def warn(self, message: str) -> None:
+    def warn(self, message: str, important: bool = False) -> None:
         """Print a warning message."""
         if not self.quiet:
-            print(self._colorize(f"[!] {message}", bcolors.WARNING))
+            print(self._colorize(f"[!] {message}", bcolors.WARNING, bold=important))
 
     def error(self, message: str) -> None:
         """Print an error message."""

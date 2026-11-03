@@ -409,7 +409,19 @@ class SubdomainFinder:
                 self.console.debug(f"Subdomain source {name}: {len(found)} host(s)")
             hosts.update(found)
 
-        if brute_limit > 0:
+        # Detect wildcard DNS *before* brute-forcing: on a wildcard zone the
+        # resolver answers for any random label, so every brute-force host
+        # would "resolve" and the volume of fake hosts explodes.
+        if resolve:
+            report.wildcard = await self._wildcard(domain)
+            if report.wildcard:
+                self.console.warn(
+                    f"Wildcard DNS detected for {domain}; brute-force hosts "
+                    "(which would all 'resolve') are being skipped "
+                    "(passive-source hosts are kept and still resolved)"
+                )
+
+        if brute_limit > 0 and not report.wildcard:
             candidates = await self._wordlist_candidates(domain, wordlist, brute_limit)
             self.console.debug(f"Resolving {len(candidates)} brute-force subdomain(s)")
             resolved_brute = set(await self.resolve_many(candidates))
@@ -420,11 +432,6 @@ class SubdomainFinder:
         report.hosts = ordered
 
         if resolve and ordered:
-            report.wildcard = await self._wildcard(domain)
-            if report.wildcard:
-                self.console.warn(
-                    f"Wildcard DNS detected for {domain}; unresolved brute-force hosts were discarded"
-                )
             report.resolved = sorted(await self.resolve_many(ordered))
         else:
             report.resolved = list(ordered)
