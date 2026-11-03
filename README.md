@@ -1,4 +1,10 @@
+<div align="center">
+  <img src="assets/logo.png" alt="XOX$$ logo" width="240">
+</div>
+
 # XOX$$
+
+<div align="center">
 
 **Advanced, persistent, context-aware XSS scanner for authorized security testing.**
 
@@ -7,6 +13,10 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 [![SARIF](https://img.shields.io/badge/report-SARIF%20v2.1.0-purple.svg)](#reports-and-exit-codes)
 [![Authorized testing only](https://img.shields.io/badge/use-authorized%20testing%20only-red.svg)](#security-and-legal)
+
+</div>
+
+<br/>
 
 > [!WARNING]
 > XOX$$ sends attack payloads. Use it only against systems you own or have explicit
@@ -33,24 +43,27 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 
 ## Contents
 
-- [Features](#features)
-- [How it works](#how-it-works)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [CLI reference](#cli-reference)
-- [Recipes](#recipes)
-- [Reports and exit codes](#reports-and-exit-codes)
-- [State and resume](#state-and-resume)
-- [Configuration](#configuration)
-- [Architecture](#architecture)
-- [Using as a library](#using-as-a-library)
-- [Performance](#performance)
-- [Troubleshooting](#troubleshooting)
-- [Development](#development)
-- [Limitations](#limitations)
-- [Security and legal](#security-and-legal)
-- [Acknowledgements](#acknowledgements)
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#how-it-works">How it works</a> •
+  <a href="#requirements">Requirements</a> •
+  <a href="#installation">Installation</a> •
+  <a href="#quick-start">Quick start</a> •
+  <a href="#cli-reference">CLI reference</a> •
+  <a href="#recipes">Recipes</a> •
+  <a href="#reports-and-exit-codes">Reports &amp; exit codes</a> •
+  <a href="#state-and-resume">State &amp; resume</a> •
+  <a href="#configuration">Configuration</a> •
+  <a href="#architecture">Architecture</a> •
+  <a href="#using-as-a-library">Using as a library</a> •
+  <a href="#performance">Performance</a> •
+  <a href="#troubleshooting">Troubleshooting</a> •
+  <a href="#development">Development</a> •
+  <a href="#limitations">Limitations</a> •
+  <a href="#security-and-legal">Security &amp; legal</a> •
+  <a href="#acknowledgements">Acknowledgements</a> •
+  <a href="#license">License</a>
+</p>
 
 ## Features
 
