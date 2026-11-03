@@ -89,7 +89,7 @@ class SmartRateLimiter:
 
         # Handle Retry-After
         if retry_after:
-            self._current_rate = self.min_rate
+            self.current_rate = self.min_rate
             self._retry_after_delays[str(time.monotonic())] = retry_after
 
         # Update statistics

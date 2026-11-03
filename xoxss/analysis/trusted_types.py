@@ -91,16 +91,14 @@ class TrustedTypesAnalyzer:
             has_trusted_types_directive = True
             requires_trusted_for = directives['require-trusted-types-for']
 
-            # Check if it covers important sinks
-            important_sinks = ['script', 'style']
-            for sink in important_sinks:
-                if sink not in requires_trusted_for:
-                    issues.append(TrustedTypesIssue(
-                        issue_type="missing_sink_coverage",
-                        severity="medium",
-                        description=f"require-trusted-types-for does not cover '{sink}' sink",
-                        directive="require-trusted-types-for"
-                    ))
+            # 'script' is the only sink directive in the Trusted Types spec
+            if 'script' not in requires_trusted_for:
+                issues.append(TrustedTypesIssue(
+                    issue_type="missing_sink_coverage",
+                    severity="medium",
+                    description="require-trusted-types-for does not cover the 'script' sink",
+                    directive="require-trusted-types-for"
+                ))
         else:
             issues.append(TrustedTypesIssue(
                 issue_type="missing_directive",
@@ -112,11 +110,13 @@ class TrustedTypesAnalyzer:
         # Check for trusted-types directive
         if 'trusted-types' in directives:
             trusted_policies = directives['trusted-types']
-            if '*' in trusted_policies or 'none' not in trusted_policies:
+            # A named allowlist ('trusted-types app-policy') is the *correct*
+            # restrictive form; only a wildcard is permissive.
+            if '*' in trusted_policies:
                 issues.append(TrustedTypesIssue(
                     issue_type="permissive_policy",
                     severity="medium",
-                    description="trusted-types allows any policy or does not have 'none'",
+                    description="trusted-types allows any policy ('*')",
                     directive="trusted-types"
                 ))
         else:

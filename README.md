@@ -108,6 +108,8 @@ stopped, resumed, scripted and reported without a second tool.
 - OpenAPI/Swagger discovery, including path parameters and JSON/form request bodies.
 - Passive subdomain enumeration (crt.sh, certspotter, HackerTarget, OTX, urlscan) and
   historic URL mining (Wayback, Common Crawl, urlscan, OTX).
+- **Parameter audit** combining collector-style Wayback harvesting with Gxss-style
+  one-parameter-at-a-time reflection probing, ranked by parameter name risk and usage.
 - Internal path fuzzing with soft-404 detection, hidden-parameter mining, and parameter
   fuzzing on endpoints that expose no query string.
 - Optional orchestration of installed `subfinder`, `gau`, `waybackurls`, `katana`, `httpx`,
@@ -115,7 +117,8 @@ stopped, resumed, scripted and reported without a second tool.
 
 ### Payloads and evasion
 
-- Ten context-specific built-in payload families plus a rotating remote corpus.
+- Ten context-specific built-in payload families, a rotating remote corpus and the bundled
+  6,900+ entry LazyXss payload pack.
 - Eight tamper transforms (`doubleencode`, `hexencode`, `htmlentities`, `jscomment`,
   `jsonfuzz`, `spacetab`, `uppercase`, `urlencode`) and the `all` chain.
 - Twenty composable encoders, including entity variants, JS escapes, `fromCharCode`,
@@ -153,6 +156,8 @@ sequenceDiagram
 
 ### Operations and reporting
 
+- `--god` / `--yolo` full-automatic preset: recon, deep crawl, fuzzing, browser
+  verification, interactsh and external tools in one flag, no further input needed.
 - Persistent checkpoints, resume, and cross-run finding deduplication.
 - WAF fingerprinting (header/cookie/body signatures) and an active blocking probe.
 - Retries with exponential backoff, `Retry-After` support, token-bucket rate limiting,
@@ -316,15 +321,21 @@ non-zero only when a required component is missing. Optional warnings (missing
 ## Quick start
 
 ```bash
+# 0. God mode: everything below, fully automatic, no extra flags
+xoxss example.com --god          # alias: --yolo
+
 # 1. Fast HTTP-only triage of a single parameter
 xoxss "https://target.tld/?q=1" --no-browser --report json,sarif
 
-# 2. Crawl, confirm in a headless browser, save evidence
+# 2. Harvest a domain and find reflecting parameters (collector + Gxss)
+xoxss example.com --param-audit --param-output params.json
+
+# 3. Crawl, confirm in a headless browser, save evidence
 xoxss https://target.tld --crawl --deep \
   --browser playwright --headless --screenshot \
   --report all
 
-# 3. Triage a large URL list without a browser
+# 4. Triage a large URL list without a browser
 xoxss -l urls.txt --mass --jsonl findings.jsonl --concurrency 32
 ```
 
@@ -348,6 +359,7 @@ same options by workflow and include the default where one exists.
 | `--exclude REGEX ...` | URLs matching any regex are skipped. |
 | `--crawl` | Crawl before scanning. |
 | `--deep` | Preset: crawl, depth ≥ 5, ≥ 1500 URLs, endpoint discovery, path probing and parameter fuzzing. |
+| `--god`, `--yolo` | Full-automatic maximum-aggression preset — see [God mode](#god-mode). Not combinable with `--mass` or `--param-audit`. |
 | `--crawl-depth N` | Maximum crawl depth (default: `3`). |
 | `--max-urls N` | Maximum URLs to scan (default: `500`). |
 | `--discover` / `--no-discover` | Parse robots.txt, sitemaps and JavaScript (default: on). |
@@ -370,6 +382,7 @@ same options by workflow and include the default where one exists.
 |---|---|
 | `--payload-file PATH` | Custom payloads. Accepts a single file, an `os.pathsep`-separated list, or a JSON array. |
 | `--payload-dir DIR` | Load every `.txt`, `.lst` and `.json` file under `DIR` recursively. Repeatable. |
+| `--lazy-payloads` / `--no-lazy-payloads` | Load the bundled LazyXss pack (6,900+ payloads; default: on). |
 | `--remote-payloads` / `--no-remote-payloads` | Download the temporary GitHub payload corpus (default: on). |
 | `--payload-source URL` | Extra raw payload URL. Repeatable. |
 | `--payload-limit N` | Maximum remote payloads kept (default: `600`; hard cap: `5000`). |
@@ -458,6 +471,39 @@ same options by workflow and include the default where one exists.
 | `--mass-payloads N` | Payloads per parameter (default: `4`). Extra slots can come from local corpora. |
 | `--jsonl PATH` | Append one JSON finding object per line. |
 
+### Parameter audit (collector + Gxss)
+
+`--param-audit` is a standalone reconnaissance mode. It harvests historic URLs the same
+way `collector` does, extracts unique parameter names, then tests each parameter
+individually by substituting a unique marker (the core idea from `Gxss`). It does not crawl,
+launch a browser, download payloads, or create a checkpoint.
+
+| Option | Description |
+|---|---|
+| `--param-audit` | Run the standalone parameter harvest and reflection audit, then exit. |
+| `--param-input PATH` | Read seed URLs from a file. When used alone, Wayback harvesting is skipped. |
+| `--param-source {wayback,passive,both,none}` | URL source (default: `wayback`, or `none` with `--param-input`). |
+| `--param-subs` / `--no-param-subs` | Include subdomains in Wayback harvesting (default: on). |
+| `--param-limit N` | Maximum historic URLs to harvest (default: `5000`). |
+| `--param-max-checks N` | Maximum parameter names to probe (default: `10000`). |
+| `--param-marker STRING` | Alphanumeric marker prefix (default: `XoxssReflect`). |
+| `--param-data BODY` | POST form body for Gxss-style `-d` checks, e.g. `user=test&pass=test`. |
+| `--param-output PATH` | Write the JSON audit report. |
+| `--jsonl PATH` | Append one candidate/reflection object per line. |
+
+A reflected parameter is **evidence of reflection, not execution**. The JSON deliberately
+keeps `executable: false`; use the main scanner or `--mass` to test exploitability.
+
+> [!NOTE]
+> collector's README advertises vulnerable-parameter detection, but its published script
+> only harvests Wayback URLs and checks host status. XOXSS keeps the useful CDX harvest and
+> adds parameter extraction, ranking and the Gxss-style reflection probe on top.
+
+The audit JSON contains `mode`, `targets`, `source`, `stats`, `errors` and a `candidates`
+array. Each candidate records `name`, `count`, `risk`, the collected `urls`, `sources`,
+`sample_url`, `reflected`, `context`, `status`, `method`, `probe_url`, `marker`, `evidence`
+and `executable`. JSONL is one candidate object per line.
+
 ### Output and persistence
 
 | Option | Description |
@@ -484,6 +530,43 @@ same options by workflow and include the default where one exists.
 | `--version` | Print the version and exit. |
 
 ## Usage recipes
+
+### God mode (`--god` / `--yolo`)
+
+```bash
+xoxss example.com --god
+```
+
+God mode is the everything-on, hands-off preset: pass one flag, pick your target
+(URL, bare domain, or `-l targets.txt`) and walk away. It automatically enables a
+best-of-everything configuration and retries degraded setups instead of asking questions:
+
+- **Recon and scope**: passive subdomain enumeration, subdomain brute-force of the first
+  50 candidates, `--allow-subdomains`, passive URL mining (Wayback / Common Crawl /
+  urlscan / OTX), OpenAPI discovery, hidden parameter mining.
+- **Discovery**: crawl at depth ≥ 6 with ≥ 3000 URLs, 60 parsed JavaScript files, path
+  discovery, path fuzzing and parameter fuzzing (25 names per endpoint).
+- **Injection**: ≥ 16 payloads per injection point, ≥ 1500 remote payloads (plus the
+  bundled LazyXss pack), header injection, stored-XSS hunting (20 pages) and
+  reflection reporting.
+- **Analyzers**: polyglots, JSONP, prototype pollution, mXSS, CSP and CORS analysis and
+  adaptive smart rate limiting.
+- **Verification**: the fastest browser available (Playwright if importable, otherwise
+  Chrome/Edge/Firefox found on PATH, with an explicit binary path where needed), two
+  headless workers and automatic screenshots for confirmed findings. With no browser at
+  all it continues HTTP-only.
+- **Blind XSS**: registers with a public interactsh server (`oast.pro`) and polls for
+  out-of-band callbacks, unless you already supplied `--blind`, `--interactsh`,
+  `--oob-poll` or `--oob-file`.
+- **External tools**: dalfox/nuclei/subfinder/gau/katana are used automatically when
+  installed.
+
+Networking is raised to 20 workers x 32 concurrent requests with a 30 s timeout.
+Explicit command-line flags always win, so `xoxss example.com --god --max-urls 500`
+still applies god mode everywhere except the URL budget. `--god` cannot be combined
+with the standalone `--mass` or `--param-audit` modes.
+
+> Authorized targets only — god mode is deliberately loud and thorough.
 
 ### Fast HTTP-only triage
 
@@ -608,6 +691,44 @@ as `Reflected XSS (HTTP evidence)` with `confidence: high`. `--tamper` and `--en
 transforms are applied to each request. `--jsonl` is the machine output;
 `--fail-on-findings` returns exit code 2 when anything actionable is found.
 
+### Parameter audit with collector and Gxss logic
+
+```bash
+xoxss example.com \
+  --param-audit \
+  --param-output artifacts/params.json \
+  --jsonl artifacts/params.jsonl
+```
+
+The audit pulls `*.example.com/*` from the Wayback CDX API (collector behavior), extracts
+parameter names and how often each appears, then rewrites one parameter at a time with a
+unique marker and checks the response without following redirects (Gxss behavior). Reflected
+candidates are printed first, including their context and a reproducing URL. To audit a
+specific set of URLs offline:
+
+```bash
+xoxss example.com \
+  --param-audit \
+  --param-input urls.txt \
+  --param-source none \
+  --param-output artifacts/params.json
+```
+
+For POST forms, pass a body; the audit tests each field in the body independently:
+
+```bash
+xoxss https://target.tld/login \
+  --param-audit \
+  --param-source none \
+  --param-data "user=test&pass=test" \
+  --param-output artifacts/login-params.json
+```
+
+Use `--param-source passive` to add Common Crawl, urlscan and OTX URLs to the Wayback
+harvest. `--fail-on-findings` exits 2 when at least one parameter reflects. Reflected
+candidates include a `probe_url`; feed those URLs to `--mass` or the main scanner to test
+exploitability.
+
 ### Runtime prototype pollution
 
 ```bash
@@ -672,6 +793,10 @@ Valid context identifiers are `html`, `attr_double`, `attr_single`, `attr_unquot
 automatically and also registered for generic contexts. Duplicates are skipped across
 every file. A single file can be supplied with `--payload-file`; use the platform path
 separator to pass several.
+
+XOXSS also ships the LazyXss payload list as `xoxss/data/lazyxss.txt`. It is enabled by
+default and sampled alongside the curated corpus; disable it with `--no-lazy-payloads`.
+See `xoxss/data/LAZYXSS_NOTICE.md` for provenance and the upstream licensing caveat.
 
 ### CI with SARIF
 
@@ -982,10 +1107,14 @@ xoxss/
     poller.py             HTTP and file pollers
   scan/
     fuzzer.py             path fuzzing, wordlists, parameter mining
+    parameters.py         collector-style URL harvest + Gxss-style reflection probe
   tools/
     external.py           optional subfinder/gau/katana/dalfox/nuclei adapters
   reports/
     sarif.py              SARIF v2.1.0 export
+  data/
+    lazyxss.txt           bundled LazyXss payload pack
+    LAZYXSS_NOTICE.md     payload provenance and licensing notice
   utils/                  console, helpers, markers, URL utilities
 tests/                    pytest suite and manual integration scripts
 ```
@@ -1217,6 +1346,10 @@ development extras and does not require a browser.
 - [SecLists](https://github.com/danielmiessler/SecLists) and
   [PayloadsAllTheThings](https://github.com/swisskyrepo/PayloadsAllTheThings) for the
   public payload corpora the scanner can download.
+- [LazyXss](https://github.com/iamunixtz/LazyXss) for the bundled payload list,
+  [Gxss](https://github.com/KathanP19/Gxss) for the per-parameter reflection technique and
+  [collector](https://github.com/thenurhabib/collector) for the Wayback parameter-harvest
+  workflow. See `xoxss/data/LAZYXSS_NOTICE.md` for payload provenance.
 - The [interactsh](https://github.com/projectdiscovery/interactsh) project for the
   out-of-band interaction protocol implemented by the native client.
 - The maintainers of aiohttp, BeautifulSoup, Selenium, Playwright, pytest and the

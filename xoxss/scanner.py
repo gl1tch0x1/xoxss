@@ -163,6 +163,14 @@ except Exception as _recon_exc:  # pragma: no cover
     ExternalToolkit = None  # type: ignore
     available_tools = lambda: {}  # type: ignore
 
+try:
+    from xoxss.scan.parameters import ParameterHarvester, ReflectionProbe
+    HAS_PARAM_AUDIT = True
+except Exception as _param_exc:  # pragma: no cover
+    HAS_PARAM_AUDIT = False
+    _PARAM_IMPORT_ERROR = str(_param_exc)
+    ParameterHarvester = None  # type: ignore
+    ReflectionProbe = None  # type: ignore
 
 
 try:
@@ -174,6 +182,12 @@ except Exception:  # pragma: no cover - package optional during partial installs
 
     def score_reflection(payload: str, response: str, marker: str = ""):  # type: ignore
         return 0.0, 100.0
+
+
+from xoxss.reports.sarif import (  # noqa: E402
+    build_sarif_document,
+    sarif_rule_id,
+)
 
 
 from xoxss.reports.sarif import (  # noqa: E402
@@ -1681,6 +1695,9 @@ def cleanup_payload_lists(work: Optional[Path], keep: bool, console: Console) ->
     console.debug(f"Removed temporary payload directory {work}")
 
 
+LAZY_PAYLOAD_FILE = Path(__file__).resolve().parent / "data" / "lazyxss.txt"
+
+
 class PayloadEngine:
     CONTEXTS = tuple(DEFAULT_PAYLOADS.keys())
 
@@ -1690,10 +1707,14 @@ class PayloadEngine:
         extra_file: Optional[str] = None,
         remote_files: Optional[Sequence[str]] = None,
         corpus_dirs: Optional[Sequence[str]] = None,
+        lazy_payloads: bool = True,
     ):
         self.console = console
         self.payloads: Dict[str, List[str]] = {key: list(value) for key, value in DEFAULT_PAYLOADS.items()}
         self.remote_payloads: List[str] = []
+        self.lazy_payloads: List[str] = []
+        self._lazy_by_context: Dict[str, List[str]] = {}
+        self._lazy_pool_cache: Dict[str, List[str]] = {}
         self._remote_set: Set[str] = set()
         self._seen: Set[str] = {payload for values in self.payloads.values() for payload in values}
         # A payload may deliberately live in more than one context (classified
@@ -1711,6 +1732,62 @@ class PayloadEngine:
             self._load_dir(directory)
         for path in remote_files or []:
             self._load_file(str(path), remote=True, quiet=True)
+        if lazy_payloads:
+            self._load_lazy_corpus()
+
+    def _load_lazy_corpus(self, limit: int = 12000) -> None:
+        """Load the bundled LazyXss corpus as an extended, context-classified pool.
+
+        The corpus is kept separate from ``payloads`` so the hand-curated
+        context payloads still receive most slots.  ``payloads_for`` reserves a
+        share of each batch for this pool, which keeps 7k payloads from pushing
+        the reliable built-ins out of the way.
+        """
+        path = LAZY_PAYLOAD_FILE
+        if not path.is_file():
+            self.console.debug(f"Bundled payload pack not found: {path}")
+            return
+        added = 0
+        seen: Set[str] = set()
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
+                for raw in handle:
+                    payload = raw.strip()
+                    if not payload or len(payload) > 2048:
+                        continue
+                    if payload in seen or payload in self._seen:
+                        continue
+                    # Reject prose/headings while keeping fragment and comment
+                    # payloads (e.g. ``#<script>``) that are valid for DOM sinks.
+                    lowered = payload.lower()
+                    if not any(
+                        marker in lowered
+                        for marker in (
+                            "<", "javascript:", "onerror", "onload", "onfocus",
+                            "alert", "prompt", "confirm", "eval(", "settimeout(",
+                            "%3c", "&lt;", "&lpar;", "&#", "svg", "script",
+                            "iframe", "srcdoc", "formaction", "document.",
+                            "window[", "top[", "constructor", "\\x", "\\u",
+                        )
+                    ):
+                        continue
+                    seen.add(payload)
+                    self.lazy_payloads.append(payload)
+                    context = classify_remote_payload(payload)
+                    self._lazy_by_context.setdefault(context, []).append(payload)
+                    if context != "generic":
+                        self._lazy_by_context.setdefault("generic", []).append(payload)
+                    added += 1
+                    if added >= limit:
+                        break
+        except OSError as exc:
+            self.console.warn(f"Could not read bundled payload pack {path}: {exc}")
+            return
+        if added:
+            self.console.ok(
+                f"Bundled LazyXss payload pack: {added} payload(s) ({path.name})",
+                important=False,
+            )
 
     def _load_dir(self, directory: str) -> None:
         root = Path(directory).expanduser()
@@ -1824,6 +1901,46 @@ class PayloadEngine:
     def probe(self, token: str) -> str:
         return f"{token}\"'><()"
 
+    def _lazy_pool_for(self, context: str) -> List[str]:
+        cached = self._lazy_pool_cache.get(context)
+        if cached is not None:
+            return cached
+        contexts: List[str] = []
+        if context in self._lazy_by_context:
+            contexts.append(context)
+        if "generic" in self._lazy_by_context:
+            contexts.append("generic")
+        seen: Set[str] = set(self._seen)
+        pool: List[str] = []
+        for ctx in contexts:
+            for template in self._lazy_by_context.get(ctx, []):
+                if template in seen:
+                    continue
+                seen.add(template)
+                pool.append(template)
+        self._lazy_pool_cache[context] = pool
+        return pool
+
+    def _lazy_pool_for(self, context: str) -> List[str]:
+        cached = self._lazy_pool_cache.get(context)
+        if cached is not None:
+            return cached
+        contexts: List[str] = []
+        if context in self._lazy_by_context:
+            contexts.append(context)
+        if "generic" in self._lazy_by_context:
+            contexts.append("generic")
+        seen: Set[str] = set(self._seen)
+        pool: List[str] = []
+        for ctx in contexts:
+            for template in self._lazy_by_context.get(ctx, []):
+                if template in seen:
+                    continue
+                seen.add(template)
+                pool.append(template)
+        self._lazy_pool_cache[context] = pool
+        return pool
+
     def payloads_for(self, context: str, limit: Optional[int] = None) -> List[str]:
         contexts = [context] if context in self.payloads else []
         for fallback in ("generic", "html"):
@@ -1838,25 +1955,54 @@ class PayloadEngine:
                 seen.add(template)
                 base.append(template)
 
+        lazy_pool = self._lazy_pool_for(context)
+
         if limit is None:
-            return base + [payload for payload in self.remote_payloads if payload not in seen]
+            return (
+                base
+                + [payload for payload in self.remote_payloads if payload not in seen]
+                + lazy_pool
+            )
 
         limit = max(1, limit)
-        # Reserve roughly a third of the slots for the downloaded corpus so every
-        # injection point sees some fresh payloads instead of the same five built-ins.
-        remote_quota = max(1, limit // 3) if self.remote_payloads else 0
-        base_quota = max(0, limit - remote_quota)
-        result = base[:base_quota]
-        remaining = limit - len(result)
-        if remaining > 0 and self.remote_payloads:
-            pool = [
-                payload
-                for payload in self.remote_payloads
-                if payload not in seen and payload not in result
-            ]
-            if len(pool) > remaining:
-                pool = random.sample(pool, remaining)
-            result.extend(pool)
+        used: Set[str] = set()
+        result: List[str] = []
+
+        def take(pool: Sequence[str], quota: int) -> None:
+            if quota <= 0:
+                return
+            candidates = [item for item in pool if item not in used and item not in result]
+            if not candidates:
+                return
+            chosen = random.sample(candidates, quota) if len(candidates) > quota else candidates
+            for item in chosen:
+                if item not in used:
+                    used.add(item)
+                    result.append(item)
+
+        if lazy_pool:
+            # 50% curated, 30% LazyXss, 20% downloaded corpus.  At least one
+            # curated payload is always kept so small limits stay reliable.
+            base_quota = max(1, limit // 2)
+            lazy_quota = min(max(1, int(limit * 0.3)), max(0, limit - base_quota))
+            remote_quota = max(0, limit - base_quota - lazy_quota)
+            if not self.remote_payloads:
+                lazy_quota += remote_quota
+                remote_quota = 0
+            take(base[:base_quota], base_quota)
+            take(lazy_pool, lazy_quota)
+            take(self.remote_payloads, remote_quota)
+            # Fill any shortfall (small pools, duplicates) from the remaining
+            # curated payloads first, then the extended pools.
+            take(base[base_quota:], limit - len(result))
+            take(lazy_pool, limit - len(result))
+            take(self.remote_payloads, limit - len(result))
+        else:
+            remote_quota = max(1, limit // 3) if self.remote_payloads else 0
+            base_quota = max(0, limit - remote_quota)
+            take(base, base_quota)
+            take(self.remote_payloads, remote_quota)
+            take(base[base_quota:], limit - len(result))
         return result[:limit]
 
     def render(self, template: str, token: str, context: str = "") -> str:
@@ -2365,6 +2511,7 @@ class XSSScanner:
                 args.payload_file,
                 remote_files=getattr(args, "payload_files", None),
                 corpus_dirs=getattr(args, "payload_dir", None),
+                lazy_payloads=getattr(args, "lazy_payloads", True),
             )
             try:
                 setattr(args, "_payload_engine", cached_payloads)
@@ -2424,18 +2571,9 @@ class XSSScanner:
         self.mxss_findings: List[Dict] = []
         self.proto_pollution_findings: List[Dict] = []
         self.cors_issues: List[Dict] = []
-        
-        # Initialize advanced modules if available
-        if HAS_ADVANCED:
-            if getattr(self.args, 'smart_rate', False):
-                # Replace rate limiter with smart version
-                from xoxss.analysis.rate_limit import SmartRateLimiter
-                self.http.limiter = SmartRateLimiter(
-                    initial_rate=self.args.rate_limit if self.args.rate_limit > 0 else 10.0,
-                    max_rate=50.0,
-                    min_rate=1.0,
-                    adaptive=True
-                )
+        # Adaptive rate limiting is handled above via HttpEngine.enable_smart_rate(),
+        # which installs an internal SmartRateLimiter and records every request;
+        # replacing self.http.limiter here would bypass that mechanism.
 
     # -- setup ------------------------------------------------------------------------
     @staticmethod
@@ -3856,7 +3994,7 @@ class XSSScanner:
         
         # Use per-character probing if enabled
         if HAS_ADVANCED and getattr(self.args, 'per_char_probe', False):
-            from xoxss.analysis.per_char import PerCharProbe
+            from xoxss.analysis.per_char import PerCharProbe, ProbeContext
             probe_engine = PerCharProbe()
             probe = probe_engine.generate_probe_string(token)
             response = await self.send_point(point, probe)
@@ -3865,13 +4003,13 @@ class XSSScanner:
                 return
             
             # Analyze with per-character probe
-            probe_analysis = probe_engine.analyze_response(probe, response.text, token)
+            probe_analysis = probe_engine.analyze_probe(response.text, token)
             info = analyze_reflection(
                 response.text, token, probe, response.header("content-type", "")
             )
             # Use context from per-char analysis if available
-            if probe_analysis.detected_context != 'unknown':
-                info.context = probe_analysis.detected_context
+            if probe_analysis.detected_context != ProbeContext.UNKNOWN:
+                info.context = probe_analysis.detected_context.value
         else:
             probe = self.payloads.probe(token)
             response = await self.send_point(point, probe)
@@ -3897,15 +4035,21 @@ class XSSScanner:
             for polyglot in polyglots:
                 if self._stop.is_set():
                     return
-                payload_token = unique_token()
                 payload = self.transform_payload(polyglot.payload)
                 result = await self.send_point(point, payload)
                 if result is None or result.error or not result.text:
                     continue
                 self.stats.payloads += 1
-                # Check if polyglot executed
-                if token in result.text or polyglot.marker in result.text:
-                    # Add finding
+                polyglot_info = analyze_reflection(
+                    result.text, token, payload, result.header("content-type", "")
+                )
+                # Confirm execution with the browser when one is available
+                if self.pool is not None and self.pool.engines and self.args.confirm != "http":
+                    finding = await self.confirm_in_browser(point, payload, token, polyglot_info)
+                    if finding:
+                        self.add_finding(finding)
+                        return
+                if polyglot_info.reflected:
                     self.add_finding(
                         Finding(
                             kind="Reflected XSS (polyglot)",
@@ -3920,69 +4064,73 @@ class XSSScanner:
                         )
                     )
                     return
-        else:
-            # Standard payload testing
-            for template in self.payloads.payloads_for(info.context, self.args.max_payloads):
-                if self._stop.is_set():
-                    return
-                payload_token = unique_token()
-                payload = self.transform_payload(
-                    self.payloads.render(template, payload_token, info.context)
-                )
-                result = await self.send_point(point, payload)
-                if result is None or result.error or not result.text:
-                    continue
-                self.stats.payloads += 1
-                payload_info = analyze_reflection(
-                    result.text, payload_token, payload, result.header("content-type", "")
-                )
-                if not payload_info.reflected:
-                    continue
-
-                if point.method.upper() == "POST" and self.args.stored and point.key() not in self._stored_checked:
-                    self._stored_checked.add(point.key())
-                    stored_page = await self.check_stored(point, payload_token, payload)
-                    if stored_page:
-                        self.add_finding(
-                            Finding(
-                                kind="Stored XSS (payload persisted)",
-                                url=stored_page,
-                                parameter=point.param,
-                                method="POST",
-                                payload=payload,
-                                evidence=f"payload persisted and re-rendered on {stored_page}",
-                                confidence="high",
-                                context=payload_info.context,
-                                detail="Persistence verified over HTTP; execution not re-confirmed",
-                            )
-                        )
-                        return
-
-                if not payload_info.executable and not self.args.report_reflections:
-                    self.console.debug(f"Reflected but not executable ({payload_info.context}): {location}")
-                    continue
-
-                if self.pool is not None and self.pool.engines and self.args.confirm != "http":
-                    finding = await self.confirm_in_browser(point, payload, payload_token, info)
-                    if finding:
-                        self.add_finding(finding)
-                        return
-
-                confidence = "high" if payload_info.executable else "low"
-                self.add_finding(
-                    Finding(
-                        kind="Reflected XSS (HTTP evidence)",
-                        url=point.url,
-                        parameter=point.param,
-                        method=point.method.upper(),
-                        payload=payload,
-                        evidence=f"payload reflected unescaped ({payload_info.detail})",
-                        confidence=confidence,
-                        context=info.context,
-                        detail="Browser verification unavailable or inconclusive",
-                    )
-                )
+            if polyglots:
                 return
+            # No polyglots for this context: fall through to the standard loop
+            # so the injection point is never left untested.
+
+        # Standard payload testing
+        for template in self.payloads.payloads_for(info.context, self.args.max_payloads):
+            if self._stop.is_set():
+                return
+            payload_token = unique_token()
+            payload = self.transform_payload(
+                self.payloads.render(template, payload_token, info.context)
+            )
+            result = await self.send_point(point, payload)
+            if result is None or result.error or not result.text:
+                continue
+            self.stats.payloads += 1
+            payload_info = analyze_reflection(
+                result.text, payload_token, payload, result.header("content-type", "")
+            )
+            if not payload_info.reflected:
+                continue
+
+            if point.method.upper() == "POST" and self.args.stored and point.key() not in self._stored_checked:
+                self._stored_checked.add(point.key())
+                stored_page = await self.check_stored(point, payload_token, payload)
+                if stored_page:
+                    self.add_finding(
+                        Finding(
+                            kind="Stored XSS (payload persisted)",
+                            url=stored_page,
+                            parameter=point.param,
+                            method="POST",
+                            payload=payload,
+                            evidence=f"payload persisted and re-rendered on {stored_page}",
+                            confidence="high",
+                            context=payload_info.context,
+                            detail="Persistence verified over HTTP; execution not re-confirmed",
+                        )
+                    )
+                    return
+
+            if not payload_info.executable and not self.args.report_reflections:
+                self.console.debug(f"Reflected but not executable ({payload_info.context}): {location}")
+                continue
+
+            if self.pool is not None and self.pool.engines and self.args.confirm != "http":
+                finding = await self.confirm_in_browser(point, payload, payload_token, info)
+                if finding:
+                    self.add_finding(finding)
+                    return
+
+            confidence = "high" if payload_info.executable else "low"
+            self.add_finding(
+                Finding(
+                    kind="Reflected XSS (HTTP evidence)",
+                    url=point.url,
+                    parameter=point.param,
+                    method=point.method.upper(),
+                    payload=payload,
+                    evidence=f"payload reflected unescaped ({payload_info.detail})",
+                    confidence=confidence,
+                    context=info.context,
+                    detail="Browser verification unavailable or inconclusive",
+                )
+            )
+            return
 
     async def confirm_in_browser(
         self,
@@ -4212,22 +4360,38 @@ class XSSScanner:
         response = await self.http.get(url, cache=True)
         if response.error or not response.text:
             return
-        
+
         endpoints = detector.discover_jsonp_endpoints(url, response.text, response.header("content-type", ""))
         for endpoint in endpoints:
             self.console.debug(f"JSONP endpoint found: {endpoint.url}")
-            
-            # Test for XSS
+            if not endpoint.callback_param or endpoint.callback_param == "inferred":
+                continue  # cannot inject into an inferred callback name
+
+            # Active same-origin test: replace the callback parameter with a
+            # script payload and check whether it is reflected unescaped.
             marker = unique_token()
-            test_results = detector.test_jsonp_injection(endpoint, marker)
-            for result in test_results:
-                if result.is_vulnerable:
-                    self.jsonp_findings.append({
-                        'url': endpoint.url,
-                        'callback_param': endpoint.callback_param,
-                        'evidence': result.evidence,
-                    })
-                    self.console.warn(f"JSONP XSS found: {endpoint.url} - {endpoint.callback_param}")
+            payload = f"<script>alert('{marker}')</script>"
+            try:
+                parts = urlsplit(endpoint.url)
+                query = parse_qsl(parts.query, keep_blank_values=True)
+            except ValueError:
+                continue
+            query = [(k, payload if k == endpoint.callback_param else v) for k, v in query]
+            if not any(k == endpoint.callback_param for k, _ in query):
+                query.append((endpoint.callback_param, payload))
+            test_url = urlunsplit(parts._replace(query=urlencode(query)))
+
+            result = await self.http.get(test_url)
+            if result.error or not result.text:
+                continue
+            # Raw payload present (not HTML-escaped and not URL-encoded)
+            if payload in result.text and f"&lt;" not in result.text[: result.text.find(payload) + len(payload) + 64]:
+                self.jsonp_findings.append({
+                    'url': endpoint.url,
+                    'callback_param': endpoint.callback_param,
+                    'evidence': f"callback parameter reflected unescaped with {payload[:48]}",
+                })
+                self.console.warn(f"JSONP XSS found: {endpoint.url} - {endpoint.callback_param}")
     
     async def _analyze_csp(self, url: str) -> None:
         """Analyze CSP headers for bypass opportunities."""
@@ -4866,11 +5030,195 @@ EXAMPLES = """
 examples:
   xoxss https://target.tld --crawl --headless
   xoxss https://target.tld/?q=1 --browser chrome --headless --dom
+  xoxss https://target.tld --god
+  xoxss https://target.tld --deep --report all
+  xoxss https://target.tld --god
+  xoxss https://target.tld --deep --report all
   xoxss -l targets.txt --threads 20 --rate-limit 15 --report all
   xoxss https://target.tld --no-browser --report-reflections --report json
   xoxss https://target.tld --tamper all --max-payloads 12 --scan-headers
   xoxss https://target.tld --stored --stored-pages 20 --screenshot
 """
+
+
+# --------------------------------------------------------------------------------------
+# god mode (--god / --yolo)
+# --------------------------------------------------------------------------------------
+
+_GOD_BROWSERS: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = {
+    # kind -> (PATH command names, direct binary locations relative to install dirs)
+    "chrome": (
+        ("chrome", "chrome.exe", "google-chrome", "google-chrome-stable"),
+        (r"Google\Chrome\Application\chrome.exe",),
+    ),
+    "chromium": (
+        ("chromium", "chromium.exe", "chromium-browser"),
+        (r"Chromium\Application\chromium.exe",),
+    ),
+    "edge": (
+        ("msedge", "msedge.exe", "microsoft-edge", "microsoft-edge-stable"),
+        (r"Microsoft\Edge\Application\msedge.exe",),
+    ),
+    "firefox": (
+        ("firefox", "firefox.exe"),
+        (r"Mozilla Firefox\firefox.exe",),
+    ),
+}
+
+
+def _locate_browser(kind: str) -> Optional[str]:
+    """Find a local browser binary: PATH name first, then common install dirs."""
+    names, locations = _GOD_BROWSERS.get(kind, ((kind,), ()))
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            return found
+    bases: List[Path] = []
+    if os.name == "nt":
+        for env in ("ProgramFiles", "ProgramFiles(x86)", "LocalAppData"):
+            value = os.environ.get(env)
+            if value and Path(value).is_dir():
+                bases.append(Path(value))
+    for relative in locations:
+        for base in bases:
+            candidate = base / relative
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+def _god_browser_choice() -> Optional[Tuple[str, Optional[str]]]:
+    """Best browser backend for god mode: Playwright first, then local engines."""
+    with suppress(Exception):
+        import playwright  # noqa: F401
+
+        return "playwright", None
+    for kind in ("chrome", "edge", "firefox", "chromium"):
+        binary = _locate_browser(kind)
+        if binary:
+            return kind, binary
+    return None
+
+
+def apply_god_preset(
+    args: argparse.Namespace,
+    console: "Console",
+    user_flags: Set[str],
+) -> None:
+    """``--god`` / ``--yolo`` preset: every capability on without further input.
+
+    Budgets are raised to aggressive-but-safe maximums; explicit command-line
+    flags always win so the user can still pin individual settings.
+    """
+
+    def unclaimed(*flags: str) -> bool:
+        return not any(flag in user_flags for flag in flags)
+
+    def bump(attr: str, value: Any, flag: Optional[str] = None) -> None:
+        if flag and not unclaimed(flag):
+            return
+        current = getattr(args, attr, None)
+        if current is None:
+            setattr(args, attr, value)
+        else:
+            setattr(args, attr, max(current, value))
+
+    recon = HAS_RECON
+
+    # -- discovery ----------------------------------------------------------------------
+    args.crawl = True
+    bump("crawl_depth", 6, "--crawl-depth")
+    bump("max_urls", 3000, "--max-urls")
+    bump("js_files", 60, "--js-files")
+    if unclaimed("--no-discover"):
+        args.discover = True
+    args.discover_paths = True
+    args.fuzz_paths = True
+    if unclaimed("--no-fuzz-params"):
+        args.fuzz_params = True
+    bump("fuzz_param_limit", 25, "--fuzz-param-limit")
+    if recon:
+        args.subdomains = True
+        args.passive_urls = True
+        args.openapi = True
+        args.mine_params = True
+        args.allow_subdomains = True
+        bump("subdomain_brute", 50, "--subdomain-brute")
+
+    # -- injection ----------------------------------------------------------------------
+    bump("max_payloads", 16, "--max-payloads")
+    if getattr(args, "remote_payloads", True):
+        bump("payload_limit", 1500, "--payload-limit")
+    args.scan_headers = True
+    args.stored = True
+    bump("stored_pages", 20, "--stored-pages")
+    args.report_reflections = True
+
+    # -- advanced analysis (cheap, HTTP-level) -------------------------------------------
+    args.polyglot = True
+    args.jsonp = True
+    args.csp_analyze = True
+    args.cors_analyze = True
+    args.proto_pollution = True
+    args.mxss = True
+    args.smart_rate = True
+
+    # -- network -------------------------------------------------------------------------
+    bump("threads", 20, "--threads")
+    bump("concurrency", 32, "--concurrency")
+    bump("timeout", 30.0, "--timeout")
+    bump("retries", 2, "--retries")
+
+    # -- browser / evidence ---------------------------------------------------------------
+    if args.no_browser or not unclaimed("--no-browser"):
+        args.confirm = "http"
+    else:
+        if unclaimed("--browser"):
+            choice = _god_browser_choice()
+            if choice is not None:
+                kind, binary = choice
+                args.browser = kind
+                if binary and not args.binary and unclaimed("--binary"):
+                    args.binary = binary
+            else:
+                console.warn(
+                    "God mode: no local browser found - continuing HTTP-only (equivalent to --no-browser)"
+                )
+                args.no_browser = True
+                args.confirm = "http"
+        if not args.no_browser:
+            bump("browser_workers", 2, "--browser-workers")
+            args.headless = True
+            args.screenshot = True
+
+    # -- blind XSS / out-of-band -----------------------------------------------------------
+    configured_oob = bool(
+        getattr(args, "blind", None)
+        or getattr(args, "interactsh", None)
+        or getattr(args, "oob_poll", None)
+        or getattr(args, "oob_file", None)
+    )
+    if (
+        not configured_oob
+        and recon
+        and InteractshClient is not None
+        and unclaimed("--interactsh")
+    ):
+        try:
+            import cryptography  # noqa: F401
+        except Exception:
+            console.warn("God mode: cryptography missing - automatic blind-XSS callbacks disabled")
+        else:
+            args.interactsh = "oast.pro"
+            bump("oob_wait", 45.0, "--oob-wait")
+
+    # -- external tools ---------------------------------------------------------------------
+    if HAS_RECON and ExternalToolkit is not None and unclaimed("--external-tools") and not args.external_tools:
+        tools: Dict[str, Any] = {}
+        with suppress(Exception):
+            tools = available_tools() or {}
+        if any(name in tools for name in ("dalfox", "nuclei", "subfinder", "gau", "katana")):
+            args.external_tools = True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4890,6 +5238,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--deep",
         action="store_true",
         help="deep crawl preset: depth 5, 1500 URLs, robots/sitemap/JS + path discovery, parameter fuzzing",
+    )
+    godmode = parser.add_argument_group("god mode")
+    godmode.add_argument(
+        "--god",
+        "--yolo",
+        dest="god",
+        action="store_true",
+        help="full-automatic maximum-aggression preset: recon + deep crawl + fuzzing + browser "
+        "verification + interactsh blind-XSS + external tools; no other flags needed",
     )
     crawl.add_argument("--crawl-depth", type=int, default=3, help="crawl depth (default: 3)")
     crawl.add_argument("--max-urls", type=int, default=500, help="maximum URLs to scan (default: 500)")
@@ -4964,6 +5321,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="DIR",
         help="load every .txt/.lst/.json payload corpus under DIR (repeatable)",
+    )
+    injection.add_argument(
+        "--lazy-payloads",
+        dest="lazy_payloads",
+        action="store_true",
+        default=True,
+        help="load the bundled LazyXss payload pack (default: on)",
+    )
+    injection.add_argument(
+        "--no-lazy-payloads",
+        dest="lazy_payloads",
+        action="store_false",
+        help="disable the bundled LazyXss payload pack",
     )
     injection.add_argument(
         "--remote-payloads",
@@ -5115,7 +5485,64 @@ def build_parser() -> argparse.ArgumentParser:
     mass.add_argument(
         "--jsonl",
         metavar="PATH",
-        help="append one JSON finding per line (mass mode)",
+        help="append one JSON finding per line (mass mode or --param-audit)",
+    )
+
+    params = parser.add_argument_group("parameter audit")
+    params.add_argument(
+        "--param-audit",
+        action="store_true",
+        help="collect Wayback parameters and probe each one for reflection (collector + Gxss style) and exit",
+    )
+    params.add_argument(
+        "--param-input",
+        metavar="PATH",
+        help="read seed URLs from a file (when set alone, Wayback harvesting is skipped)",
+    )
+    params.add_argument(
+        "--param-source",
+        choices=["wayback", "passive", "both", "none"],
+        help="URL source for --param-audit (default: wayback, or none when --param-input is used)",
+    )
+    params.add_argument(
+        "--param-limit",
+        type=int,
+        default=5000,
+        help="maximum historic URLs to harvest for parameter audit (default: 5000)",
+    )
+    params.add_argument(
+        "--param-max-checks",
+        type=int,
+        default=10000,
+        help="maximum parameter reflection checks per audit (default: 10000)",
+    )
+    params.add_argument(
+        "--param-marker",
+        default="XoxssReflect",
+        help="alphanumeric reflection marker used for each parameter (default: XoxssReflect)",
+    )
+    params.add_argument(
+        "--param-data",
+        metavar="BODY",
+        help="POST form body for Gxss-style checks, e.g. 'user=test&pass=test'",
+    )
+    params.add_argument(
+        "--param-output",
+        metavar="PATH",
+        help="write the parameter-audit JSON report to this file",
+    )
+    params.add_argument(
+        "--param-subs",
+        dest="param_subs",
+        action="store_true",
+        default=True,
+        help="include subdomains in Wayback harvesting (default: on)",
+    )
+    params.add_argument(
+        "--no-param-subs",
+        dest="param_subs",
+        action="store_false",
+        help="only harvest the exact host, not its subdomains",
     )
 
     output = parser.add_argument_group("output")
@@ -5147,6 +5574,15 @@ def print_payloads() -> None:
         print(f"\n[{context}]")
         for template in DEFAULT_PAYLOADS[context]:
             print(f"  {template}")
+    try:
+        with open(LAZY_PAYLOAD_FILE, "r", encoding="utf-8-sig", errors="replace") as handle:
+            bundled = sum(1 for line in handle if line.strip())
+    except OSError:
+        bundled = 0
+    print(
+        f"\n[Bundled LazyXss pack] {bundled} payload(s) at {LAZY_PAYLOAD_FILE} "
+        "(enabled by default; disable with --no-lazy-payloads)"
+    )
 
 
 def print_tampers() -> None:
@@ -5336,6 +5772,7 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
         console,
         args.payload_file,
         corpus_dirs=getattr(args, "payload_dir", None),
+        lazy_payloads=getattr(args, "lazy_payloads", True),
     )
     http = HttpEngine(
         console,
@@ -5459,6 +5896,234 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
     return 0, actionable
 
 
+async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[int, int]:
+    """Collect candidate parameters (collector style) and probe reflection (Gxss style).
+
+    This mode is intentionally independent from the full scanner: it performs no
+    crawling, browser work, payload download or checkpointing.  It harvests URLs
+    from Wayback (or an input file), extracts parameter names, then substitutes a
+    unique marker into exactly one parameter per request and checks the response.
+    """
+    if not HAS_PARAM_AUDIT:
+        console.error(
+            "Parameter-audit modules failed to import: "
+            + str(globals().get("_PARAM_IMPORT_ERROR", "unknown error"))
+        )
+        return 1, 0
+
+    targets = gather_targets(args, console)
+    if targets is None:
+        return 1, 0
+    if not targets:
+        console.error("No target supplied. Run with --help for usage.")
+        return 1, 0
+
+    stats = ScanStats(urls_total=len(targets))
+    http = HttpEngine(
+        console,
+        stats,
+        headers=XSSScanner._parse_headers(args.headers),
+        cookies=XSSScanner._parse_cookies(args.cookies),
+        timeout=args.timeout,
+        retries=args.retries,
+        rate=args.rate_limit,
+        concurrency=args.concurrency,
+        proxy=args.proxy,
+        insecure=args.insecure,
+    )
+    harvester = ParameterHarvester(
+        http, console, limit=max(1, args.param_limit), timeout=max(10.0, args.timeout * 2)
+    )
+    probe = ReflectionProbe(
+        http,
+        console,
+        marker=args.param_marker,
+        concurrency=max(1, args.concurrency),
+    )
+
+    seed_urls: List[str] = []
+    source_errors: List[str] = []
+    source = args.param_source or (
+        "none" if (args.param_input or args.param_data) else "wayback"
+    )
+    if source in ("passive", "both") and not HAS_RECON:
+        console.warn("Passive URL collection is unavailable; scanning the supplied targets only")
+        source = "wayback" if source == "both" else "none"
+    try:
+        if args.param_input:
+            try:
+                with open(args.param_input, "r", encoding="utf-8-sig", errors="replace") as handle:
+                    for line in handle:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            seed_urls.append(line)
+            except OSError as exc:
+                console.error(f"Cannot read --param-input {args.param_input}: {exc}")
+                return 1, 0
+
+        for target in targets:
+            candidate_target = target if target.lower().startswith(("http://", "https://")) else "http://" + target
+            seed_urls.append(candidate_target)
+
+        if source in ("wayback", "both"):
+            wayback_attempted = 0
+            wayback_found = 0
+            for target in targets:
+                host = (urlsplit(target if "://" in target else "http://" + target).hostname or "").lower()
+                if not host:
+                    continue
+                domain = host
+                if HAS_RECON and root_domain is not None:
+                    try:
+                        domain = root_domain(host) or host
+                    except Exception:
+                        domain = host
+                wayback_attempted += 1
+                found = await harvester.wayback(domain, include_subdomains=bool(args.param_subs))
+                wayback_found += len(found)
+                seed_urls.extend(found)
+            if wayback_attempted and not wayback_found:
+                console.warn(
+                    "Wayback returned no URLs for the target, or the CDX API is unavailable; "
+                    "use --param-input with a URL list to audit offline."
+                )
+
+        if source in ("passive", "both") and HAS_RECON and PassiveURLCollector is not None:
+            for target in targets:
+                host = (urlsplit(target if "://" in target else "http://" + target).hostname or "").lower()
+                if not host:
+                    continue
+                domain = host
+                if root_domain is not None:
+                    try:
+                        domain = root_domain(host) or host
+                    except Exception:
+                        domain = host
+                try:
+                    collected = await PassiveURLCollector(
+                        http,
+                        console,
+                        timeout=max(10.0, args.timeout * 2),
+                        limit=max(1, args.param_limit),
+                    ).collect(domain)
+                    seed_urls.extend(collected.urls)
+                    source_errors.extend(collected.errors)
+                except Exception as exc:
+                    source_errors.append(f"{domain}: {exc}"[:300])
+    finally:
+        await http.close()
+
+    if args.param_data:
+        # Gxss -d: test form fields from an explicit body on the first seed.
+        if not seed_urls:
+            console.error("--param-data requires at least one target URL")
+            return 1, 0
+        try:
+            pairs = parse_qsl(args.param_data, keep_blank_values=True)
+        except Exception:
+            pairs = []
+        if not pairs:
+            console.error("--param-data must be a form body such as 'user=test&pass=test'")
+            return 1, 0
+        report = harvester.from_pairs(seed_urls[0], pairs, source="post")
+    else:
+        report = harvester.harvest(seed_urls, domain="", source="audit")
+    report.errors.extend(source_errors)
+
+    if not report.candidates:
+        console.warn(
+            "No query parameters found. Supply URLs with parameters via --param-input, "
+            "use --param-source passive, or pass a target URL with a query string."
+        )
+        return 0, 0
+
+    max_checks = max(1, int(args.param_max_checks or 10000))
+    candidates = report.candidates[:max_checks]
+    # The HTTP engine was closed after harvesting; reopen it for the probe pass
+    # so the session lifetime stays explicit and testable.
+    http = HttpEngine(
+        console,
+        stats,
+        headers=XSSScanner._parse_headers(args.headers),
+        cookies=XSSScanner._parse_cookies(args.cookies),
+        timeout=args.timeout,
+        retries=args.retries,
+        rate=args.rate_limit,
+        concurrency=args.concurrency,
+        proxy=args.proxy,
+        insecure=args.insecure,
+    )
+    probe.http = http
+    try:
+        candidates = await probe.probe_candidates(candidates, data=args.param_data or "")
+    finally:
+        await http.close()
+
+    stats.passive_urls = len(report.urls)
+    stats.discovered_params = len(report.candidates)
+    reflected = [candidate for candidate in candidates if candidate.reflected]
+    candidates.sort(key=lambda item: (not item.reflected, -item.count, item.name))
+
+    console.info(
+        f"Parameter audit: {len(report.urls)} URL(s), {len(candidates)} parameter(s), "
+        f"{len(reflected)} reflecting",
+        important=True,
+    )
+    for candidate in candidates:
+        if args.quiet and not candidate.reflected:
+            continue
+        if candidate.reflected:
+            console.ok(
+                f"reflected: {candidate.name} "
+                f"(risk={candidate.risk}, hits={candidate.count}, context={candidate.context or 'unknown'})",
+                important=True,
+            )
+        else:
+            console.raw(
+                f"  candidate: {candidate.name} (risk={candidate.risk}, hits={candidate.count})"
+            )
+        if candidate.reflected and candidate.probe_url:
+            console.raw(f"      {candidate.probe_url}")
+        if args.verbose and candidate.evidence:
+            console.raw(f"      {candidate.evidence}")
+
+    report_payload: Dict[str, Any] = {
+        "tool": APP_NAME,
+        "version": VERSION,
+        "mode": "param-audit",
+        "finished": datetime.now(timezone.utc).isoformat(),
+        "targets": targets,
+        "source": source,
+        "stats": asdict(stats),
+        "candidates": [candidate.to_dict() for candidate in candidates],
+        "errors": report.errors,
+    }
+    if args.param_output:
+        output_path = Path(args.param_output)
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(
+                json.dumps(report_payload, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            console.info(f"Parameter audit JSON written to {output_path}", important=False)
+        except OSError as exc:
+            console.warn(f"Cannot write parameter audit report {output_path}: {exc}")
+
+    if args.jsonl:
+        try:
+            jsonl_path = Path(args.jsonl)
+            jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(jsonl_path, "a", encoding="utf-8") as handle:
+                for candidate in candidates:
+                    handle.write(json.dumps(candidate.to_dict(), ensure_ascii=False) + "\n")
+            console.info(f"Parameter audit JSONL written to {jsonl_path}", important=False)
+        except OSError as exc:
+            console.warn(f"Cannot write parameter audit JSONL {args.jsonl}: {exc}")
+
+    return 0, len(reflected)
+
+
 async def run_targets(args: argparse.Namespace, console: Console) -> Tuple[int, int]:
     actionable = 0
     targets = gather_targets(args, console)
@@ -5541,6 +6206,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 1
 
+    if getattr(args, "god", False):
+        raw_tokens = list(argv) if argv is not None else sys.argv[1:]
+        user_flags = {
+            token
+            for token in raw_tokens
+            if token.startswith("--") and token not in ("--god", "--yolo")
+        }
+        apply_god_preset(args, console, user_flags)
+        console.info("GOD MODE engaged: full-automatic maximum-aggression preset applied", important=True)
+        console.info(
+            f"god preset: crawl depth {args.crawl_depth}/{args.max_urls} URLs/{args.js_files} JS files, "
+            f"{args.max_payloads} payloads per point, {args.threads} workers x {args.concurrency} requests, "
+            f"browser {'off (HTTP-only)' if args.no_browser else args.browser}, "
+            f"OOB {'interactsh' if getattr(args, 'interactsh', None) else ('blind callback' if args.blind else 'off')}",
+        )
+
     recon_flags = (
         getattr(args, "subdomains", False)
         or int(getattr(args, "subdomain_brute", 0) or 0) > 0
@@ -5593,6 +6274,70 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.discover = True
         args.discover_paths = True
         args.fuzz_params = True
+
+    if args.mass and getattr(args, "param_audit", False):
+        console.error("--mass and --param-audit are separate modes; choose one")
+        return 1
+
+    if getattr(args, "god", False) and (args.mass or getattr(args, "param_audit", False)):
+        console.error("--god is a full-scan preset; it cannot be combined with --mass or --param-audit")
+        return 1
+
+    if getattr(args, "param_audit", False):
+        if not HAS_PARAM_AUDIT:
+            console.error(
+                "Parameter-audit modules failed to import: "
+                + str(globals().get("_PARAM_IMPORT_ERROR", "unknown error"))
+            )
+            return 1
+        console.info(
+            "Parameter audit: collector-style URL harvest + Gxss-style per-parameter reflection probe",
+            important=False,
+        )
+        install_uvloop()
+        try:
+            code, reflected = asyncio.run(run_param_audit(args, console))
+            if args.fail_on_findings and reflected:
+                code = 2
+        except KeyboardInterrupt:
+            console.warn("Interrupted")
+            code = 130
+        except Exception as exc:
+            console.error(f"Fatal error: {exc}")
+            if args.verbose:
+                console.raw(traceback.format_exc())
+            code = 1
+        return code
+
+    if args.mass and getattr(args, "param_audit", False):
+        console.error("--mass and --param-audit are separate modes; choose one")
+        return 1
+
+    if getattr(args, "param_audit", False):
+        if not HAS_PARAM_AUDIT:
+            console.error(
+                "Parameter-audit modules failed to import: "
+                + str(globals().get("_PARAM_IMPORT_ERROR", "unknown error"))
+            )
+            return 1
+        console.info(
+            "Parameter audit: collector-style URL harvest + Gxss-style per-parameter reflection probe",
+            important=False,
+        )
+        install_uvloop()
+        try:
+            code, reflected = asyncio.run(run_param_audit(args, console))
+            if args.fail_on_findings and reflected:
+                code = 2
+        except KeyboardInterrupt:
+            console.warn("Interrupted")
+            code = 130
+        except Exception as exc:
+            console.error(f"Fatal error: {exc}")
+            if args.verbose:
+                console.raw(traceback.format_exc())
+            code = 1
+        return code
 
     if args.mass:
         if args.blind:

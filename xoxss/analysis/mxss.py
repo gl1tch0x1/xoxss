@@ -54,7 +54,7 @@ class MXSSDetector:
             '3.0.6', '3.0.7', '3.0.8', '3.0.9',
             '3.0.10', '3.0.11', '3.0.12', '3.1.0',
             '3.1.1', '3.1.2', '3.1.3', '3.1.4',
-            '3.1.5', '3.1.6', '3.1.7',
+            '3.1.5', '3.1.6',
         ],
         SanitizerType.SANITIZE_HTML: [
             '1.0.0', '1.0.1', '1.0.2',
@@ -219,7 +219,7 @@ class MXSSDetector:
             return "Current sanitizer version appears safe"
 
         if analysis.sanitizer == SanitizerType.DOMPURIFY:
-            return "Upgrade DOMPurify to version 3.1.7 or later"
+            return "Upgrade DOMPurify to version 3.1.8 or later (3.1.7 fixed the severe mXSS regressions)"
         elif analysis.sanitizer == SanitizerType.SANITIZE_HTML:
             return "Upgrade sanitize-html to version 2.11.0 or later"
         elif analysis.sanitizer == SanitizerType.JS_XSS:

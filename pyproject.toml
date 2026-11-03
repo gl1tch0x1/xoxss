@@ -49,6 +49,7 @@ Source = "https://github.com/gl1tch0x1/xoxss"
 
 [tool.setuptools]
 include-package-data = true
+package-data = { "xoxss" = ["data/*.txt", "data/*.md"] }
 
 [tool.setuptools.packages.find]
 include = ["xoxss*"]

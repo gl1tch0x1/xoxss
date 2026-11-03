@@ -68,20 +68,22 @@ class GraphQLAnalyzer:
 
     def detect_graphql_endpoint(self, url: str, response: str) -> bool:
         """Check if the endpoint is a GraphQL API."""
-        graphql_indicators = [
-            'data',
-            'errors',
-            'extensions',
-            'query',
-            'mutation',
-            'subscription',
-        ]
-
         try:
             json_data = json.loads(response)
-            return any(indicator in json_data for indicator in graphql_indicators)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, TypeError):
             return False
+        if not isinstance(json_data, dict):
+            return False
+
+        raw = str(json_data)
+        # Meta fields (__typename / __schema) are unambiguous GraphQL markers;
+        # a bare "data" key alone matches almost every REST/JSON API, so it
+        # must be combined with another GraphQL-specific sibling.
+        if "__typename" in raw or "__schema" in raw:
+            return True
+        has_data = "data" in json_data
+        has_gql_siblings = ("errors" in json_data) or ("extensions" in json_data)
+        return has_data and has_gql_siblings
 
     def analyze_graphql_query(self, query: str, marker: str) -> List[GraphQLVulnerability]:
         """
@@ -132,12 +134,17 @@ class GraphQLAnalyzer:
             return f'<script>window.__xoxss_gql.push(\'{marker}\')</script>'
 
     def check_introspection(self, response: str) -> bool:
-        """Check if GraphQL introspection is enabled."""
+        """Check if GraphQL introspection is enabled.
+
+        ``__typename`` is added automatically by many clients to ordinary
+        responses, so only the schema introspection markers count.
+        """
         try:
             json_data = json.loads(response)
-            return any(intro in str(json_data) for intro in self.INTROSPECTION_QUERIES)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, TypeError):
             return False
+        raw = str(json_data)
+        return "__schema" in raw or "__type(name:" in raw or "__typename!" in raw
 
     def detect_dangerous_types(self, schema: str) -> List[str]:
         """Detect dangerous field types in GraphQL schema."""

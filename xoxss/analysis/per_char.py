@@ -60,47 +60,12 @@ class PerCharProbe:
         ':', '?', '%', '.', '@', '_', '-', '+',
     ]
 
-    # Context detection patterns
-    CONTEXT_PATTERNS = {
-        ProbeContext.HTML: [
-            r'&lt;[a-zA-Z]',
-            r'^[^"]*<[^>]',
-            r'[^<]*<[^>]*(?=>)',
-        ],
-        ProbeContext.ATTR_DOUBLE: [
-            r'="[^"]*x',
-            r'\s\w+="[^"]*x',
-        ],
-        ProbeContext.ATTR_SINGLE: [
-            r"=\'[^\']*x",
-            r"\s\w+='[^\']*x",
-        ],
-        ProbeContext.ATTR_UNQUOTED: [
-            r'=[^"\'<>\s]*x',
-            r'=\S+x',
-        ],
-        ProbeContext.SCRIPT: [
-            r';\s*x',
-            r'\]\s*x',
-            r'\}\s*x',
-            r'\(\s*x',
-            r'"[^"]*x"',
-            r"'[^']*x'",
-        ],
-        ProbeContext.STYLE: [
-            r'{[^}]*x',
-            r':[^;]*x',
-        ],
-        ProbeContext.COMMENT: [
-            r'<!--.*x',
-            r'/\*.*x',
-            r'//.*x',
-        ],
-        ProbeContext.JSON: [
-            r'"{[^}]*x',
-            r':\s*"[^"]*x"',
-        ],
-    }
+    # Context detection: anchored on the probe reflection and delegated to the
+    # parser-based ContextDetector (regex heuristics hard-coding specific
+    # letters misclassify almost any page text, so they were removed).
+
+    def __init__(self):
+        self._probe_marker = "X0XSS_CH4R_PR0B3"
 
     # Character survival rules per context
     CONTEXT_CHAR_RULES = {
@@ -181,7 +146,7 @@ class PerCharProbe:
                 surviving.add(char)
             elif self._is_escaped(response, char, probe_marker):
                 escaped.add(char)
-            elif self._is_encoded(response, char):
+            elif self._is_encoded(response, char, probe_marker):
                 encoded.add(char)
             else:
                 blocked.add(char)
@@ -208,39 +173,84 @@ class PerCharProbe:
         )
 
     def _is_escaped(self, response: str, char: str, marker: str) -> bool:
-        """Check if a character is HTML escaped."""
+        """Check if a character is HTML escaped around the probe reflection."""
         escaped_map = {
             '<': '&lt;',
             '>': '&gt;',
             '"': '&quot;',
             "'": '&#39;',
         }
+        window = self._reflection_window(response, marker)
+        if not window:
+            return False
         escaped = escaped_map.get(char, '')
-        if escaped and escaped in response:
+        if escaped and escaped in window:
             return True
         # Check for numeric entities
-        if f"&#{ord(char)};" in response:
+        if f"&#{ord(char)};" in window:
             return True
         return False
 
-    def _is_encoded(self, response: str, char: str) -> bool:
-        """Check if a character is URL encoded."""
+    def _is_encoded(self, response: str, char: str, marker: str) -> bool:
+        """Check if a character is URL encoded around the probe reflection."""
         import urllib.parse
-        encoded = urllib.parse.quote(char)
-        if encoded in response:
-            return True
-        return False
+        window = self._reflection_window(response, marker)
+        if not window:
+            return False
+        return urllib.parse.quote(char) in window
+
+    @staticmethod
+    def _reflection_window(response: str, marker: str, radius: int = 200) -> str:
+        """Text around the first probe reflection (whole-document defaults to
+        false positives: one unrelated ``&lt;`` in a nav bar would otherwise
+        mark every probe as escaped)."""
+        if not response or not marker:
+            return ""
+        index = response.find(marker)
+        if index == -1:
+            return ""
+        start = max(0, index - radius)
+        end = min(len(response), index + len(marker) + radius)
+        return response[start:end]
 
     def _detect_context(self, response: str, marker: str) -> ProbeContext:
-        """Detect the injection context from the response."""
-        snippet = response[:500] if response else ""
+        """Detect the injection context anchored on the probe reflection.
 
-        for context, patterns in self.CONTEXT_PATTERNS.items():
-            for pattern in patterns:
-                if re.search(pattern, snippet, re.I | re.DOTALL):
-                    return context
-
-        return ProbeContext.UNKNOWN
+        Delegates to the parser-based :class:`ContextDetector`, which parses
+        the markup before the reflection instead of scoring regexes that
+        hard-code probe characters.
+        """
+        if not response or not marker:
+            return ProbeContext.UNKNOWN
+        index = response.find(marker)
+        if index == -1:
+            return ProbeContext.UNKNOWN
+        try:
+            from xoxss.detection.context import ContextDetector, ContextType
+        except Exception:
+            return ProbeContext.UNKNOWN
+        analysis = ContextDetector().detect_context(response, index, marker=marker)
+        mapping = {
+            ContextType.HTML_BODY: ProbeContext.HTML,
+            ContextType.HTML_TAG: ProbeContext.HTML,
+            ContextType.SVG_DATA: ProbeContext.HTML,
+            ContextType.MATHML: ProbeContext.HTML,
+            ContextType.TEMPLATE_LITERAL: ProbeContext.HTML,
+            ContextType.ATTR_DOUBLE_QUOTED: ProbeContext.ATTR_DOUBLE,
+            ContextType.ATTR_SINGLE_QUOTED: ProbeContext.ATTR_SINGLE,
+            ContextType.ATTR_UNQUOTED: ProbeContext.ATTR_UNQUOTED,
+            ContextType.JAVASCRIPT_STRING_DOUBLE: ProbeContext.SCRIPT,
+            ContextType.JAVASCRIPT_STRING_SINGLE: ProbeContext.SCRIPT,
+            ContextType.JAVASCRIPT_TEMPLATE: ProbeContext.SCRIPT,
+            ContextType.JAVASCRIPT_CODE: ProbeContext.SCRIPT,
+            ContextType.HTML_COMMENT: ProbeContext.COMMENT,
+            ContextType.JAVASCRIPT_COMMENT: ProbeContext.COMMENT,
+            ContextType.CSS_STRING: ProbeContext.STYLE,
+            ContextType.CSS_PROPERTY: ProbeContext.STYLE,
+            ContextType.JSON_STRING: ProbeContext.JSON,
+            ContextType.JSON_VALUE: ProbeContext.JSON,
+        }
+        return mapping.get(analysis.context_type, ProbeContext.UNKNOWN)
 
     def _calculate_confidence(
         self,

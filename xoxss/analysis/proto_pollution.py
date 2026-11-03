@@ -52,12 +52,11 @@ class PrototypePollutionDetector:
     # Pollution source patterns
     POLLUTION_PATTERNS = {
         PollutionSource.MERGE: [
-            r'\.merge\s*\(',
-            r'\.assign\s*\(',
-            r'\Object\.merge\s*\(',
+            r'(?:Object\s*\.\s*)?merge\s*\(',
+            r'Object\s*\.\s*assign\s*\(',
         ],
         PollutionSource.JQUERY_EXTEND: [
-            r'\$\.\extend\s*\(',
+            r'\$\.extend\s*\(',
             r'jQuery\.extend\s*\(',
         ],
         PollutionSource.LODASH_MERGE: [
@@ -199,9 +198,9 @@ class PrototypePollutionDetector:
     def get_pollution_sink(self, js_content: str) -> Optional[str]:
         """Identify the primary pollution sink in the code."""
         sinks = {
-            'Object.assign': r'\.assign\s*\(',
-            'Object.merge': r'\.merge\s*\(',
-            'jQuery.extend': r'\$\.\extend\s*\(',
+            'Object.assign': r'Object\s*\.\s*assign\s*\(',
+            'Object.merge': r'Object\s*\.\s*merge\s*\(',
+            'jQuery.extend': r'\$\.extend\s*\(',
             'Lodash.merge': r'_\.merge\s*\(',
         }
 

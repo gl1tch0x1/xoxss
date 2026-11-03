@@ -53,7 +53,9 @@ class CSPAnalyzer:
     Analyzes Content-Security-Policy headers for bypass opportunities.
     """
 
-    # Dangerous CSP values
+    # Dangerous CSP values: matched exhaustively ('*', 'unsafe-inline', ...) or
+    # by scheme prefix ('data:', 'blob:') — never as a raw substring, which
+    # would flag every legitimate https:// source because 'http:' in 'https://x'.
     DANGEROUS_VALUES = ['*', 'unsafe-inline', 'unsafe-eval', 'data:', 'blob:', 'http:', 'https:']
 
     # Required directives for a strong CSP
@@ -154,38 +156,49 @@ class CSPAnalyzer:
         # Check for dangerous values
         for directive, values in directives.items():
             for value in values:
+                matched_dangerous = None
                 for dangerous in self.DANGEROUS_VALUES:
-                    if dangerous in value:
-                        issues.append(CSPIssue(
-                            issue_type="dangerous_value",
-                            severity=CSPSeverity.HIGH,
-                            description=f"{directive} contains dangerous value: {dangerous}",
-                            directive=directive,
-                            value=value
-                        ))
+                    if dangerous.endswith(':'):
+                        # Bare scheme tokens ('data:', 'https:') allow every
+                        # resource of that scheme and are dangerous; a concrete
+                        # origin such as 'https://cdn.example.com' is not.
+                        if value in (dangerous, dangerous + '*'):
+                            matched_dangerous = dangerous
+                            break
+                    elif value == dangerous:
+                        matched_dangerous = dangerous
+                        break
+                if matched_dangerous:
+                    issues.append(CSPIssue(
+                        issue_type="dangerous_value",
+                        severity=CSPSeverity.HIGH,
+                        description=f"{directive} contains dangerous value: {matched_dangerous}",
+                        directive=directive,
+                        value=value
+                    ))
 
-                        # Add corresponding bypass
-                        if dangerous == 'unsafe-inline':
-                            bypasses.append(CSPBypass(
-                                technique=self.BYPASS_TECHNIQUES['unsafe_inline']['technique'],
-                                payload=self.BYPASS_TECHNIQUES['unsafe_inline']['payload'],
-                                description=self.BYPASS_TECHNIQUES['unsafe_inline']['description'],
-                                success_probability=0.9
-                            ))
-                        elif dangerous == '*':
-                            bypasses.append(CSPBypass(
-                                technique=self.BYPASS_TECHNIQUES['wildcard_origin']['technique'],
-                                payload=self.BYPASS_TECHNIQUES['wildcard_origin']['payload'],
-                                description=self.BYPASS_TECHNIQUES['wildcard_origin']['description'],
-                                success_probability=0.8
-                            ))
-                        elif dangerous == 'data:':
-                            bypasses.append(CSPBypass(
-                                technique=self.BYPASS_TECHNIQUES['data_uri']['technique'],
-                                payload=self.BYPASS_TECHNIQUES['data_uri']['payload'],
-                                description=self.BYPASS_TECHNIQUES['data_uri']['description'],
-                                success_probability=0.7
-                            ))
+                    # Add corresponding bypass
+                    if matched_dangerous == 'unsafe-inline':
+                        bypasses.append(CSPBypass(
+                            technique=self.BYPASS_TECHNIQUES['unsafe_inline']['technique'],
+                            payload=self.BYPASS_TECHNIQUES['unsafe_inline']['payload'],
+                            description=self.BYPASS_TECHNIQUES['unsafe_inline']['description'],
+                            success_probability=0.9
+                        ))
+                    elif matched_dangerous == '*':
+                        bypasses.append(CSPBypass(
+                            technique=self.BYPASS_TECHNIQUES['wildcard_origin']['technique'],
+                            payload=self.BYPASS_TECHNIQUES['wildcard_origin']['payload'],
+                            description=self.BYPASS_TECHNIQUES['wildcard_origin']['description'],
+                            success_probability=0.8
+                        ))
+                    elif matched_dangerous == 'data:':
+                        bypasses.append(CSPBypass(
+                            technique=self.BYPASS_TECHNIQUES['data_uri']['technique'],
+                            payload=self.BYPASS_TECHNIQUES['data_uri']['payload'],
+                            description=self.BYPASS_TECHNIQUES['data_uri']['description'],
+                            success_probability=0.7
+                        ))
 
         # Check for JSONP gadget domains
         gadget_domains = ['ajax.googleapis.com', 'cdn.jsdelivr.net', 'cdnjs.cloudflare.com']

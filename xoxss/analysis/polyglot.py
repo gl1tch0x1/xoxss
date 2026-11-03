@@ -135,7 +135,9 @@ class PolyglotGenerator:
 
         Args:
             marker: Unique marker string for verification
-            target_contexts: Specific contexts to target (None = all)
+            target_contexts: Specific contexts to target (None = all); plain
+                context strings (``"html"``, ``"attr_double"``) are accepted and
+                converted, unknown names are ignored.
             max_payloads: Maximum number of payloads to return
             prioritize_coverage: Prioritize payloads that cover more contexts
 
@@ -143,6 +145,23 @@ class PolyglotGenerator:
             List of PolyglotPayload objects
         """
         if target_contexts is None:
+            target_contexts = list(PolyglotContext)
+
+        normalized: List[PolyglotContext] = []
+        for context in target_contexts:
+            if isinstance(context, PolyglotContext):
+                enum_context = context
+            else:
+                try:
+                    enum_context = PolyglotContext(str(context))
+                except ValueError:
+                    continue
+            if enum_context not in normalized:
+                normalized.append(enum_context)
+        target_contexts = normalized
+        if not target_contexts:
+            # Unknown / mixed contexts: fall back to the universal set so the
+            # caller still gets usable payloads.
             target_contexts = list(PolyglotContext)
 
         cache_key = (marker, frozenset(target_contexts))
@@ -202,6 +221,12 @@ class PolyglotGenerator:
         template = re.sub(r'alert\s*\(\s*1\s*\)', marker_js, template)
         template = re.sub(r'alert\s*\(\s*"1"\s*\)', marker_js, template)
         template = re.sub(r'alert\s*\(\s*\'1\'\s*\)', marker_js, template)
+
+        if '{marker}' in template:
+            # Templates embed the marker as a placeholder; replace it with the
+            # recording JS so browser execution can be detected and the token
+            # string appears in the response for reflection checks.
+            template = template.replace('{marker}', marker_js)
 
         if '{marker}' not in template and marker_js not in template:
             template = template.replace('<script>', f'<script>{marker_js};')

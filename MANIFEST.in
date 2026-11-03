@@ -4,3 +4,4 @@ include requirements.txt
 include pyproject.toml
 include pyrightconfig.json
 recursive-include xoxss *.py
+recursive-include xoxss/data *.txt *.md

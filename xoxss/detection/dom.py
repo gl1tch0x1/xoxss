@@ -106,8 +106,9 @@ class DOMAnalyzer:
         DOMSink.LOCATION_HREF: r'\.location\.href\s*=',
         DOMSink.LOCATION_HASH: r'\.location\.hash\s*=',
         DOMSink.LOCATION_SEARCH: r'\.location\.search\s*=',
-        DOMSink.DOCUMENT_REFERRER: r'document\.referrer',
-        DOMSink.WINDOW_NAME: r'window\.name',
+        # NOTE: document.referrer / window.name are pure *sources* (read-only);
+        # listing them as sinks produced bogus 1.0-confidence self-flows for
+        # every script that merely reads one of them.
         DOMSink.JQUERY_HTML: r'\$\([^)]*\)\.html\s*\(',
         DOMSink.JQUERY_APPEND: r'\$\([^)]*\)\.append\s*\(',
         DOMSink.JQUERY_PREPEND: r'\$\([^)]*\)\.prepend\s*\(',
@@ -230,6 +231,10 @@ class DOMAnalyzer:
         """
         for source in self._sources:
             for sink in self._sinks:
+                # A source is not a flow into itself (reads-before-uses are
+                # handled by the assignment requirement of the sink patterns).
+                if sink.line_number == source.line_number and str(sink.sink_type) == str(source.source_type):
+                    continue
                 # Simple heuristic: if source and sink are in close proximity
                 line_distance = abs(sink.line_number - source.line_number)
                 if line_distance < 20:  # Within 20 lines

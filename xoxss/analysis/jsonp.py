@@ -84,31 +84,34 @@ class JSONPAnalyzer:
         Returns:
             List of discovered JSONP endpoints
         """
-        endpoints = []
+        callbacks: List[JSONPEndpoint] = []
 
         if not self.is_jsonp_response(body):
-            return endpoints
+            return callbacks
 
         callback_param = self.detect_callback_param(url)
         if callback_param:
-            endpoints.append(JSONPEndpoint(
+            callbacks.append(JSONPEndpoint(
                 url=url,
                 callback_param=callback_param,
                 callback_value=None,
                 response_format=content_type
             ))
+            return callbacks
 
-        # Check for inline JSONP in script tags
+        # A JavaScript body wrapping JSON in a call is only worth reporting as
+        # an inferred endpoint when no callback parameter was found explicitly,
+        # and only once per URL.
         if 'application/javascript' in content_type or 'text/javascript' in content_type:
             if self.is_jsonp_response(body):
-                endpoints.append(JSONPEndpoint(
+                callbacks.append(JSONPEndpoint(
                     url=url,
                     callback_param="inferred",
                     callback_value=None,
                     response_format=content_type
                 ))
 
-        return endpoints
+        return callbacks
 
     def test_jsonp_injection(
         self,
