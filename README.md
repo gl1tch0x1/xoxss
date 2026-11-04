@@ -100,7 +100,7 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 - Internal path fuzzing with soft-404 detection, hidden-parameter mining, and parameter
   fuzzing on endpoints that expose no query string.
 - Optional orchestration of installed `subfinder`, `gau`, `waybackurls`, `katana`,
-  `httpx`, `dalfox` and `nuclei` binaries.
+  `httpx`, `arjun`, `x8`, `dalfox` and `nuclei` binaries.
 
 **Payloads and evasion**
 
@@ -206,15 +206,16 @@ injected parameter — no cookies or session data.
 
 | Component | Required | Notes |
 |---|---|---|
-| Python | **3.9+** | CI covers 3.9, 3.12 and 3.13. |
+| Python | **3.9+** | CI covers 3.9 through 3.13. |
 | `aiohttp` | Yes | HTTP engine, concurrency, retries. |
+| `aiodns` | Yes | Asynchronous DNS on supported event loops; threaded resolver fallback elsewhere. |
 | `beautifulsoup4` | Yes | HTML parsing and form extraction. |
 | `selenium` + `webdriver-manager` | For browser mode | Drivers resolve via Selenium Manager first, then webdriver-manager. |
 | Firefox / Chrome / Edge | For Selenium mode | Use `--no-browser` for HTTP-only operation. |
 | Playwright | Optional | `--browser playwright`; requires `playwright install chromium`. |
 | `cryptography` | Optional | Native `--interactsh` decryption. |
 | `uvloop` | Optional | Faster event loop on non-Windows platforms. |
-| External binaries | Optional | `subfinder`, `gau`, `waybackurls`, `katana`, `httpx`, `dalfox`, `nuclei`; missing tools contribute nothing. |
+| External binaries | Optional | `subfinder`, `gau`, `waybackurls`, `katana`, `httpx`, `arjun`, `x8`, `dalfox`, `nuclei`; missing tools contribute nothing. |
 
 Linux, macOS and Windows are supported. On Windows, `uvloop` is skipped and Selenium
 Manager resolves the browser driver. The scanner degrades to HTTP-only mode when no
@@ -325,12 +326,21 @@ Run `xoxss --help` for the authoritative generated reference.
 
 ## CLI reference
 
+Use `--profile quick` for a short HTTP-only pass with local payloads, `--profile balanced`
+for the normal defaults, or `--profile deep` to enable the deep crawl preset. Explicit
+CLI flags take precedence over quick-profile defaults. Response bodies are capped at
+5 MiB by default; tune `--max-response-bytes N` for applications that return unusually
+large pages. Truncated bodies are reported in scan statistics and reports.
+
 ### Targets and discovery
 
 | Option | Description |
 |---|---|
 | `TARGET ...` | One or more URLs or bare domains. Bare domains get `http://`. |
 | `-l, --target-list PATH` | File with one target per line (# comments ignored). |
+
+When no target or target list is supplied, XOXSS reads one URL per line from piped
+standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mass --jsonl findings.jsonl`.
 | `--crawl` / `--deep` | Crawl before scanning / deep preset (depth ≥ 5, ≥ 1500 URLs, discovery, path probing, parameter fuzzing). |
 | `--crawl-depth N` / `--max-urls N` | Crawl depth (default `3`) and scan budget (default `500`). |
 | `--discover` / `--discover-paths` | Parse robots.txt, sitemaps and JavaScript (on by default) / probe 41 common endpoint paths. |
@@ -409,19 +419,21 @@ Run `xoxss --help` for the authoritative generated reference.
 | `--timeout S` / `--retries N` | Per-request timeout (default `20`) / retries (default `2`). |
 | `--rate-limit N` | Global requests-per-second cap; `0` is unlimited. |
 | `--proxy URL` / `--insecure` | HTTP(S) proxy / disable TLS verification (authorized targets only). |
+| `--max-response-bytes N` | Maximum response body size analyzed (default `5242880`). |
 | `--headers "Name: Value"` / `--cookies "a=b; c=d"` | Extra headers and cookies for HTTP probes. |
 | `-o, --output PATH` | Mirror the console log to a file. |
 | `--report LIST` | `json`, `md`, `html`, `sarif`, combinations, `all`, or `none` (default `all`). |
 | `--report-dir DIR` / `--state-dir DIR` | Report root / checkpoint root (default `.xoxss`). |
+| `--events-jsonl PATH` | Append versioned JSONL target, discovery, finding, and completion events for automation. |
 | `--no-state` / `--no-resume` | Disable checkpoints / reset and start over. |
 | `--verbose` / `--quiet` / `--no-color` | Debug output / findings-only / disable ANSI colours. |
 | `--fail-on-findings` | Exit `2` when confirmed/high findings exist. |
 | `--doctor` / `--list-payloads` / `--list-tampers` / `--list-encoders` / `--version` | Diagnostics and registry inspection. |
 
 > [!NOTE]
-> `--headers` and `--cookies` apply to the HTTP engine. A browser verification session
-> is not seeded with those cookies or headers; reach authenticated areas through a
-> proxy or an unauthenticated equivalent flow.
+> `--headers` and `--cookies` apply to HTTP requests. Browser verification does not
+> inherit them. Cross-origin redirects are stopped to keep credentials and scan traffic
+> on the original origin; redirects are still checked against the configured scope.
 
 ### Mass mode
 
@@ -432,6 +444,13 @@ get `--mass-params "q,search,..."` fallbacks, and each parameter gets
 transforms apply per request. Only executable reflections are emitted, as
 `Reflected XSS (HTTP evidence)` with `confidence: high`. `--jsonl PATH` appends one
 finding object per line for streaming ingestion.
+
+When no target argument or `--target-list` is provided, xoxss reads one URL per
+line from piped standard input. Blank lines and lines beginning with `#` are ignored:
+
+```bash
+subfinder -d example.com -silent | httpx -silent | python -m xoxss --mass --jsonl findings.jsonl
+```
 
 ### Parameter audit (collector + Gxss)
 
@@ -458,6 +477,12 @@ The audit JSON contains `mode`, `targets`, `source`, `stats`, `errors` and a
 `probe_url`s to `--mass` or the main scanner to test exploitability. `--fail-on-findings`
 exits `2` when any parameter reflects.
 
+When Arjun or x8 is installed, the main discovery flow can also add their hidden query
+parameter names to the scanner's candidate set. Reflection probes compare two benign
+control responses first and record response drift as baseline evidence; a drifting
+baseline does not discard a candidate because that alone cannot establish whether a
+reflection is safe or exploitable.
+
 ## Recipes
 
 ### God mode (`--god` / `--yolo`)
@@ -481,7 +506,7 @@ It enables and retries degraded setups automatically:
   headless workers, screenshots; HTTP-only without a browser.
 - **Blind XSS**: public interactsh (`oast.pro`) unless you supplied `--blind`,
   `--interactsh`, `--oob-poll` or `--oob-file`.
-- **External tools**: dalfox/nuclei/subfinder/gau/katana when installed.
+- **External tools**: dalfox/nuclei/subfinder/gau/katana/arjun/x8 when installed.
 
 Networking is raised to 20 workers × 32 concurrent requests, 30 s timeout. Explicit
 flags always win (`--god --max-urls 500` keeps the URL budget). Not combinable with
@@ -621,6 +646,9 @@ Each requested format is written as:
 Screenshots go to `<state-dir>/screenshots/` (`<token>.png`, `dom-<token>.png`) and are
 linked from findings. `--jsonl` is mass-mode output only: one finding object per line,
 appended across runs.
+Full scans can use `--events-jsonl` for live lifecycle and finding events. JSON reports
+include verification availability and coverage notes for request failures and truncated
+responses, so an empty finding list is easier to interpret.
 
 The JSON report (abridged — the real document also includes per-bundle JS
 intelligence, OpenAPI operations, OOB registrations and every analyzer list):
@@ -745,8 +773,12 @@ xoxss/
     fuzzer.py             path fuzzing, wordlists, parameter mining
     parameters.py         collector-style harvest + Gxss-style reflection probe
   tools/
-    external.py           optional subfinder/gau/katana/dalfox/nuclei adapters
+    external.py           optional recon, parameter discovery and XSS tool adapters
   reports/
+    common.py             shared report helpers
+    html.py               standalone HTML report
+    json.py               JSON report payload and writer
+    markdown.py           Markdown report
     sarif.py              SARIF v2.1.0 export
   data/
     lazyxss.txt           bundled LazyXss payload pack
@@ -806,6 +838,7 @@ probe.
 | `--payload-limit` | `600` | Remote corpus size. |
 | `--js-files` | `25` | JavaScript files parsed per scan. |
 | `--max-urls` | `500` | Crawl/scan URL budget. |
+| `--max-response-bytes` | `5242880` | Per-response body analysis budget. |
 
 - **Triage first, confirm second.** Find candidates with `--no-browser` or `--mass`,
   then re-scan promising URLs with browser confirmation.
@@ -862,9 +895,9 @@ matching, SARIF generation, encoders, AST taint, recon parsers, JS intelligence,
 OpenAPI expansion, OOB correlation, external-tool parsing, mass mode, god mode,
 parameter audit, runtime prototype pollution and a mock interactsh server.
 Browser-dependent tests skip when no browser is available. `pyrightconfig.json`
-configures Pyright/Pylance (include scope intentionally narrow). CI runs the
-import/CLI checks, pytest and the integration smoke on Python 3.9, 3.12 and 3.13,
-without a browser.
+configures the CLI entry point, typed configuration and SARIF exporter. CI runs
+Pyright, import/CLI checks, pytest and the integration smoke on Python 3.9 through
+3.13, without a browser.
 
 Contributions: keep changes focused, explain security rationale, add or update tests
 (never weaken assertions), update this README for flag/report changes, and preserve

@@ -57,10 +57,11 @@ def build_sarif_document(
     waf_names: Iterable[str] = (),
     duration_seconds: float = 0.0,
     endpoint_count: int = 0,
+    truncated_responses: int = 0,
     blind_markers: Optional[Sequence[Dict[str, Any]]] = None,
     tool_name: str = "XOX$$",
     tool_version: str = "2.0.0",
-    information_uri: str = "https://github.com/example/xoxss",
+    information_uri: str = "https://github.com/gl1tch0x1/xoxss",
     timestamp: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a SARIF v2.1.0 document for a completed scan."""
@@ -133,6 +134,12 @@ def build_sarif_document(
                     "parameter": parameter,
                     "method": method,
                     "confidence": confidence,
+                    "confidenceRationale": getattr(finding, "confidence_rationale", "") or {
+                        "confirmed": "Direct confirmation evidence was recorded for this finding.",
+                        "high": "Strong technical evidence was recorded; browser execution was not recorded for this finding.",
+                        "medium": "A supporting signal was observed without direct execution proof.",
+                        "low": "A heuristic signal needs manual validation.",
+                    }.get(confidence, "Review the evidence manually."),
                     "context": getattr(finding, "context", ""),
                     "payload": getattr(finding, "payload", ""),
                     "evidence": getattr(finding, "evidence", ""),
@@ -169,6 +176,7 @@ def build_sarif_document(
                             "waf": list(waf_names),
                             "durationSeconds": round(duration_seconds, 2),
                             "endpoints": endpoint_count,
+                            "truncatedResponses": truncated_responses,
                         },
                     }
                 ],

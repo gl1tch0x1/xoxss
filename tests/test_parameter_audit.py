@@ -3,6 +3,7 @@
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -102,6 +103,16 @@ def test_parameter_harvester_counts_and_ranks():
     assert report.sources["test"] == 3
 
 
+def test_parameter_harvester_adapts_external_names():
+    harvester = ParameterHarvester(http=object(), console=Console(quiet=True))
+    report = harvester.from_names(
+        "https://app.test/search", ["page", "q", "q", ""], source="arjun/x8"
+    )
+    assert {candidate.name for candidate in report.candidates} == {"q", "page"}
+    assert all(candidate.sample_url == "https://app.test/search" for candidate in report.candidates)
+    assert report.sources == {"arjun/x8": 1}
+
+
 def test_wayback_list_parser_keeps_scope_and_parameters():
     text = "\n".join(
         [
@@ -172,6 +183,35 @@ def test_post_parameter_probe(server):
     assert by_name["user"].reflected is True
     assert by_name["user"].method == "POST"
     assert by_name["pass"].reflected is False
+
+
+def test_reflection_probe_records_dynamic_control_baseline():
+    class NoisyHttp:
+        def __init__(self):
+            self.calls = 0
+
+        async def get(self, url, **kwargs):
+            self.calls += 1
+            value = parse_qs(urlsplit(url).query).get("q", [""])[0]
+            body = f"<html><p>{value}</p><small>clock-{self.calls}</small></html>"
+            return SimpleNamespace(status=200, text=body, error=None)
+
+        async def post(self, url, **kwargs):
+            raise AssertionError("unexpected POST")
+
+    async def run():
+        http = NoisyHttp()
+        candidate = ParameterHarvester(http, Console(quiet=True)).harvest(
+            ["https://app.test/search?q=initial"], source="test"
+        ).candidates[0]
+        result = await ReflectionProbe(http, Console(quiet=True), marker="Baseline").probe_candidates([candidate])
+        return http.calls, result[0]
+
+    calls, candidate = asyncio.run(run())
+    assert calls == 3  # two controls plus the unique marker request
+    assert candidate.reflected is True
+    assert candidate.baseline_dynamic is True
+    assert candidate.baseline_similarity is not None and candidate.baseline_similarity < 0.985
 
 
 def test_param_audit_end_to_end_writes_json_and_jsonl(server, tmp_path):

@@ -57,11 +57,14 @@ from xoxss.recon.subdomains import (
     root_domain,
 )
 from xoxss.tools.external import (
+    ExternalToolkit,
     parse_dalfox,
+    parse_arjun_json,
     parse_ffuf,
     parse_katana,
     parse_nuclei,
     parse_subfinder,
+    parse_x8_json,
 )
 from xoxss.scan.fuzzer import expand_paths, load_wordlist
 
@@ -527,6 +530,47 @@ def test_external_tool_parsers():
 
     ffuf = json.dumps({"results": [{"url": "https://example.com/admin", "status": 200}]})
     assert parse_ffuf(ffuf)[0]["url"] == "https://example.com/admin"
+
+    arjun = json.dumps({"https://example.com/search": {"GET": ["q", "page"]}})
+    assert parse_arjun_json(arjun) == {
+        "https://example.com/search": ["page", "q"]
+    }
+    row_output = json.dumps({"url": "https://example.com/api", "parameters": [{"name": "debug"}]})
+    assert parse_arjun_json(row_output) == {"https://example.com/api": ["debug"]}
+    assert parse_x8_json(json.dumps({"parameters": ["admin", "token"]}), "https://example.com/") == {
+        "https://example.com/": ["admin", "token"]
+    }
+
+
+def test_external_parameter_tools_merge_json_results(monkeypatch):
+    import xoxss.tools.external as external
+    from types import SimpleNamespace
+    from pathlib import Path
+
+    monkeypatch.setattr(external, "available_tools", lambda: {"arjun": "arjun", "x8": "x8"})
+
+    class _NullConsole:
+        def info(self, *args, **kwargs): pass
+        def warn(self, *args, **kwargs): pass
+        def debug(self, *args, **kwargs): pass
+
+    toolkit = ExternalToolkit(_NullConsole(), tools=["arjun", "x8"])
+
+    class Runner:
+        async def run(self, tool, args, *, timeout=None):
+            output_path = Path(args[-1])
+            url = args[args.index("-u") + 1]
+            if tool == "arjun":
+                output_path.write_text(json.dumps({url: {"GET": ["arjunParam"]}}), encoding="utf-8")
+                assert "-m" in args and args[args.index("-m") + 1] == "GET"
+            else:
+                output_path.write_text(json.dumps({url: {"parameters": ["x8Param"]}}), encoding="utf-8")
+                assert args[args.index("-O") + 1] == "json"
+            return SimpleNamespace(stdout="", returncode=0)
+
+    toolkit.runner = Runner()
+    result = asyncio.run(toolkit.parameters(["https://example.com/search"]))
+    assert result == {"https://example.com/search": ["arjunParam", "x8Param"]}
 
 
 # --------------------------------------------------------------------------------------

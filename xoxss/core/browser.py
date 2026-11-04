@@ -15,7 +15,7 @@ import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional, Protocol
 
 
 class ConsoleLike(Protocol):
@@ -209,7 +209,8 @@ class BrowserEngine:
         user_agent: Optional[str] = None,
         proxy: Optional[str] = None,
         binary: Optional[str] = None,
-        insecure: bool = True,
+        insecure: bool = False,
+        url_allowed: Optional[Callable[[str], bool]] = None,
     ):
         self.console = console
         self.kind = (kind or "firefox").lower()
@@ -219,7 +220,9 @@ class BrowserEngine:
         self.proxy = proxy
         self.binary = binary
         self.insecure = insecure
+        self.url_allowed = url_allowed
         self.driver: Any = None
+        self.navigation_count = 0
         self._lock = asyncio.Lock()
         self._cdp_hook = False
         self._suppress_dialogs = self.kind in ("chrome", "chromium", "edge")
@@ -343,11 +346,14 @@ class BrowserEngine:
 
     # -- page interaction -------------------------------------------------------------
     async def navigate(self, url: str) -> str:
+        if self.url_allowed is not None and not self.url_allowed(url):
+            return "URL is outside the configured scan scope"
         async with self._lock:
             return await asyncio.to_thread(self._navigate_sync, url)
 
     def _navigate_sync(self, url: str) -> str:
         driver = self.driver
+        self.navigation_count += 1
         error = ""
         try:
             driver.get(url)
@@ -459,6 +465,7 @@ class BrowserEngine:
 
     async def submit_form(self, form_index: int, field_name: str, value: str) -> Dict[str, str]:
         async with self._lock:
+            self.navigation_count += 1
             return await asyncio.to_thread(self._submit_sync, form_index, field_name, value)
 
     def _submit_sync(self, form_index: int, field_name: str, value: str) -> Dict[str, str]:
@@ -520,7 +527,8 @@ class PlaywrightEngine:
         user_agent: Optional[str] = None,
         proxy: Optional[str] = None,
         binary: Optional[str] = None,
-        insecure: bool = True,
+        insecure: bool = False,
+        url_allowed: Optional[Callable[[str], bool]] = None,
     ):
         self.console = console
         self.kind = kind or "playwright"
@@ -530,11 +538,13 @@ class PlaywrightEngine:
         self.proxy = proxy
         self.binary = binary
         self.insecure = insecure
+        self.url_allowed = url_allowed
         self._lock = asyncio.Lock()
         self._pw: Any = None
         self._browser: Any = None
         self._context: Any = None
         self.page: Any = None
+        self.navigation_count = 0
         self._dialogs: List[str] = []
         self._page_handler: Any = None
 
@@ -675,9 +685,12 @@ class PlaywrightEngine:
             self._pw = None
 
     async def navigate(self, url: str) -> str:
+        if self.url_allowed is not None and not self.url_allowed(url):
+            return "URL is outside the configured scan scope"
         async with self._lock:
             if self.page is None:
                 return "no page"
+            self.navigation_count += 1
             self._dialogs.clear()
             error = ""
             try:
@@ -749,6 +762,7 @@ class PlaywrightEngine:
             result = {"fill": "error", "submit": "error"}
             if self.page is None:
                 return result
+            self.navigation_count += 1
             fill_js = r"""
             ({index, name, value}) => {
               var forms = document.forms, form = forms[index];
@@ -827,10 +841,11 @@ class PlaywrightEngine:
 class BrowserPool:
     """Small pool of drivers; each driver serialises its own work."""
 
-    def __init__(self, console: ConsoleLike, size: int, factory):
+    def __init__(self, console: ConsoleLike, size: int, factory, recycle_after: int = 90):
         self.console = console
         self.size = max(1, size)
         self.factory = factory
+        self.recycle_after = max(1, int(recycle_after))
         self.engines: List[BrowserEngine] = []
         self._queue: Optional[asyncio.Queue] = None
 
@@ -857,7 +872,17 @@ class BrowserPool:
         try:
             yield engine
         finally:
-            self._queue.put_nowait(engine)
+            if engine.navigation_count >= self.recycle_after:
+                await engine.stop()
+                if await engine.start():
+                    engine.navigation_count = 0
+                    self.console.debug("Browser worker recycled after its navigation budget")
+                else:
+                    self.console.warn("Browser worker failed to restart and was retired")
+                    if engine in self.engines:
+                        self.engines.remove(engine)
+            if engine in self.engines:
+                self._queue.put_nowait(engine)
 
     async def stop(self) -> None:
         for engine in self.engines:

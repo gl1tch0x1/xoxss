@@ -161,3 +161,17 @@ class ScanConfig:
         if self.no_browser:
             self.dom = False
             self.confirm = VerificationStrategy.HTTP
+
+        bounded_positive = {
+            "crawl_depth": self.crawl_depth,
+            "max_urls": self.max_urls,
+            "threads": self.threads,
+            "concurrency": self.concurrency,
+            "browser_workers": self.browser_workers,
+            "timeout": self.timeout,
+        }
+        invalid = [name for name, value in bounded_positive.items() if value <= 0]
+        if invalid:
+            raise ValueError("configuration values must be positive: " + ", ".join(invalid))
+        if self.retries < 0 or self.rate_limit < 0 or self.oob_interval <= 0 or self.oob_wait < 0:
+            raise ValueError("retries, rate limits, and OOB timing must be non-negative (interval must be positive)")

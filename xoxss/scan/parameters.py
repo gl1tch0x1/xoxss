@@ -19,6 +19,7 @@ that can be fed into the main scanner or triaged on its own.
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -130,6 +131,8 @@ class ParameterCandidate:
     marker: str = ""
     evidence: str = ""
     executable: bool = False
+    baseline_similarity: Optional[float] = None
+    baseline_dynamic: bool = False
 
     def add(self, url: str, source: str = "") -> None:
         self.count += 1
@@ -159,6 +162,8 @@ class ParameterCandidate:
             "marker": self.marker,
             "evidence": self.evidence,
             "executable": self.executable,
+            "baseline_similarity": self.baseline_similarity,
+            "baseline_dynamic": self.baseline_dynamic,
         }
 
 
@@ -351,6 +356,33 @@ class ParameterHarvester:
         )
         return report
 
+    def from_names(
+        self,
+        url: str,
+        names: Iterable[str],
+        *,
+        source: str = "external",
+    ) -> ParameterReport:
+        """Adapt externally discovered names to the scanner's ranked model."""
+        clean = _clean_url(url)
+        report = ParameterReport(urls=[clean] if clean else [])
+        seen: Set[str] = set()
+        for raw_name in names:
+            name = str(raw_name or "").strip()
+            if not clean or not name or len(name) > 80 or name in seen:
+                continue
+            seen.add(name)
+            candidate = ParameterCandidate(name=name, risk=parameter_risk(name))
+            candidate.add(clean, source)
+            report.candidates.append(candidate)
+        report.sources[source] = 1 if report.candidates else 0
+        report.candidates.sort(
+            key=lambda item: (
+                {"high": 0, "normal": 1, "low": 2}.get(item.risk, 3), item.name
+            )
+        )
+        return report
+
 
 class ReflectionProbe:
     """Gxss-style one-parameter-at-a-time reflection checker."""
@@ -376,6 +408,41 @@ class ReflectionProbe:
         # Gxss uses a plain alphanumeric marker.  UUID suffix avoids matching
         # text that already existed on the page.
         return f"{self.marker}{uuid.uuid4().hex[:8]}"
+
+    async def _baseline(
+        self,
+        url: str,
+        name: str,
+        post_pairs: Optional[Sequence[Tuple[str, str]]],
+    ) -> Tuple[Optional[float], bool]:
+        """Compare two benign controls to measure page noise before probing."""
+        controls = (self._new_marker(), self._new_marker())
+        responses: List[Any] = []
+        for control in controls:
+            try:
+                if post_pairs is None:
+                    response = await self.http.get(
+                        _replace_parameter(url, name, control),
+                        allow_redirects=False,
+                        cache=False,
+                    )
+                else:
+                    body = [(key, control if key == name else value) for key, value in post_pairs]
+                    response = await self.http.post(
+                        url, data=dict(body), allow_redirects=False,
+                    )
+                if getattr(response, "error", None):
+                    return None, True
+                responses.append(response)
+            except Exception:
+                return None, True
+        first, second = responses
+        first_status = int(getattr(first, "status", 0) or 0)
+        second_status = int(getattr(second, "status", 0) or 0)
+        first_body = (getattr(first, "text", "") or "").replace(controls[0], "<CONTROL>")
+        second_body = (getattr(second, "text", "") or "").replace(controls[1], "<CONTROL>")
+        similarity = SequenceMatcher(None, first_body[:50_000], second_body[:50_000]).ratio()
+        return similarity, first_status != second_status or similarity < 0.985
 
     async def probe_candidates(
         self,
@@ -410,6 +477,13 @@ class ReflectionProbe:
                     urls = urls[: self.urls_per_param]
                 if not urls:
                     return candidate
+
+                baseline_url = (
+                    candidate.sample_url if post_pairs is not None else urls[0]
+                )
+                candidate.baseline_similarity, candidate.baseline_dynamic = await self._baseline(
+                    baseline_url, candidate.name, post_pairs
+                )
 
                 candidate.marker = marker
                 last_status = 0
@@ -464,6 +538,8 @@ class ReflectionProbe:
                     except Exception:
                         evidence = f"parameter value reflected (HTTP {candidate.status})"
                     candidate.evidence = evidence
+                    if candidate.baseline_dynamic:
+                        candidate.evidence += "; control responses were dynamic; review the baseline before triage"
                     candidate.executable = False  # reflection is not execution
                     break
                 if not candidate.reflected:

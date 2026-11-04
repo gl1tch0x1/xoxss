@@ -31,6 +31,7 @@ import random
 import re
 import shutil
 import shlex
+import socket
 import string
 import sys
 import tempfile
@@ -189,6 +190,9 @@ from xoxss.reports.sarif import (  # noqa: E402
     build_sarif_document,
     sarif_rule_id,
 )
+from xoxss.reports.html import write_html_report
+from xoxss.reports.json import report_payload, write_json_report
+from xoxss.reports.markdown import write_markdown_report
 
 try:
     from xoxss.utils import ui as _ui
@@ -632,7 +636,13 @@ def extract_endpoints_from_text(text: str, base_url: str) -> List[str]:
 class Console:
     """Thread-safe console with optional live status line and file logging."""
 
-    def __init__(self, verbose: bool = False, quiet: bool = False, log_file: Optional[str] = None):
+    def __init__(
+        self,
+        verbose: bool = False,
+        quiet: bool = False,
+        log_file: Optional[str] = None,
+        events_file: Optional[str] = None,
+    ):
         self.verbose = verbose
         self.quiet = quiet
         self._lock = threading.RLock()
@@ -642,6 +652,8 @@ class Console:
         self._status_enabled = (not quiet) and sys.stdout.isatty()
         self.counts: Counter = Counter()
         self._log_path: Optional[Path] = None
+        self._events_path: Optional[Path] = Path(events_file) if events_file else None
+        self._events_error_reported = False
         if log_file:
             self._log_path = Path(log_file)
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -649,6 +661,26 @@ class Console:
                 self._log_path.write_text("", encoding="utf-8")
             except OSError:
                 self._log_path = None
+
+    def event(self, name: str, **fields: Any) -> None:
+        """Write one versioned JSONL event for automation and live monitoring."""
+        if self._events_path is None:
+            return
+        event = {
+            "schema_version": 1,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "event": name,
+            **fields,
+        }
+        try:
+            self._events_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._lock:
+                with self._events_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        except OSError as exc:
+            if not self._events_error_reported:
+                self._events_error_reported = True
+                self.warn(f"Cannot write event stream {self._events_path}: {exc}")
 
     # -- status line ------------------------------------------------------------------
     def start_status(self) -> None:
@@ -908,6 +940,7 @@ class Finding:
     payload: str
     evidence: str = ""
     confidence: str = "confirmed"  # confirmed | high | medium | low
+    confidence_rationale: str = ""
     context: str = ""
     detail: str = ""
     screenshot: str = ""
@@ -930,13 +963,22 @@ class Finding:
         return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        if not result["confidence_rationale"]:
+            result["confidence_rationale"] = {
+                "confirmed": "Direct confirmation evidence was recorded for this finding.",
+                "high": "Strong technical evidence was recorded; browser execution was not recorded for this finding.",
+                "medium": "A supporting signal was observed without direct execution proof.",
+                "low": "A heuristic signal needs manual validation.",
+            }.get(self.confidence, "Confidence was not classified; review the evidence manually.")
+        return result
 
 
 @dataclass
 class ScanStats:
     requests: int = 0
     errors: int = 0
+    truncated_responses: int = 0
     blocked: int = 0
     payloads: int = 0
     points: int = 0
@@ -1029,6 +1071,7 @@ class HttpResponse:
     elapsed: float = 0.0
     error: Optional[str] = None
     from_cache: bool = False
+    truncated: bool = False
 
     @property
     def ok(self) -> bool:
@@ -1048,9 +1091,10 @@ class StateStore:
 
     SCHEMA = 1
 
-    def __init__(self, target: str, directory: str, enabled: bool = True):
+    def __init__(self, target: str, directory: str, enabled: bool = True, console: Optional[Any] = None):
         self.target = target
         self.enabled = enabled
+        self.console = console
         digest = hashlib.sha256(target.encode("utf-8", "replace")).hexdigest()[:12]
         host = urlsplit(target).hostname or "target"
         base = Path(directory)
@@ -1072,8 +1116,34 @@ class StateStore:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
+            if self.console:
+                self.console.warn(f"Ignoring unreadable checkpoint: {self.path}")
             return False
-        if data.get("target") != self.target:
+        if not isinstance(data, dict) or data.get("target") != self.target:
+            if self.console:
+                self.console.warn(f"Ignoring checkpoint with a different or invalid target: {self.path}")
+            return False
+        if data.get("schema") != self.SCHEMA:
+            if self.console:
+                self.console.warn(
+                    f"Ignoring checkpoint schema {data.get('schema')!r}; expected {self.SCHEMA}: {self.path}"
+                )
+            return False
+        if not all(
+            isinstance(data.get(key, default), expected)
+            for key, default, expected in (
+                ("scanned", [], list), ("findings", [], list),
+                ("waf", [], list), ("extra", {}, dict),
+            )
+        ):
+            if self.console:
+                self.console.warn(f"Ignoring incompatible checkpoint schema or data: {self.path}")
+            return False
+        if not all(isinstance(item, str) for item in data.get("scanned", [])) or not all(
+            isinstance(item, dict) for item in data.get("findings", [])
+        ) or not all(isinstance(item, str) for item in data.get("waf", [])):
+            if self.console:
+                self.console.warn(f"Ignoring checkpoint with invalid entries: {self.path}")
             return False
         self.created = data.get("created", self.created)
         self.scanned = set(data.get("scanned", []))
@@ -1182,6 +1252,8 @@ class HttpEngine:
         insecure: bool = False,
         cache_ttl: float = 60.0,
         cache_size: int = 512,
+        max_response_bytes: int = 5 * 1024 * 1024,
+        redirect_scope: Optional[Any] = None,
     ):
         self.console = console
         self.stats = stats
@@ -1196,6 +1268,8 @@ class HttpEngine:
         self.insecure = insecure
         self.cache_ttl = cache_ttl
         self.cache_size = cache_size
+        self.max_response_bytes = max(1024, int(max_response_bytes))
+        self.redirect_scope = redirect_scope
         self.rate = rate
         self.limiter = RateLimiter(rate)
         self.semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -1209,8 +1283,18 @@ class HttpEngine:
         if self.session is not None and not self.session.closed:
             return
         assert aiohttp is not None, "aiohttp is not installed"
+        resolver = aiohttp.ThreadedResolver()
+        # The c-ares resolver is fast on Unix event loops. Windows defaults to
+        # ProactorEventLoop, which is not compatible with aiodns 3.x callbacks.
+        if sys.platform != "win32":
+            try:
+                resolver = aiohttp.AsyncResolver()
+            except Exception:
+                pass
         connector = aiohttp.TCPConnector(
-            limit=max(10, 20),
+            resolver=resolver,
+            limit=100,
+            ttl_dns_cache=300,
             ssl=not self.insecure,
             enable_cleanup_closed=True,
         )
@@ -1282,6 +1366,9 @@ class HttpEngine:
         allow_redirects: bool = True,
         cache: bool = False,
     ) -> HttpResponse:
+        if self.redirect_scope is not None and not self.redirect_scope(url):
+            self.stats.errors += 1
+            return HttpResponse(url=url, error="request target is outside the configured scan scope")
         if self.session is None:
             await self.start()
 
@@ -1293,30 +1380,72 @@ class HttpEngine:
                 return hit
 
         delay = 0.0
+        last_error = "request failed after retries"
         for attempt in range(self.retries + 1):
             if delay:
                 await asyncio.sleep(delay)
-            await self._apply_rate_limit(urlsplit(url).hostname or "")
-            started = time.monotonic()
             try:
                 async with self.semaphore:
                     assert self.session is not None
-                    response = await self.session.request(
-                        method,
-                        url,
-                        headers=headers,
-                        data=data,
-                        json=json_body,
-                        allow_redirects=allow_redirects,
-                        proxy=self.proxy,
-                        ssl=not self.insecure,
-                    )
+                    current_url, current_method = url, method
+                    current_data, current_json = data, json_body
+                    for redirect_count in range(11):
+                        await self._apply_rate_limit(urlsplit(current_url).hostname or "")
+                        if redirect_count == 0:
+                            started = time.monotonic()
+                        response = await self.session.request(
+                            current_method,
+                            current_url,
+                            headers=headers,
+                            data=current_data,
+                            json=current_json,
+                            allow_redirects=False,
+                            proxy=self.proxy,
+                            ssl=not self.insecure,
+                        )
+                        self.stats.requests += 1
+                        location = response.headers.get("Location")
+                        is_redirect = response.status in (301, 302, 303, 307, 308) and location
+                        if not (allow_redirects and is_redirect):
+                            break
+                        next_url = urljoin(str(response.url), location)
+                        current_parts = urlsplit(str(response.url))
+                        next_parts = urlsplit(next_url)
+                        same_origin = (
+                            current_parts.scheme.lower(), current_parts.hostname, current_parts.port
+                        ) == (
+                            next_parts.scheme.lower(), next_parts.hostname, next_parts.port
+                        )
+                        if not same_origin or (
+                            self.redirect_scope is not None and not self.redirect_scope(next_url)
+                        ):
+                            result = HttpResponse(
+                                url=str(response.url), status=response.status,
+                                headers={k.lower(): v for k, v in response.headers.items()},
+                                error="redirect target is outside the request origin or scan scope",
+                            )
+                            response.release()
+                            return result
+                        response.release()
+                        if redirect_count == 10:
+                            return HttpResponse(url=current_url, error="too many redirects")
+                        if response.status == 303 or (response.status in (301, 302) and current_method.upper() == "POST"):
+                            current_method, current_data, current_json = "GET", None, None
+                        current_url = next_url
                     try:
+                        raw = bytearray()
+                        while len(raw) <= self.max_response_bytes:
+                            chunk = await response.content.read(min(65536, self.max_response_bytes + 1 - len(raw)))
+                            if not chunk:
+                                break
+                            raw.extend(chunk)
+                        truncated = len(raw) > self.max_response_bytes
+                        if truncated:
+                            del raw[self.max_response_bytes:]
                         try:
-                            text = await response.text(errors="replace")
-                        except Exception:
-                            raw = await response.read()
-                            text = raw.decode("utf-8", "replace")
+                            text = bytes(raw).decode(response.get_encoding() or "utf-8", "replace")
+                        except (LookupError, RuntimeError):
+                            text = bytes(raw).decode("utf-8", "replace")
                         elapsed = time.monotonic() - started
                         result = HttpResponse(
                             url=str(response.url),
@@ -1324,9 +1453,14 @@ class HttpEngine:
                             headers={k.lower(): v for k, v in response.headers.items()},
                             text=text,
                             elapsed=elapsed,
+                            truncated=truncated,
                         )
-                        self.stats.requests += 1
-                        
+                        if truncated:
+                            self.stats.truncated_responses += 1
+                            self.console.debug(
+                                f"Response from {truncate(str(response.url), 120)} exceeded "
+                                f"{self.max_response_bytes} bytes; analysis used a truncated body"
+                            )
                         # Track for smart rate limiter
                         if self._use_smart_rate and self._smart_limiter:
                             self._smart_limiter.record_request(
@@ -1357,9 +1491,36 @@ class HttpEngine:
                 self.console.debug(f"{method} {truncate(url, 120)} -> timeout, retry {attempt + 1}/{self.retries}")
                 if self._use_smart_rate and self._smart_limiter:
                     self._smart_limiter.record_request(success=False, elapsed=delay, is_retry=True)
-            except Exception as exc:  # aiohttp errors, DNS, TLS, connection resets
+            except socket.gaierror as exc:
+                host = urlsplit(url).hostname or "unknown host"
+                last_error = f"DNS resolution failed for {host}: {exc}"
+                if exc.errno != socket.EAI_AGAIN:
+                    self.console.debug(last_error)
+                    break
                 delay = min(8.0, 0.6 * (2 ** attempt))
-                self.console.debug(f"{method} {truncate(url, 120)} -> {type(exc).__name__}: {exc}")
+                self.console.debug(
+                    f"{last_error}; retry {attempt + 1}/{self.retries} in {delay:.1f}s"
+                )
+                if host != "unknown host":
+                    self._host_failures[host] += 1
+            except Exception as exc:  # aiohttp errors, DNS, TLS, connection resets
+                dns_exc = exc if isinstance(exc, socket.gaierror) else getattr(exc, "os_error", None)
+                if isinstance(dns_exc, socket.gaierror):
+                    host = urlsplit(url).hostname or "unknown host"
+                    last_error = f"DNS resolution failed for {host}: {dns_exc}"
+                    if dns_exc.errno != socket.EAI_AGAIN:
+                        self.console.debug(last_error)
+                        break
+                    delay = min(8.0, 0.6 * (2 ** attempt))
+                    self.console.debug(
+                        f"{last_error}; retry {attempt + 1}/{self.retries} in {delay:.1f}s"
+                    )
+                    if host != "unknown host":
+                        self._host_failures[host] += 1
+                    continue
+                delay = min(8.0, 0.6 * (2 ** attempt))
+                last_error = f"{type(exc).__name__}: {exc}"
+                self.console.debug(f"{method} {truncate(url, 120)} -> {last_error}")
                 host = urlsplit(url).hostname or ""
                 if host:
                     self._host_failures[host] += 1
@@ -1367,7 +1528,7 @@ class HttpEngine:
                     self._smart_limiter.record_request(success=False, elapsed=delay, is_retry=True)
 
         self.stats.errors += 1
-        return HttpResponse(url=url, error="request failed after retries")
+        return HttpResponse(url=url, error=last_error)
 
     # -- internals --------------------------------------------------------------------
     @staticmethod
@@ -2515,10 +2676,21 @@ class Scope:
         exclude: Optional[Sequence[str]] = None,
     ):
         parts = urlsplit(base_url)
-        self.host = (parts.hostname or "").lower()
+        self.host = self._canonical_host(parts.hostname or "")
+        try:
+            self.base_port = parts.port
+        except ValueError:
+            self.base_port = -1
         self.allow_subdomains = allow_subdomains
         self.include = [re.compile(pattern, re.I) for pattern in (include or [])]
         self.exclude = [re.compile(pattern, re.I) for pattern in (exclude or [])]
+
+    @staticmethod
+    def _canonical_host(host: str) -> str:
+        try:
+            return host.rstrip(".").encode("idna").decode("ascii").lower()
+        except (UnicodeError, AttributeError):
+            return ""
 
     def in_scope(self, url: str) -> bool:
         try:
@@ -2527,8 +2699,18 @@ class Scope:
             return False
         if parts.scheme not in ("http", "https"):
             return False
-        host = (parts.hostname or "").lower()
+        if parts.username is not None or parts.password is not None or self.base_port == -1:
+            return False
+        host = self._canonical_host(parts.hostname or "")
         if not host:
+            return False
+        try:
+            candidate_port = parts.port
+        except ValueError:
+            return False
+        allowed_ports = {self.base_port} if self.base_port is not None else {80, 443}
+        effective_port = candidate_port or (443 if parts.scheme == "https" else 80)
+        if effective_port not in allowed_ports:
             return False
         if self.allow_subdomains:
             if host != self.host and not host.endswith("." + self.host):
@@ -2629,7 +2811,7 @@ class XSSScanner:
             if base_domain:
                 self.scope.host = base_domain
                 self.scope.allow_subdomains = True
-        self.state = StateStore(self.target, args.state_dir, enabled=not args.no_state)
+        self.state = StateStore(self.target, args.state_dir, enabled=not args.no_state, console=console)
         # A corpus can hold thousands of entries; when several targets are scanned
         # in one run, parse it once and share the read-only engine.
         cached_payloads = getattr(args, "_payload_engine", None)
@@ -2657,6 +2839,8 @@ class XSSScanner:
             concurrency=args.concurrency,
             proxy=args.proxy,
             insecure=args.insecure,
+            redirect_scope=self.scope.in_scope,
+            max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
         )
         
         # Enable smart rate limiting if requested
@@ -2750,7 +2934,8 @@ class XSSScanner:
             user_agent=self.args.user_agent,
             proxy=self.args.proxy,
             binary=self.args.binary,
-            insecure=True,
+            insecure=self.args.insecure,
+            url_allowed=self.scope.in_scope,
         )
 
     # -- prototype pollution ----------------------------------------------------------
@@ -2923,6 +3108,10 @@ class XSSScanner:
 
             urls = await self.prepare_urls()
             self.stats.urls_total = len(urls)
+            self.console.event(
+                "discovery_completed", target=self.target, urls=len(urls),
+                endpoints=len(self.endpoints), js_files=self.stats.js_files,
+            )
             self.console.info(f"Scanning {len(urls)} URL(s) with {self.args.threads} worker(s)")
             self.console.rule("attack")
             await self._scan_urls(urls)
@@ -2956,6 +3145,10 @@ class XSSScanner:
         self.console.rule("reports & summary")
         self.print_summary()
         self.write_reports()
+        self.console.event(
+            "target_completed", target=self.target, findings=len(self.findings),
+            stats=asdict(self.stats), browser_available=bool(self.pool and self.pool.engines),
+        )
 
         if self.pool:
             await self.pool.stop()
@@ -3407,6 +3600,37 @@ class XSSScanner:
                     self.target, depth=min(3, max(1, self.args.crawl_depth))
                 )
                 extra.extend(crawl.urls)
+                parameter_targets = list(dict.fromkeys(
+                    [self.target, *(url for url in self.passive_urls if self.scope.in_scope(url))]
+                ))[:20]
+                discovered_parameters = await toolkit.parameters(parameter_targets)
+                external_parameter_state: Dict[str, List[str]] = {}
+                for endpoint, names in discovered_parameters.items():
+                    if not self.scope.in_scope(endpoint):
+                        continue
+                    if HAS_PARAM_AUDIT and ParameterHarvester is not None:
+                        parameter_report = ParameterHarvester(
+                            self.http, self.console, limit=max(1, self.args.max_urls)
+                        ).from_names(endpoint, names, source="arjun/x8")
+                        names = [candidate.name for candidate in parameter_report.candidates]
+                    self._mined_params.setdefault(endpoint, []).extend(names)
+                    self._mined_params[endpoint] = list(dict.fromkeys(self._mined_params[endpoint]))
+                    for name in names:
+                        if name not in self.discovered_param_names:
+                            self.discovered_param_names.append(name)
+                    external_parameter_state[endpoint] = names
+                    extra.append(endpoint)
+                if external_parameter_state:
+                    self.stats.discovered_params += sum(
+                        len(names) for names in external_parameter_state.values()
+                    )
+                    self.state.extra["external_parameters"] = external_parameter_state
+                    self.console.info(
+                        f"External parameter discovery: "
+                        f"{sum(len(names) for names in external_parameter_state.values())} name(s) "
+                        f"across {len(external_parameter_state)} endpoint(s)",
+                        important=False,
+                    )
                 self.state.extra["external_tools"] = self.external_summary
             except Exception as exc:
                 self.console.warn(f"External recon failed: {exc}")
@@ -4396,6 +4620,7 @@ class XSSScanner:
         self.stats.findings = len(self.findings)
         self.state.add_finding(finding)
         self.state.save(force=True)
+        self.console.event("finding", target=self.target, finding=finding.to_dict())
         self.console.finding(finding)
         return True
 
@@ -4900,6 +5125,8 @@ class XSSScanner:
             ("Injection points", str(stats.points)),
             ("Payloads sent", str(stats.payloads)),
             ("HTTP requests", str(stats.requests)),
+            ("HTTP errors", str(stats.errors)),
+            ("Truncated responses", str(stats.truncated_responses)),
             ("Browser checks", str(stats.browser_checks)),
             ("WAF", self.waf.label()),
             ("Vulnerable libs", str(len(self.vulnerable_libs))),
@@ -5062,7 +5289,7 @@ class XSSScanner:
 
         host = slugify(urlsplit(self.target).hostname or "target")
         tag = hashlib.sha1(self.target.encode("utf-8", "replace")).hexdigest()[:6]
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         written: List[str] = []
         for fmt in formats:
             if fmt not in ("json", "md", "html", "sarif"):
@@ -5100,58 +5327,6 @@ def payload_for_kind(kind: str) -> str:
     return "/* XOX$$ JavaScript marker */"
 
 
-def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
-    return {
-        "tool": APP_NAME,
-        "version": VERSION,
-        "target": scanner.target,
-        "finished": now_iso(),
-        "duration_seconds": round(scanner.stats.elapsed, 2),
-        "waf": scanner.waf.names,
-        "waf_blocking": scanner.waf.blocking,
-        "stats": asdict(scanner.stats),
-        "endpoint_count": len(scanner.endpoints),
-        "endpoints": sorted(scanner.endpoints)[:5000],
-        "recon": {
-            "subdomains": scanner.subdomains[:5000],
-            "passive_urls": scanner.passive_urls[:5000],
-            "openapi_operations": [
-                operation.to_dict() for operation in scanner.api_operations[:500]
-            ],
-            "external_tools": scanner.external_summary,
-            "js_intel": [intel.to_dict() for intel in scanner.js_intel[:25]],
-        },
-        "oob": scanner.oob.to_dict() if scanner.oob is not None else {},
-        "external_findings": [item.to_dict() for item in scanner.external_findings],
-        "vulnerable_libraries": [
-            {
-                "name": lib.name,
-                "version": lib.version,
-                "cve": lib.cve,
-                "severity": lib.severity,
-                "url": lib.url,
-            }
-            for lib in scanner.vulnerable_libs
-        ],
-        "jsonp_findings": scanner.jsonp_findings,
-        "csp_issues": scanner.csp_issues,
-        "cors_issues": scanner.cors_issues,
-        "proto_pollution_sources": scanner.proto_pollution_findings,
-        "trusted_types_issues": scanner.trusted_types_issues,
-        "dom_clobbering": scanner.dom_clobber_findings,
-        "postmessage": scanner.postmessage_findings,
-        "websocket": scanner.websocket_findings,
-        "file_upload": scanner.file_upload_findings,
-        "graphql": scanner.graphql_endpoints,
-        "blind_markers": scanner.blind_markers,
-        "findings": [finding.to_dict() for finding in scanner.findings],
-    }
-
-
-def write_json_report(path: Path, scanner: XSSScanner) -> None:
-    path.write_text(json.dumps(report_payload(scanner), indent=2, ensure_ascii=False), encoding="utf-8")
-
-
 def build_sarif(scanner: XSSScanner) -> Dict[str, Any]:
     """Thin adapter over :func:`xoxss.reports.sarif.build_sarif_document`."""
     return build_sarif_document(
@@ -5160,6 +5335,7 @@ def build_sarif(scanner: XSSScanner) -> Dict[str, Any]:
         waf_names=scanner.waf.names,
         duration_seconds=scanner.stats.elapsed,
         endpoint_count=len(scanner.endpoints),
+        truncated_responses=getattr(scanner.stats, "truncated_responses", 0),
         blind_markers=scanner.blind_markers,
         tool_name=APP_NAME,
         tool_version=VERSION,
@@ -5169,507 +5345,6 @@ def build_sarif(scanner: XSSScanner) -> Dict[str, Any]:
 def write_sarif_report(path: Path, scanner: XSSScanner) -> None:
     path.write_text(json.dumps(build_sarif(scanner), indent=2, ensure_ascii=False), encoding="utf-8")
 
-
-def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
-    data = report_payload(scanner)
-    lines = [
-        f"# {APP_NAME} scan report",
-        "",
-        f"- **Target:** `{scanner.target}`",
-        f"- **Finished:** {data['finished']}",
-        f"- **Duration:** {fmt_duration(scanner.stats.elapsed)}",
-        f"- **WAF:** {scanner.waf.label()}",
-        f"- **Requests:** {scanner.stats.requests}",
-        f"- **Endpoints discovered:** {len(scanner.endpoints)}",
-        f"- **Injection points:** {scanner.stats.points}",
-        f"- **Payloads sent:** {scanner.stats.payloads}",
-        f"- **Vulnerable libraries:** {len(scanner.vulnerable_libs)}",
-        f"- **JSONP findings:** {len(scanner.jsonp_findings)}",
-        f"- **CSP issues:** {len(scanner.csp_issues)}",
-        f"- **CORS issues:** {len(scanner.cors_issues)}",
-        f"- **XSS Findings:** {len(scanner.findings)}",
-        "",
-    ]
-
-    if scanner.trusted_types_issues:
-        lines += ["## Trusted Types issues", "",
-                  "| # | URL | Issue |", "|---|-----|-------|"]
-        for index, item in enumerate(scanner.trusted_types_issues, 1):
-            lines.append(f"| {index} | {item['url']} | {'; '.join(item['issues'])} |")
-        lines += [""]
-
-    if scanner.dom_clobber_findings:
-        lines += ["## DOM clobbering", "",
-                  "| # | URL | Type | Property | Element | Severity |",
-                  "|---|-----|------|----------|---------|----------|"]
-        for index, item in enumerate(scanner.dom_clobber_findings, 1):
-            lines.append(
-                f"| {index} | {item['url']} | {item['type']} | {item['property']} "
-                f"| {item['element'].replace('|', '%7C')} | {item['severity']} |"
-            )
-        lines += [""]
-
-    if scanner.postmessage_findings:
-        lines += ["## postMessage sinks", "",
-                  "| # | Script | Sink | Origin validated | Description |",
-                  "|---|--------|------|------------------|-------------|"]
-        for index, item in enumerate(scanner.postmessage_findings, 1):
-            origin = "yes" if item['origin_validated'] else "**no**"
-            lines.append(
-                f"| {index} | {item['url']} | {item['sink']} | {origin} "
-                f"| {item['description'].replace('|', '%7C')} |"
-            )
-        lines += [""]
-
-    if scanner.websocket_findings:
-        lines += ["## WebSocket sinks", "",
-                  "| # | Script | Sink | Snippet | Description |", "|---|--------|------|---------|-------------|"]
-        for index, item in enumerate(scanner.websocket_findings, 1):
-            lines.append(
-                f"| {index} | {item['url']} | {item['sink']} "
-                f"| {item['location'].replace('|', '%7C')} "
-                f"| {item['description'].replace('|', '%7C')} |"
-            )
-        lines += [""]
-
-    if scanner.file_upload_findings:
-        lines += ["## File upload forms", ""]
-        for item in scanner.file_upload_findings:
-            lines.append(f"- {item['url']}")
-        lines += [""]
-
-    if scanner.graphql_endpoints:
-        lines += ["## GraphQL endpoints", "",
-                  "| # | URL | Introspection open |", "|---|-----|--------------------|"]
-        for index, item in enumerate(scanner.graphql_endpoints, 1):
-            lines.append(
-                f"| {index} | {item['url']} | {'**yes**' if item['introspection'] else 'no'} |"
-            )
-        lines += [""]
-    
-    if scanner.vulnerable_libs:
-        lines += [
-            "## Vulnerable JavaScript Libraries",
-            "",
-            "| # | Library | Version | Severity | CVE | URL |",
-            "|---|---------|---------|----------|-----|-----|",
-        ]
-        for index, lib in enumerate(scanner.vulnerable_libs, 1):
-            url = lib.url.replace("|", "%7C")
-            lines.append(
-                f"| {index} | {lib.name} | {lib.version} | {lib.severity} | {lib.cve} | {url} |"
-            )
-        lines += [""]
-    
-    if scanner.jsonp_findings:
-        lines += [
-            "## JSONP XSS Findings",
-            "",
-            "| # | URL | Callback Parameter | PoC URL | Evidence |",
-            "|---|-----|-------------------|---------|---------|",
-        ]
-        for index, finding in enumerate(scanner.jsonp_findings, 1):
-            url = finding['url'].replace("|", "%7C")
-            poc = str(finding.get('poc_url', '') or '').replace("|", "%7C")
-            lines.append(
-                f"| {index} | {url} | {finding['callback_param']} | {poc} | {finding['evidence'][:80]} |"
-            )
-        lines += [""]
-    
-    if scanner.csp_issues:
-        lines += [
-            "## CSP Bypass Opportunities",
-            "",
-            "| # | URL | Issues |",
-            "|---|-----|-------|",
-        ]
-        for index, issue in enumerate(scanner.csp_issues, 1):
-            url = issue['url'].replace("|", "%7C")
-            issues_str = ", ".join(issue['issues'][:2])
-            lines.append(f"| {index} | {url} | {issues_str} |")
-        lines += [""]
-    
-    if scanner.cors_issues:
-        lines += [
-            "## CORS Misconfigurations",
-            "",
-            "| # | URL | Issues |",
-            "|---|-----|-------|",
-        ]
-        for index, issue in enumerate(scanner.cors_issues, 1):
-            url = issue['url'].replace("|", "%7C")
-            issues_str = ", ".join(issue['issues'][:2])
-            lines.append(f"| {index} | {url} | {issues_str} |")
-        lines += [""]
-    
-    if scanner.findings:
-        lines += [
-            "## XSS Findings",
-            "",
-            "| # | Severity | Type | Method | Parameter | URL |",
-            "|---|----------|------|--------|-----------|-----|",
-        ]
-        for index, finding in enumerate(scanner.findings, 1):
-            url = finding.url.replace("|", "%7C")
-            lines.append(
-                f"| {index} | {finding.confidence} | {finding.kind} | {finding.method} | "
-                f"`{finding.parameter}` | {url} |"
-            )
-        lines += ["", "## Details", ""]
-        for index, finding in enumerate(scanner.findings, 1):
-            lines += [
-                f"### {index}. {finding.kind} ({finding.confidence})",
-                "",
-                f"- **URL:** {finding.url}",
-                f"- **Parameter:** `{finding.parameter}` ({finding.method})",
-                f"- **Context:** {finding.context or 'n/a'}",
-                f"- **Evidence:** {finding.evidence or 'n/a'}",
-                f"- **Detail:** {finding.detail or 'n/a'}",
-            ]
-            if finding.poc_url:
-                lines.append(f"- **PoC URL:** {finding.poc_url}")
-            else:
-                lines.append("- **PoC URL:** n/a")
-            if finding.poc_command:
-                lines += ["", "```bash", finding.poc_command, "```", ""]
-            lines += [
-                f"- **Screenshot:** {finding.screenshot or 'n/a'}",
-                "",
-                "```html",
-                finding.payload,
-                "```",
-                "",
-            ]
-    else:
-        lines.append("No XSS findings.")
-    path.write_text("\n".join(lines), encoding="utf-8")
-
-
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__TITLE__</title>
-<style>
-  :root { color-scheme: dark; }
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 32px; background: #0b0f14; color: #d7e0ea;
-         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-  h1 { font-size: 22px; margin: 0 0 4px; color: #6ee7ff; letter-spacing: 1px; }
-  .sub { color: #7c8b9c; margin-bottom: 24px; font-size: 13px; }
-  .cards { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }
-  .card { background: #121922; border: 1px solid #1e2a37; border-radius: 8px; padding: 10px 16px; }
-  .card .k { font-size: 11px; color: #7c8b9c; text-transform: uppercase; letter-spacing: 1px; }
-  .card .v { font-size: 16px; margin-top: 2px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #1e2a37; vertical-align: top; }
-  th { color: #7c8b9c; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
-  tr:hover td { background: #10171f; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; }
-  .confirmed { background: #064e3b; color: #6ee7b7; }
-  .high { background: #14532d; color: #86efac; }
-  .medium { background: #78350f; color: #fcd34d; }
-  .low { background: #334155; color: #cbd5e1; }
-  code { color: #93c5fd; word-break: break-all; }
-  .poc-block { background: #121922; border: 1px solid #1e2a37; border-radius: 8px;
-               padding: 12px 16px 4px; margin-bottom: 8px; break-inside: avoid; }
-  .poc-block h3 { font-size: 14px; color: #6ee7ff; margin: 4px 0 10px; }
-  .poc-block table { table-layout: fixed; }
-  .poc-block th { width: 140px; }
-  .empty { padding: 24px; border: 1px dashed #1e2a37; border-radius: 8px; color: #7c8b9c; }
-  footer { margin-top: 28px; color: #55657a; font-size: 12px; }
-</style>
-</head>
-<body>
-<h1>__TITLE__</h1>
-<div class="sub">Target <code>__TARGET__</code> &middot; generated __DATE__ by __APPNAME__ v__VERSION__</div>
-<div class="cards">__CARDS__</div>
-__CONTENT__
-<footer>Automated result. Manually validate every finding before reporting.</footer>
-</body>
-</html>
-"""
-
-
-def _card(label: str, value: Any) -> str:
-    return f'<div class="card"><div class="k">{html_lib.escape(str(label))}</div><div class="v">{html_lib.escape(str(value))}</div></div>'
-
-
-def write_html_report(path: Path, scanner: XSSScanner) -> None:
-    cards = "".join(
-        [
-            _card("Duration", fmt_duration(scanner.stats.elapsed)),
-            _card("URLs", f"{scanner.stats.urls_done}/{scanner.stats.urls_total}"),
-            _card("Endpoints", len(scanner.endpoints)),
-            _card("Requests", scanner.stats.requests),
-            _card("Payloads", scanner.stats.payloads),
-            _card("WAF", scanner.waf.label()),
-            _card("Vulnerable libs", len(scanner.vulnerable_libs)),
-            _card("JSONP", len(scanner.jsonp_findings)),
-            _card("CSP issues", len(scanner.csp_issues)),
-            _card("CORS issues", len(scanner.cors_issues)),
-            _card("Trusted Types", len(scanner.trusted_types_issues)),
-            _card("DOM clobbering", len(scanner.dom_clobber_findings)),
-            _card("postMessage", len(scanner.postmessage_findings)),
-            _card("WebSocket", len(scanner.websocket_findings)),
-            _card("Upload forms", len(scanner.file_upload_findings)),
-            _card("GraphQL", len(scanner.graphql_endpoints)),
-            _card("XSS Findings", len(scanner.findings)),
-        ]
-    )
-
-    content_parts = []
-    
-    if scanner.vulnerable_libs:
-        lib_rows = []
-        for lib in scanner.vulnerable_libs:
-            lib_rows.append(
-                "<tr>"
-                f'<td><span class="badge {html_lib.escape(lib.severity)}">'
-                f"{html_lib.escape(lib.severity)}</span></td>"
-                f"<td>{html_lib.escape(lib.name)}</td>"
-                f"<td>{html_lib.escape(lib.version)}</td>"
-                f"<td>{html_lib.escape(lib.cve)}</td>"
-                f"<td><code>{html_lib.escape(truncate(lib.url, 300))}</code></td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>Vulnerable JavaScript Libraries</h2>"
-            "<table><thead><tr><th>Severity</th><th>Library</th><th>Version</th><th>CVE</th><th>URL</th></tr></thead>"
-            "<tbody>" + "".join(lib_rows) + "</tbody></table>"
-        )
-    
-    if scanner.jsonp_findings:
-        jsonp_rows = []
-        for finding in scanner.jsonp_findings:
-            jsonp_rows.append(
-                "<tr>"
-                f"<td><code>{html_lib.escape(truncate(finding['url'], 300))}</code></td>"
-                f"<td>{html_lib.escape(finding['callback_param'])}</td>"
-                f"<td><code>{html_lib.escape(truncate(finding.get('poc_url', ''), 300))}</code></td>"
-                f"<td>{html_lib.escape(truncate(finding['evidence'], 300))}</td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>JSONP XSS Findings</h2>"
-            "<table><thead><tr><th>URL</th><th>Callback Parameter</th><th>PoC URL</th><th>Evidence</th></tr></thead>"
-            "<tbody>" + "".join(jsonp_rows) + "</tbody></table>"
-        )
-    
-    if scanner.csp_issues:
-        csp_rows = []
-        for issue in scanner.csp_issues:
-            issues_str = html_lib.escape(", ".join(issue['issues'][:2]))
-            csp_rows.append(
-                "<tr>"
-                f"<td><code>{html_lib.escape(truncate(issue['url'], 300))}</code></td>"
-                f"<td>{issues_str}</td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>CSP Bypass Opportunities</h2>"
-            "<table><thead><tr><th>URL</th><th>Issues</th></tr></thead>"
-            "<tbody>" + "".join(csp_rows) + "</tbody></table>"
-        )
-    
-    if scanner.cors_issues:
-        cors_rows = []
-        for issue in scanner.cors_issues:
-            issues_str = html_lib.escape(", ".join(issue['issues'][:2]))
-            cors_rows.append(
-                "<tr>"
-                f"<td><code>{html_lib.escape(truncate(issue['url'], 300))}</code></td>"
-                f"<td>{issues_str}</td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>CORS Misconfigurations</h2>"
-            "<table><thead><tr><th>URL</th><th>Issues</th></tr></thead>"
-            "<tbody>" + "".join(cors_rows) + "</tbody></table>"
-        )
-
-    if scanner.trusted_types_issues:
-        tt_rows = []
-        for item in scanner.trusted_types_issues:
-            tt_rows.append(
-                "<tr>"
-                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
-                f"<td>{html_lib.escape(' | '.join(item['issues'][:3]))}</td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>Trusted Types Issues</h2>"
-            "<table><thead><tr><th>URL</th><th>Issues</th></tr></thead>"
-            "<tbody>" + "".join(tt_rows) + "</tbody></table>"
-        )
-
-    if scanner.dom_clobber_findings:
-        clob_rows = []
-        for item in scanner.dom_clobber_findings:
-            clob_rows.append(
-                "<tr>"
-                f'<td><span class="badge {html_lib.escape(item["severity"])}">'
-                f"{html_lib.escape(item['severity'])}</span></td>"
-                f"<td>{html_lib.escape(item['type'])}</td>"
-                f"<td><code>{html_lib.escape(item['property'])}</code></td>"
-                f"<td><code>{html_lib.escape(truncate(item['element'], 160))}</code></td>"
-                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>DOM Clobbering</h2>"
-            "<table><thead><tr><th>Severity</th><th>Type</th><th>Property</th>"
-            "<th>Element</th><th>URL</th></tr></thead>"
-            "<tbody>" + "".join(clob_rows) + "</tbody></table>"
-        )
-
-    if scanner.postmessage_findings:
-        pm_rows = []
-        for item in scanner.postmessage_findings:
-            origin = "yes" if item['origin_validated'] else '<span class="badge high">no</span>'
-            pm_rows.append(
-                "<tr>"
-                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
-                f"<td>{html_lib.escape(item['sink'])}</td>"
-                f"<td>{origin}</td>"
-                f"<td>{html_lib.escape(truncate(item['description'], 220))}</td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>postMessage Sinks</h2>"
-            "<table><thead><tr><th>Script</th><th>Sink</th><th>Origin Validated</th>"
-            "<th>Description</th></tr></thead>"
-            "<tbody>" + "".join(pm_rows) + "</tbody></table>"
-        )
-
-    if scanner.websocket_findings:
-        ws_rows = []
-        for item in scanner.websocket_findings:
-            ws_rows.append(
-                "<tr>"
-                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
-                f"<td>{html_lib.escape(item['sink'])}</td>"
-                f"<td><code>{html_lib.escape(truncate(item['location'], 200))}</code></td>"
-                f"<td>{html_lib.escape(truncate(item['description'], 220))}</td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>WebSocket Sinks</h2>"
-            "<table><thead><tr><th>Script</th><th>Sink</th><th>Location</th>"
-            "<th>Description</th></tr></thead>"
-            "<tbody>" + "".join(ws_rows) + "</tbody></table>"
-        )
-
-    if scanner.file_upload_findings:
-        upload_rows = []
-        for item in scanner.file_upload_findings:
-            upload_rows.append(
-                f'<tr><td><code>{html_lib.escape(truncate(item["url"], 300))}</code></td></tr>'
-            )
-        content_parts.append(
-            "<h2>File Upload Forms</h2>"
-            "<table><thead><tr><th>URL</th></tr></thead>"
-            "<tbody>" + "".join(upload_rows) + "</tbody></table>"
-        )
-
-    if scanner.graphql_endpoints:
-        gql_rows = []
-        for item in scanner.graphql_endpoints:
-            flag = '<span class="badge high">enabled</span>' if item['introspection'] else "off"
-            gql_rows.append(
-                "<tr>"
-                f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"
-                f"<td>{flag}</td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>GraphQL Endpoints</h2>"
-            "<table><thead><tr><th>URL</th><th>Introspection</th></tr></thead>"
-            "<tbody>" + "".join(gql_rows) + "</tbody></table>"
-        )
-
-    if scanner.findings:
-        rows = []
-        for finding in scanner.findings:
-            poc_cell = (
-                html_lib.escape(truncate(finding.poc_url, 300))
-                if finding.poc_url
-                else html_lib.escape(truncate(finding.poc_command, 160))
-            )
-            rows.append(
-                "<tr>"
-                f'<td><span class="badge {html_lib.escape(finding.confidence)}">'
-                f"{html_lib.escape(finding.confidence)}</span></td>"
-                f"<td>{html_lib.escape(finding.kind)}</td>"
-                f"<td>{html_lib.escape(finding.method)}</td>"
-                f"<td><code>{html_lib.escape(finding.parameter)}</code></td>"
-                f"<td><code>{html_lib.escape(truncate(finding.url, 300))}</code></td>"
-                f"<td><code>{html_lib.escape(truncate(finding.payload, 300))}</code></td>"
-                f"<td><code>{poc_cell}</code></td>"
-                f"<td>{html_lib.escape(truncate(finding.evidence, 300))}</td>"
-                "</tr>"
-            )
-        content_parts.append(
-            "<h2>XSS Findings</h2>"
-            "<table><thead><tr><th>Severity</th><th>Type</th><th>Method</th>"
-            "<th>Parameter</th><th>URL</th><th>Payload</th><th>PoC</th><th>Evidence</th></tr></thead>"
-            "<tbody>" + "".join(rows) + "</tbody></table>"
-        )
-
-        details: List[str] = [
-            "<h2>Proof of Concept</h2>",
-            "<p>Each block reproduces the finding: open the PoC URL (GET points) "
-            "or run the command (POST / header / cookie points). PoCs embed only "
-            "the injected parameter - no cookies or session data.</p>",
-            "",
-        ]
-        for index, finding in enumerate(scanner.findings, 1):
-            detail_rows = [
-                f"<tr><th>Type</th><td>{html_lib.escape(finding.kind)} "
-                f'<span class="badge {html_lib.escape(finding.confidence)}">'
-                f"{html_lib.escape(finding.confidence)}</span></td></tr>",
-                f"<tr><th>Target</th><td><code>{html_lib.escape(finding.url)}</code></td></tr>",
-                f"<tr><th>Parameter</th><td><code>{html_lib.escape(finding.parameter)}</code>"
-                f" ({html_lib.escape(finding.method)}, context: {html_lib.escape(finding.context or 'n/a')})</td></tr>",
-                f"<tr><th>Evidence</th><td>{html_lib.escape(truncate(finding.evidence or finding.detail, 500))}</td></tr>",
-                f"<tr><th>Payload</th><td><code>{html_lib.escape(truncate(finding.payload, 400))}</code></td></tr>",
-            ]
-            if finding.poc_url:
-                detail_rows.append(
-                    f'<tr><th>PoC URL</th><td><a href="{html_lib.escape(finding.poc_url, quote=True)}">'
-                    f"<code>{html_lib.escape(finding.poc_url)}</code></a></td></tr>"
-                )
-            if finding.poc_command:
-                detail_rows.append(
-                    f"<tr><th>PoC command</th><td><code>{html_lib.escape(finding.poc_command)}</code></td></tr>"
-                )
-            if finding.screenshot:
-                detail_rows.append(
-                    f"<tr><th>Screenshot</th><td><code>{html_lib.escape(finding.screenshot)}</code></td></tr>"
-                )
-            details.append(
-                f'<div class="poc-block"><h3>{index}. {html_lib.escape(finding.kind)}'
-                f" - {html_lib.escape(finding.parameter or finding.url)}</h3>"
-                "<table><tbody>" + "".join(detail_rows) + "</tbody></table></div><br>"
-            )
-        content_parts.append("".join(details))
-    
-    if not content_parts:
-        content = '<div class="empty">No XSS findings were confirmed.</div>'
-    else:
-        content = "<br>".join(content_parts)
-
-    document = (
-        HTML_TEMPLATE.replace("__TITLE__", f"{APP_NAME} scan report")
-        .replace("__TARGET__", html_lib.escape(scanner.target))
-        .replace("__DATE__", now_iso())
-        .replace("__APPNAME__", APP_NAME)
-        .replace("__VERSION__", VERSION)
-        .replace("__CARDS__", cards)
-        .replace("__CONTENT__", content)
-    )
-    path.write_text(document, encoding="utf-8")
 
 
 # --------------------------------------------------------------------------------------
@@ -5873,7 +5548,7 @@ def apply_god_preset(
         tools: Dict[str, Any] = {}
         with suppress(Exception):
             tools = available_tools() or {}
-        if any(name in tools for name in ("dalfox", "nuclei", "subfinder", "gau", "katana")):
+        if any(name in tools for name in ("dalfox", "nuclei", "subfinder", "gau", "katana", "arjun", "x8")):
             args.external_tools = True
 
 
@@ -5887,6 +5562,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("target", nargs="*", help="target URL(s); http:// is assumed when missing")
     parser.add_argument("-l", "--target-list", help="file with one target URL/domain per line")
     parser.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
+    parser.add_argument(
+        "--profile", choices=("quick", "balanced", "deep"), default="balanced",
+        help="scan preset: quick (HTTP-only, local payloads), balanced (default), or deep",
+    )
 
     crawl = parser.add_argument_group("discovery")
     crawl.add_argument("--crawl", action="store_true", help="crawl the target before scanning")
@@ -5964,7 +5643,7 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument(
         "--external-tools",
         action="store_true",
-        help="use installed subfinder/gau/katana for recon and dalfox/nuclei for verification",
+        help="use installed recon, parameter discovery (arjun/x8), and XSS verification tools",
     )
 
     injection = parser.add_argument_group("injection")
@@ -6117,6 +5796,10 @@ def build_parser() -> argparse.ArgumentParser:
     network.add_argument("--rate-limit", type=float, default=0.0, help="requests per second (0 = unlimited)")
     network.add_argument("--proxy", help="HTTP(S) proxy, e.g. http://127.0.0.1:8080")
     network.add_argument("--insecure", action="store_true", help="ignore TLS certificate errors")
+    network.add_argument(
+        "--max-response-bytes", type=int, default=5 * 1024 * 1024,
+        metavar="N", help="maximum response body bytes analyzed (default: 5242880)",
+    )
     network.add_argument("--headers", nargs="+", help="extra headers: 'Name: Value'")
     network.add_argument("--cookies", nargs="+", help="cookies: 'name=value' or 'a=b; c=d'")
 
@@ -6205,6 +5888,10 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument("-o", "--output", help="write the full text log to this file")
     output.add_argument("--report", default="all", help="json, md, html, sarif, all or none (default: all)")
     output.add_argument("--report-dir", default=os.path.join(DEFAULT_STATE_DIR, "reports"), help="report directory")
+    output.add_argument(
+        "--events-jsonl", metavar="PATH",
+        help="write versioned JSONL scan lifecycle, discovery, and finding events",
+    )
     output.add_argument("--verbose", action="store_true", help="verbose (debug) output")
     output.add_argument("--quiet", action="store_true", help="only print findings and errors")
     output.add_argument("--no-color", action="store_true", help="disable ANSI colours")
@@ -6311,7 +5998,7 @@ def run_doctor(console: Console, args: argparse.Namespace) -> int:
     report(
         "ok" if present else "warn",
         "external tools",
-        ", ".join(present) if present else "none found (optional: subfinder/gau/katana/dalfox/nuclei)",
+        ", ".join(present) if present else "none found (optional: subfinder/gau/katana/arjun/x8/dalfox/nuclei)",
     )
 
     state_dir = Path(args.state_dir)
@@ -6355,7 +6042,10 @@ def run_doctor(console: Console, args: argparse.Namespace) -> int:
 
 
 def install_uvloop() -> None:
-    if sys.platform == "win32":
+    # uvloop's DNS path can leave an unobserved getaddrinfo exception on
+    # Python 3.14 when DNS is temporarily unavailable. Keep asyncio's native
+    # loop there until uvloop's 3.14 resolver behavior is reliable.
+    if sys.platform == "win32" or sys.version_info >= (3, 14):
         return
     try:
         import uvloop  # type: ignore
@@ -6366,7 +6056,7 @@ def install_uvloop() -> None:
 
 
 def gather_targets(args: argparse.Namespace, console: Console) -> Optional[List[str]]:
-    """Read seeds from arguments and ``--target-list``, preserving order."""
+    """Read targets from arguments, ``--target-list`` or a piped stdin stream."""
     targets: List[str] = []
     if args.target_list:
         try:
@@ -6379,6 +6069,19 @@ def gather_targets(args: argparse.Namespace, console: Console) -> Optional[List[
             console.error(f"Cannot read target list {args.target_list}: {exc}")
             return None
     targets.extend(args.target or [])
+
+    if not targets and not sys.stdin.isatty():
+        try:
+            targets.extend(
+                line.strip()
+                for line in sys.stdin
+                if line.strip() and not line.lstrip().startswith("#")
+            )
+            if targets:
+                console.info(f"Read {len(targets)} target(s) from stdin", important=False)
+        except OSError as exc:
+            console.error(f"Cannot read targets from stdin: {exc}")
+            return None
 
     unique_targets: List[str] = []
     seen_targets: Set[str] = set()
@@ -6450,6 +6153,11 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
         concurrency=args.concurrency,
         proxy=args.proxy,
         insecure=args.insecure,
+        redirect_scope=lambda candidate: any(
+            Scope(target, args.allow_subdomains, args.include, args.exclude).in_scope(candidate)
+            for target in targets
+        ),
+        max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
     )
     custom_params = [
         item.strip()
@@ -6595,6 +6303,11 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         concurrency=args.concurrency,
         proxy=args.proxy,
         insecure=args.insecure,
+        redirect_scope=lambda candidate: any(
+            Scope(target, args.allow_subdomains, args.include, args.exclude).in_scope(candidate)
+            for target in targets
+        ),
+        max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
     )
     harvester = ParameterHarvester(
         http, console, limit=max(1, args.param_limit), timeout=max(10.0, args.timeout * 2)
@@ -6717,6 +6430,11 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         concurrency=args.concurrency,
         proxy=args.proxy,
         insecure=args.insecure,
+        redirect_scope=lambda candidate: any(
+            Scope(target, args.allow_subdomains, args.include, args.exclude).in_scope(candidate)
+            for target in targets
+        ),
+        max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
     )
     probe.http = http
     try:
@@ -6804,6 +6522,7 @@ async def run_targets(args: argparse.Namespace, console: Console) -> Tuple[int, 
             console.raw("")
             console.info(f"[{index}/{len(targets)}] {target}")
         scanner = XSSScanner(target, args, console)
+        console.event("target_started", target=scanner.target, index=index, total=len(targets))
         try:
             findings = await scanner.run()
             # Blind injections are recorded immediately but only become real
@@ -6812,6 +6531,7 @@ async def run_targets(args: argparse.Namespace, console: Console) -> Tuple[int, 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            console.event("target_failed", target=scanner.target, error=f"{type(exc).__name__}: {exc}")
             console.error(f"Scan failed for {target}: {exc}")
             if args.verbose:
                 console.raw(traceback.format_exc())
@@ -6827,6 +6547,18 @@ async def run_targets(args: argparse.Namespace, console: Console) -> Tuple[int, 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
+    explicit_flags = {token.split("=", 1)[0] for token in raw_args if token.startswith("--")}
+    god_mode_requested = "--god" in explicit_flags or "--yolo" in explicit_flags
+    if args.profile == "quick" and not god_mode_requested:
+        if "--crawl" not in explicit_flags and "--deep" not in explicit_flags:
+            args.crawl = False
+        if not {"--no-browser", "--browser", "--confirm"}.intersection(explicit_flags):
+            args.no_browser = True
+        if "--no-remote-payloads" not in explicit_flags and "--remote-payloads" not in explicit_flags:
+            args.remote_payloads = False
+    elif args.profile == "deep":
+        args.deep = True
 
     if args.no_color or os.environ.get("NO_COLOR"):
         bcolors.disable()
@@ -6842,7 +6574,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print_encoders()
         return 0
 
-    console = Console(verbose=args.verbose, quiet=args.quiet, log_file=args.output)
+    console = Console(
+        verbose=args.verbose, quiet=args.quiet, log_file=args.output,
+        events_file=getattr(args, "events_jsonl", None),
+    )
     if getattr(args, "doctor", False):
         return run_doctor(console, args)
     if not args.quiet:
@@ -6927,6 +6662,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.threads = 1
     if args.concurrency < 1:
         args.concurrency = 1
+    if args.max_response_bytes < 1024:
+        console.warn("--max-response-bytes is below 1024; using 1024 bytes")
+        args.max_response_bytes = 1024
     if args.max_payloads < 1:
         args.max_payloads = 1
     if args.crawl_depth < 1:

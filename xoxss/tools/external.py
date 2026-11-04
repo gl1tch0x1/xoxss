@@ -11,6 +11,7 @@ orchestrate them instead of re-implementing their databases:
 * ``dalfox``           parameter analysis / XSS verification
 * ``nuclei``           template-based XSS checks
 * ``httpx``            live-host probing
+* ``arjun`` / ``x8``    hidden parameter discovery
 
 Every command is executed with ``create_subprocess_exec`` (never a shell),
 bounded by a timeout and an output cap.  A missing or failing tool is never
@@ -98,7 +99,7 @@ def available_tools() -> Dict[str, str]:
         "subfinder", "assetfinder", "amass", "findomain",
         "gau", "waybackurls", "katana", "hakrawler", "gospider",
         "ffuf", "feroxbuster", "gobuster", "dirsearch",
-        "dalfox", "nuclei", "httpx", "anew", "qsreplace",
+        "dalfox", "nuclei", "httpx", "arjun", "x8", "anew", "qsreplace",
     )
     return {name: path for name in names if (path := shutil.which(name))}
 
@@ -261,6 +262,126 @@ def parse_ffuf(text: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def parse_arjun_json(text: str) -> Dict[str, List[str]]:
+    """Parse Arjun JSON exports into ``{url: [parameter, ...]}`` mappings.
+
+    Arjun versions have emitted both URL-keyed maps and row-oriented objects;
+    accept either shape and tolerate progress text surrounding the JSON.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    start = min((i for i in (raw.find("{"), raw.find("[")) if i >= 0), default=-1)
+    if start >= 0:
+        end = max(raw.rfind("}"), raw.rfind("]"))
+        if end >= start:
+            raw = raw[start:end + 1]
+    try:
+        document = json.loads(raw)
+    except Exception:
+        # Some builds write one JSON object per line.
+        rows: List[Any] = []
+        for line in (text or "").splitlines():
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+        document = rows
+
+    output: Dict[str, Set[str]] = {}
+    parameter_fields = {
+        "params", "parameters", "found", "found_params", "found_parameters",
+        "parameter_names", "get", "post", "json", "xml",
+    }
+
+    def names(value: Any, *, under_parameter_field: bool = False) -> Set[str]:
+        found: Set[str] = set()
+        if isinstance(value, str):
+            if under_parameter_field and value.strip():
+                found.add(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    found.add(item.strip())
+                else:
+                    found.update(names(item, under_parameter_field=under_parameter_field))
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                key_lower = str(key).lower()
+                if key_lower in parameter_fields:
+                    found.update(names(item, under_parameter_field=True))
+                elif under_parameter_field and key_lower in ("name", "parameter", "param") and isinstance(item, str):
+                    if item.strip():
+                        found.add(item.strip())
+                elif under_parameter_field and isinstance(item, (bool, int, float)) and item:
+                    found.add(str(key))
+                elif isinstance(item, (dict, list)):
+                    found.update(names(item, under_parameter_field=under_parameter_field))
+        return found
+
+    def visit(value: Any, inherited_url: str = "") -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item, inherited_url)
+            return
+        if not isinstance(value, dict):
+            return
+        row_url = str(value.get("url") or value.get("target") or value.get("endpoint") or inherited_url)
+        if row_url.startswith(("http://", "https://")):
+            found = names(value)
+            if found:
+                output.setdefault(row_url, set()).update(found)
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text.startswith(("http://", "https://")):
+                found = names(item)
+                if found:
+                    output.setdefault(key_text, set()).update(found)
+            elif isinstance(item, (dict, list)):
+                visit(item, row_url)
+
+    visit(document)
+    return {url: sorted(params) for url, params in output.items() if params}
+
+
+def parse_x8_json(text: str, url: str = "") -> Dict[str, List[str]]:
+    """Parse x8 JSON output, attaching a URL when its format omits one."""
+    parsed = parse_arjun_json(text)
+    if url and not parsed:
+        # x8's json output has varied; fall back to collecting explicit
+        # parameter-name arrays from a JSON object without treating text as names.
+        try:
+            document = json.loads((text or "").strip())
+        except Exception:
+            document = None
+        collected: Set[str] = set()
+        def collect(value: Any) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item.strip():
+                        collected.add(item.strip())
+                    else:
+                        collect(item)
+            elif isinstance(value, dict):
+                named = value.get("name") or value.get("parameter") or value.get("param")
+                if isinstance(named, str) and named.strip():
+                    collected.add(named.strip())
+                for key, item in value.items():
+                    if str(key).lower() in (
+                        "parameters", "params", "found", "found_params",
+                        "found_parameters", "parameter_names",
+                    ):
+                        collect(item)
+
+        if isinstance(document, dict):
+            for key in ("parameters", "params", "found", "found_params", "found_parameters", "parameter_names"):
+                value = document.get(key)
+                collect(value)
+        if collected:
+            parsed[url] = sorted(collected)
+    return parsed
+
+
 def _dedupe_findings(findings: Iterable[ExternalFinding]) -> List[ExternalFinding]:
     seen: Set[Tuple[str, str, str]] = set()
     result: List[ExternalFinding] = []
@@ -293,6 +414,7 @@ class ToolRunner:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd,
@@ -545,6 +667,76 @@ class ExternalToolkit:
             except OSError:
                 pass
 
+    async def parameters(self, urls: Sequence[str]) -> Dict[str, List[str]]:
+        """Run installed hidden-parameter tools and merge their results by URL."""
+        if not urls or not (self.enabled("arjun") or self.enabled("x8")):
+            return {}
+        merged: Dict[str, Set[str]] = {}
+        names: Sequence[str] = (
+            "admin", "callback", "debug", "dest", "email", "file", "id", "lang",
+            "next", "page", "q", "query", "redirect", "return", "search", "url",
+        )
+        try:
+            from xoxss.scan.fuzzer import PARAM_WORDS
+            names = PARAM_WORDS
+        except Exception:
+            pass
+        wordlist_handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".txt", delete=False, encoding="utf-8"
+        )
+        with wordlist_handle:
+            wordlist_handle.write("\n".join(names) + "\n")
+        wordlist = wordlist_handle.name
+        try:
+            for url in list(dict.fromkeys(urls))[: min(10, self.max_results)]:
+                if self.enabled("arjun"):
+                    handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+                    output_path = handle.name
+                    handle.close()
+                    try:
+                        result = await self.runner.run(
+                            "arjun",
+                            ["-u", url, "-m", "GET", "--disable-redirects", "-oJ", output_path],
+                            timeout=self.timeout,
+                        )
+                        try:
+                            exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            exported = ""
+                        for found_url, params in parse_arjun_json(exported or result.stdout).items():
+                            merged.setdefault(found_url, set()).update(params)
+                    finally:
+                        try:
+                            os.unlink(output_path)
+                        except OSError:
+                            pass
+                if self.enabled("x8"):
+                    handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+                    output_path = handle.name
+                    handle.close()
+                    try:
+                        result = await self.runner.run(
+                            "x8", ["-u", url, "-w", wordlist, "-O", "json", "-o", output_path],
+                            timeout=self.timeout,
+                        )
+                        try:
+                            exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            exported = ""
+                        for found_url, params in parse_x8_json(exported or result.stdout, url).items():
+                            merged.setdefault(found_url, set()).update(params)
+                    finally:
+                        try:
+                            os.unlink(output_path)
+                        except OSError:
+                            pass
+        finally:
+            try:
+                os.unlink(wordlist)
+            except OSError:
+                pass
+        return {url: sorted(params) for url, params in merged.items() if params}
+
 
 __all__ = [
     "ToolResult",
@@ -559,4 +751,6 @@ __all__ = [
     "parse_dalfox",
     "parse_nuclei",
     "parse_ffuf",
+    "parse_arjun_json",
+    "parse_x8_json",
 ]

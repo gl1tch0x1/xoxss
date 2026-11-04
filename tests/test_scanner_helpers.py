@@ -1,9 +1,106 @@
 """Tests for scanner-level helpers: WAF fingerprints and SARIF export."""
 
+import asyncio
+import json
+import socket
 from types import SimpleNamespace
 
-from xoxss.scanner import Finding, WAFDetector, build_sarif, sarif_rule_id
+from xoxss.scanner import (
+    Console,
+    Finding,
+    HttpEngine,
+    Scope,
+    ScanStats,
+    WAFDetector,
+    build_sarif,
+    install_uvloop,
+    sarif_rule_id,
+)
 from xoxss.detection.waf import fingerprint, looks_blocked
+from xoxss.core.browser import BrowserEngine
+
+
+def test_http_engine_returns_actionable_dns_error():
+    class FailedRequest:
+        async def __aenter__(self):
+            raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class FailedSession:
+        closed = False
+
+        async def request(self, *_args, **_kwargs):
+            return await FailedRequest().__aenter__()
+
+    async def run():
+        engine = HttpEngine(Console(quiet=True), ScanStats(), retries=0)
+        engine.session = FailedSession()
+        result = await engine.get("https://unresolvable.example/")
+        return result, engine.stats
+
+    response, stats = asyncio.run(run())
+    assert "DNS resolution failed for unresolvable.example" in response.error
+    assert "Temporary failure in name resolution" in response.error
+    assert stats.errors == 1
+
+
+def test_uvloop_is_disabled_on_python_314(monkeypatch):
+    import xoxss.scanner as scanner
+
+    called = []
+    monkeypatch.setattr(scanner.sys, "platform", "linux")
+    monkeypatch.setattr(scanner.sys, "version_info", (3, 14, 0))
+    monkeypatch.setitem(__import__("sys").modules, "uvloop", SimpleNamespace(install=lambda: called.append(True)))
+    install_uvloop()
+    assert called == []
+
+
+def test_scope_validates_host_port_and_url_credentials():
+    scope = Scope("https://example.test")
+    assert scope.in_scope("http://example.test/search?q=x")
+    assert scope.in_scope("https://example.test/search?q=x")
+    assert not scope.in_scope("https://example.test:8443/")
+    assert not scope.in_scope("https://user@example.test/")
+    assert not scope.in_scope("https://example.test.attacker.invalid/")
+
+    custom_port = Scope("http://example.test:8080")
+    assert custom_port.in_scope("https://example.test:8080/")
+    assert not custom_port.in_scope("http://example.test/")
+
+
+def test_http_engine_rejects_out_of_scope_before_opening_session():
+    async def run():
+        scope = Scope("https://example.test")
+        engine = HttpEngine(Console(quiet=True), ScanStats(), redirect_scope=scope.in_scope)
+        response = await engine.get("https://other.test/")
+        return response, engine
+
+    response, engine = asyncio.run(run())
+    assert "outside the configured scan scope" in response.error
+    assert engine.session is None
+    assert engine.stats.requests == 0
+
+
+def test_browser_engine_rejects_out_of_scope_navigation():
+    engine = BrowserEngine(
+        Console(quiet=True), url_allowed=lambda url: url.startswith("https://in-scope.test/")
+    )
+    error = asyncio.run(engine.navigate("https://outside.test/"))
+    assert "outside the configured scan scope" in error
+    assert engine.navigation_count == 0
+
+
+def test_console_writes_versioned_jsonl_events(tmp_path):
+    path = tmp_path / "run" / "events.jsonl"
+    console = Console(quiet=True, events_file=str(path))
+    console.event("target_started", target="https://example.test", index=1)
+    event = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert event["schema_version"] == 1
+    assert event["event"] == "target_started"
+    assert event["target"] == "https://example.test"
+    assert event["index"] == 1
 
 
 def test_waf_signature_coverage():

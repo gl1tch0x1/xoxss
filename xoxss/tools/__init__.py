@@ -6,6 +6,8 @@ from xoxss.tools.external import (
     ExternalToolkit,
     ToolRunner,
     available_tools,
+    parse_arjun_json,
+    parse_x8_json,
 )
 
 __all__ = [
@@ -14,4 +16,6 @@ __all__ = [
     "ExternalToolkit",
     "ToolRunner",
     "available_tools",
+    "parse_arjun_json",
+    "parse_x8_json",
 ]

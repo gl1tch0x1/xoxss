@@ -1,5 +1,5 @@
 {
-  "include": ["xoxss.py"],
+  "include": ["xoxss.py", "xoxss/core/config.py", "xoxss/reports/sarif.py"],
   "exclude": ["**/__pycache__", ".venv"],
   "venvPath": ".",
   "venv": ".venv"

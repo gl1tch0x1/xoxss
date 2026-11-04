@@ -2,6 +2,7 @@
 
 import asyncio
 import html
+import io
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,6 +15,7 @@ from xoxss.analysis.proto_pollution import (
     build_proto_probes,
     gadget_exploit_names,
 )
+from xoxss.core.browser import BrowserPool
 from xoxss.scanner import (
     Console,
     PayloadEngine,
@@ -21,7 +23,45 @@ from xoxss.scanner import (
     build_parser,
     run_doctor,
     run_mass,
+    gather_targets,
 )
+
+
+def test_gather_targets_reads_piped_stdin(monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO("https://a.test/\n# ignore\nhttp://b.test/\n"))
+    assert gather_targets(build_parser().parse_args([]), Console(quiet=True)) == [
+        "https://a.test/", "http://b.test/"
+    ]
+
+
+def test_browser_pool_recycles_workers_after_navigation_budget():
+    class FakeBrowser:
+        def __init__(self):
+            self.navigation_count = 0
+            self.starts = 0
+            self.stops = 0
+
+        async def start(self):
+            self.starts += 1
+            return True
+
+        async def stop(self):
+            self.stops += 1
+
+    async def run():
+        engine = FakeBrowser()
+        pool = BrowserPool(Console(quiet=True), 1, lambda: engine, recycle_after=2)
+        await pool.start()
+        for _ in range(2):
+            async with pool.borrow() as borrowed:
+                borrowed.navigation_count += 1
+        await pool.stop()
+        return engine
+
+    engine = asyncio.run(run())
+    assert engine.starts == 2
+    assert engine.stops == 2
+    assert engine.navigation_count == 0
 
 
 # --------------------------------------------------------------------------------------
