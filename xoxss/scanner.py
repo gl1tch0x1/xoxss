@@ -5372,6 +5372,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .medium { background: #78350f; color: #fcd34d; }
   .low { background: #334155; color: #cbd5e1; }
   code { color: #93c5fd; word-break: break-all; }
+  .poc-block { background: #121922; border: 1px solid #1e2a37; border-radius: 8px;
+               padding: 12px 16px 4px; margin-bottom: 8px; break-inside: avoid; }
+  .poc-block h3 { font-size: 14px; color: #6ee7ff; margin: 4px 0 10px; }
+  .poc-block table { table-layout: fixed; }
+  .poc-block th { width: 140px; }
   .empty { padding: 24px; border: 1px dashed #1e2a37; border-radius: 8px; color: #7c8b9c; }
   footer { margin-top: 28px; color: #55657a; font-size: 12px; }
 </style>
@@ -5611,6 +5616,44 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
             "<th>Parameter</th><th>URL</th><th>Payload</th><th>PoC</th><th>Evidence</th></tr></thead>"
             "<tbody>" + "".join(rows) + "</tbody></table>"
         )
+
+        details: List[str] = [
+            "<h2>Proof of Concept</h2>",
+            "<p>Each block reproduces the finding: open the PoC URL (GET points) "
+            "or run the command (POST / header / cookie points). PoCs embed only "
+            "the injected parameter - no cookies or session data.</p>",
+            "",
+        ]
+        for index, finding in enumerate(scanner.findings, 1):
+            detail_rows = [
+                f"<tr><th>Type</th><td>{html_lib.escape(finding.kind)} "
+                f'<span class="badge {html_lib.escape(finding.confidence)}">'
+                f"{html_lib.escape(finding.confidence)}</span></td></tr>",
+                f"<tr><th>Target</th><td><code>{html_lib.escape(finding.url)}</code></td></tr>",
+                f"<tr><th>Parameter</th><td><code>{html_lib.escape(finding.parameter)}</code>"
+                f" ({html_lib.escape(finding.method)}, context: {html_lib.escape(finding.context or 'n/a')})</td></tr>",
+                f"<tr><th>Evidence</th><td>{html_lib.escape(truncate(finding.evidence or finding.detail, 500))}</td></tr>",
+                f"<tr><th>Payload</th><td><code>{html_lib.escape(truncate(finding.payload, 400))}</code></td></tr>",
+            ]
+            if finding.poc_url:
+                detail_rows.append(
+                    f'<tr><th>PoC URL</th><td><a href="{html_lib.escape(finding.poc_url, quote=True)}">'
+                    f"<code>{html_lib.escape(finding.poc_url)}</code></a></td></tr>"
+                )
+            if finding.poc_command:
+                detail_rows.append(
+                    f"<tr><th>PoC command</th><td><code>{html_lib.escape(finding.poc_command)}</code></td></tr>"
+                )
+            if finding.screenshot:
+                detail_rows.append(
+                    f"<tr><th>Screenshot</th><td><code>{html_lib.escape(finding.screenshot)}</code></td></tr>"
+                )
+            details.append(
+                f'<div class="poc-block"><h3>{index}. {html_lib.escape(finding.kind)}'
+                f" - {html_lib.escape(finding.parameter or finding.url)}</h3>"
+                "<table><tbody>" + "".join(detail_rows) + "</tbody></table></div><br>"
+            )
+        content_parts.append("".join(details))
     
     if not content_parts:
         content = '<div class="empty">No XSS findings were confirmed.</div>'
