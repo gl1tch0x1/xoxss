@@ -120,8 +120,9 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 - Native interactsh client with RSA-OAEP/AES-CTR encryption and correlation IDs.
 - Generic JSON/NDJSON poller (XSS Hunter, Burp bridges, custom collectors) and a local
   file tailer for `interactsh-client` output.
-- Background polling upgrades a low-confidence injection to a confirmed finding when the
-  callback arrives, plus a post-scan grace period for late callbacks.
+- Background polling raises a `Blind XSS (callback confirmed)` finding only when the
+  out-of-band callback is observed with the marker — a probe that was merely sent is
+  never a finding — plus a post-scan grace period for late callbacks.
 
 **Operations and reporting**
 
@@ -146,7 +147,7 @@ flowchart TD
     E --> F["Injection points<br/>Query, forms, JSON, headers"]
     F --> G["Token probe<br/>Context and surviving characters"]
     G --> H{"Executable reflection?"}
-    H -->|no| I["Discard<br/>or low-confidence report"]
+    H -->|no| I["Discard<br/>or low-confidence report (opt-in)"]
     H -->|yes| J["Context payloads<br/>Corpus, tamper, encoders"]
     J --> K{"Browser available?"}
     K -->|no| L["HTTP evidence<br/>high confidence"]
@@ -185,13 +186,21 @@ Confidence model (drives `--fail-on-findings` and SARIF severity):
 
 | Confidence | Meaning |
 |---|---|
-| `confirmed` | The marker executed, reached a live sink, or produced an observed dialog in a browser. |
-| `high` | Payload reflected unescaped / persisted, but execution was not re-confirmed. |
-| `medium` | Header reflection, DOM sink taint, or a polluted prototype with a non-firing gadget candidate. |
-| `low` | Reflected but not executable, a static DOM candidate, or an unconfirmed blind injection. Usually requires `--report-reflections`. |
+| `confirmed` | The marker executed or produced an observed dialog in a browser, or an out-of-band callback answered with the blind-XSS marker. |
+| `high` | Payload reflected unescaped in an executable context (browser verification unavailable), or a payload persisted and re-rendered for stored XSS. |
+| `medium` | Header reflection that survived unescaped and executable (browser verification needs a proxy, so it stays below `high`). |
+| `low` | Reflected but not executable, a static DOM candidate, an un-verified external-tool claim, or a DOM sink that was reached without executing. Usually requires `--report-reflections` for the reflection case. |
 
-Blind injections start at `low` and become `confirmed` only when a polling transport
-observes the callback.
+**Evidence policy.** A finding is only raised on real evidence: the payload
+survived unescaped in an executable context, executed in a browser, was
+persisted and re-rendered, or its out-of-band marker was answered. A blind
+probe that was merely *sent* never produces a finding; polyglot payloads must
+be executable, not just reflected; header injections must be executable; and
+third-party tools (`dalfox`/`nuclei`) ship as `low` + `unverified` because
+XOXSS did not confirm them itself. Every finding carries a reproduction proof:
+`poc_url` (a ready-to-open URL for GET injection points) or `poc_command` (a
+`curl` one-liner for POST / header / cookie points). The PoC embeds only the
+injected parameter — no cookies or session data.
 
 ## Requirements
 
@@ -214,7 +223,7 @@ browser is available.
 ## Installation
 
 ```bash
-git clone https://github.com/<you>/xoxss.git
+git clone https://github.com/gl1tch0x1/xoxss.git
 cd xoxss
 
 # install the package and the `xoxss` console script
@@ -506,7 +515,8 @@ xoxss https://target.tld --crawl \
   --oob-wait 30
 ```
 
-A callback upgrades the injected finding to `Blind XSS (callback confirmed)`. The
+A callback produces a `Blind XSS (callback confirmed)` finding (only a callback —
+never the mere act of sending a probe — creates it). The
 poller accepts `data`, `hits`, `requests`, `results`, `interactions` or `events`
 arrays, a single object, or one interaction per line. Use a self-hosted server with
 `--interactsh https://...` when callbacks must stay inside your infrastructure.
@@ -537,7 +547,7 @@ each with a unique marker. A finding requires the page's own parser or merge cod
 pollute `Object.prototype` (verified in the browser). The page is fingerprinted for
 jQuery, Vue, Lodash, DOMPurify, Angular, GTM and similar gadgets; gadget-specific
 exploit URLs are navigated next and an alert carrying a second marker proves execution.
-Unfired gadgets are recorded as medium-confidence candidates. Expect six probe page
+Unfired gadgets are recorded as low-confidence candidates. Expect six probe page
 loads per scanned URL plus gadget attempts; with `--no-browser` only static hints are
 logged.
 
@@ -587,8 +597,9 @@ see `xoxss/data/LAZYXSS_NOTICE.md` for provenance.
     sarif_file: artifacts
 ```
 
-Only `confirmed` and `high` findings return `2`. Low-confidence blind injections do
-not fail a build until they are confirmed. For air-gapped environments use
+Only `confirmed` and `high` findings return `2`. There are no open-ended blind
+findings waiting to be confirmed — a blind point either has a callback (confirmed)
+or nothing at all. For air-gapped environments use
 `--no-remote-payloads` and mount a local corpus.
 
 ## Reports and exit codes
@@ -602,10 +613,10 @@ Each requested format is written as:
 
 | Format | Ext | Contents |
 |---|---|---|
-| JSON | `.json` | Full payload: stats, recon, OOB, analyzer results, findings. |
-| Markdown | `.md` | Human-readable summary, tables, per-finding details. |
-| HTML | `.html` | Self-contained dark-theme report with cards and tables. |
-| SARIF | `.sarif` | SARIF v2.1.0 for code-scanning platforms. Rules derive from findings (`xoxss/reflected-xss`, …); `confirmed`/`high` → `error`, `medium` → `warning`, `low` → `note`. |
+| JSON | `.json` | Full payload: stats, recon, OOB, analyzer results, findings (each finding includes `poc_url` / `poc_command`). |
+| Markdown | `.md` | Human-readable summary, tables, per-finding details with a PoC line and a `curl` PoC block. |
+| HTML | `.html` | Self-contained dark-theme report with cards, tables and a PoC column. |
+| SARIF | `.sarif` | SARIF v2.1.0 for code-scanning platforms. Rules derive from findings (`xoxss/reflected-xss`, …); `confirmed`/`high` → `error`, `medium` → `warning`, `low` → `note`. Each result embeds `pocUrl` / `pocCommand` properties. |
 
 Screenshots go to `<state-dir>/screenshots/` (`<token>.png`, `dom-<token>.png`) and are
 linked from findings. `--jsonl` is mass-mode output only: one finding object per line,
@@ -640,11 +651,18 @@ intelligence, OpenAPI operations, OOB registrations and every analyzer list):
       "evidence": "marker reflected unescaped",
       "confidence": "high",
       "context": "html",
+      "poc_url": "https://target.tld/search?q=<script>...</script>",
+      "poc_command": "",
       "timestamp": "2026-11-03T10:00:00+00:00"
     }
   ]
 }
 ```
+
+`poc_url` is present on GET injection points as a one-click reproduction link
+that executes the payload; POST / header / cookie findings instead carry
+`poc_command`, a `curl` one-liner. Both contain only the injected parameter --
+no cookies, tokens or session data.
 
 | Exit code | Meaning |
 |---|---|

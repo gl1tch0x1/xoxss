@@ -30,6 +30,7 @@ import os
 import random
 import re
 import shutil
+import shlex
 import string
 import sys
 import tempfile
@@ -736,7 +737,7 @@ class Console:
             wrapped = textwrap.wrap(
                 raw,
                 width=max(20, width),
-                break_long_words=True,
+                break_long_words=False,   # keep PoC URLs / curl commands copy-paste intact
                 break_on_hyphens=False,
             )
             lines.extend(wrapped or [""])
@@ -825,6 +826,14 @@ class Console:
             lines.append(f"{bcolors.GREY}Detail     :{bcolors.ENDC} {finding.detail}")
         if finding.screenshot:
             lines.append(f"{bcolors.GREY}Screenshot :{bcolors.ENDC} {finding.screenshot}")
+        if finding.poc_url:
+            lines.append(
+                f"{bcolors.GREY}PoC URL    :{bcolors.ENDC} {finding.poc_url}"
+            )
+        if finding.poc_command:
+            lines.append(
+                f"{bcolors.GREY}PoC command:{bcolors.ENDC} {finding.poc_command}"
+            )
         self._emit("ok", "\n".join(lines), important=True)
 
 
@@ -902,6 +911,11 @@ class Finding:
     context: str = ""
     detail: str = ""
     screenshot: str = ""
+    # Reproduction proof.  `poc_url` is a ready-to-open URL (GET points);
+    # `poc_command` is a shell command (POST/header/cookie points).  Both are
+    # built from the injection only - no cookies or session data are included.
+    poc_url: str = ""
+    poc_command: str = ""
     subkey: str = ""
     tags: List[str] = field(default_factory=list)
     timestamp: str = field(default_factory=now_iso)
@@ -2145,13 +2159,12 @@ def analyze_reflection(body: str, token: str, sent_payload: str, content_type: s
         if offset < len(tail_recv) and tail_recv[offset] == char:
             raw_specials.append(char)
 
-    # Did the whole payload survive verbatim (entity decoding included)?
+    # Did the whole payload land verbatim (byte-for-byte)?  Entity-encoded
+    # reflections ("&lt;script&gt;...") are rendered as literal text by browsers -
+    # they cannot execute - so decoding entities here would turn sanitized
+    # reflections into false-positive 'executable' findings under the evidence
+    # policy.  Only byte-for-byte verbatim hits count.
     verbatim = bool(sent_payload) and sent_payload in body
-    if not verbatim and sent_payload:
-        try:
-            verbatim = sent_payload in html_lib.unescape(body)
-        except Exception:
-            verbatim = False
 
     raw = set(raw_specials)
     payload_chars = set(sent_payload)
@@ -2529,6 +2542,63 @@ class Scope:
         return True
 
 
+# Keys whose values must never appear in a shared PoC (JSON request bodies).
+SENSITIVE_KEY_RE = re.compile(
+    r"[a-z0-9_-]*(csrf|xsrf|token|session|auth|password|passwd|secret|cookie|api[._-]?key|key)[a-z0-9_-]*",
+    re.IGNORECASE,
+)
+
+
+def build_poc(point: InjectionPoint, payload: str) -> Tuple[str, str]:
+    """Build the reproduction proof for an injection point.
+
+    Returns ``(poc_url, poc_command)``: a ready-to-open URL for GET
+    query/form/fragment points and a shell one-liner (curl) for JSON, header,
+    cookie and POST points.  The PoC embeds only the injected parameter -
+    never cookies, CSRF tokens or other session data (documented under
+    "Reports" in the README) - so the proof is safe to share as-is.
+    """
+    method = point.method.upper()
+    if method == "GET":
+        if point.source in ("query", "form", "api", "fragment"):
+            try:
+                if point.source == "query":
+                    return replace_query_param(point.url, point.param, payload), ""
+                values = {name: spec.value for name, spec in point.fields.items()}
+                values[point.param] = payload
+                return merge_query(point.url, values), ""
+            except Exception:
+                return point.url, ""
+        if point.source == "header" and point.param:
+            command = f"curl -sk '{point.url}' -H '{point.param}: {payload}'"
+            return point.url, command
+        if point.source == "cookie" and point.param:
+            command = f"curl -sk '{point.url}' -H 'Cookie: {point.param}={payload}'"
+            return point.url, command
+        return point.url, ""
+    if point.source == "json":
+        body: Dict[str, Any] = dict(point.json_body or {})
+        body[point.param] = payload
+        # Session-bound keys are redacted so the shared curl never carries
+        # CSRF tokens, cookies or credentials from the operator's session.
+        for key in list(body):
+            if key != point.param and SENSITIVE_KEY_RE.fullmatch(str(key)):
+                body[key] = "REDACTED"
+        try:
+            serialized = json.dumps(body, separators=(",", ":"))
+        except Exception:
+            serialized = json.dumps({point.param: payload})
+        content_type = point.content_type or "application/json"
+        command = (
+            f"curl -sk -X POST '{point.url}' "
+            f"-H 'Content-Type: {content_type}' --data-raw {shlex.quote(serialized)}"
+        )
+        return point.url, command
+    body_data = urlencode({point.param: payload})
+    command = f"curl -sk -X POST '{point.url}' --data '{body_data}'"
+    return point.url, command
+
+
 # --------------------------------------------------------------------------------------
 # Scanner
 # --------------------------------------------------------------------------------------
@@ -2737,6 +2807,7 @@ class XSSScanner:
                         ),
                         tags=["prototype-pollution"],
                         subkey=probe.parameter,
+                        poc_url=probe_url,
                     )
                 )
                 if added:
@@ -2790,6 +2861,7 @@ class XSSScanner:
                         ),
                         tags=["prototype-pollution", "xss"],
                         subkey=f"gadget:{name}",
+                        poc_url=exploit_url,
                     )
                 )
                 self.console.ok(f"Prototype pollution gadget fired: {name}")
@@ -2807,7 +2879,7 @@ class XSSScanner:
                     method="GET",
                     payload=payload,
                     evidence=f"{name} fingerprinted; gadget did not fire automatically",
-                    confidence="medium",
+                    confidence="low",
                     context=f"client-side (gadget: {name})",
                     detail=(
                         "Pollution is confirmed, but the gadget needs a user interaction "
@@ -2815,6 +2887,7 @@ class XSSScanner:
                     ),
                     tags=["prototype-pollution"],
                     subkey=f"candidate:{name}",
+                    poc_url=exploit_url,
                 )
             )
 
@@ -3001,6 +3074,14 @@ class XSSScanner:
             self.state.save(force=True)
             self.console.finding(finding)
             return
+        blind_point = InjectionPoint(
+            url=registration.url,
+            method=registration.method,
+            param=registration.parameter,
+        )
+        blind_poc_url, blind_poc_command = self.poc_for_point(
+            blind_point, registration.payload
+        )
         self.add_finding(
             Finding(
                 kind="Blind XSS (callback confirmed)",
@@ -3014,6 +3095,8 @@ class XSSScanner:
                 detail=detail,
                 subkey=subkey,
                 tags=["blind", "oob", "confirmed"],
+                poc_url=blind_poc_url,
+                poc_command=blind_poc_command,
             )
         )
 
@@ -3069,7 +3152,11 @@ class XSSScanner:
         self.external_findings.append(item)
         self.stats.external_findings = len(self.external_findings)
         severity = str(getattr(item, "severity", "medium") or "medium").lower()
-        confidence = "high" if severity in ("critical", "high") else "medium"
+        # Strict evidence policy: a third-party tool's claim is not proof.
+        # XOXSS did not independently verify it, so it ships as confidence=low
+        # with an explicit "unverified" tag; the PoC URL lets the operator
+        # reproduce the claim in one click.
+        confidence = "low"
         digest = hashlib.sha1(
             f"{getattr(item, 'tool', '')}|{getattr(item, 'url', '')}|"
             f"{getattr(item, 'parameter', '')}|{getattr(item, 'payload', '')[:200]}".encode(
@@ -3091,9 +3178,11 @@ class XSSScanner:
                     f" (template {getattr(item, 'template', '')})"
                     if getattr(item, "template", "")
                     else ""
-                ),
+                )
+                + " - NOT independently confirmed by XOXSS; reproduce via the PoC URL",
                 subkey=f"external:{getattr(item, 'tool', 'tool')}:{digest}",
-                tags=[getattr(item, "tool", "external"), "external", severity],
+                tags=[getattr(item, "tool", "external"), "external", severity, "unverified"],
+                poc_url=str(getattr(item, "url", "") or ""),
             )
         )
 
@@ -3982,6 +4071,10 @@ class XSSScanner:
         values[point.param] = payload
         return merge_query(point.url, values)
 
+    def poc_for_point(self, point: InjectionPoint, payload: str) -> Tuple[str, str]:
+        """Reproduction proof for this point (module-level :func:`build_poc`)."""
+        return build_poc(point, payload)
+
     def build_post_data(self, point: InjectionPoint, payload: str) -> Dict[str, str]:
         values = {name: spec.value for name, spec in point.fields.items()}
         values[point.param] = payload
@@ -4068,23 +4161,14 @@ class XSSScanner:
                 "callback": callback,
             }
         )
-        self.add_finding(
-            Finding(
-                kind="Blind XSS (callback injected)",
-                url=point.url,
-                parameter=point.param,
-                method=point.method.upper(),
-                payload=sent[0],
-                evidence=f"out-of-band marker {marker} sent to {callback}",
-                confidence="low",
-                context="blind",
-                detail=(
-                    "Blind payload injected. Confirm by monitoring the callback "
-                    f"endpoint for marker {marker}."
-                ),
-                subkey=f"oob:{marker}",
-                tags=["blind", "oob"],
-            )
+        # Policy: a blind probe is a *probe*, not a finding.  It only becomes a
+        # report entry (Blind XSS - callback confirmed) when the out-of-band
+        # endpoint actually answers with this marker - a payload being merely
+        # "sent" proves nothing about execution or storage.
+        self.console.info(
+            f"Blind XSS probe deployed: marker {marker} -> {callback} "
+            "(finding is raised only if a callback is observed)",
+            important=False,
         )
 
     async def test_point(self, point: InjectionPoint) -> None:
@@ -4155,6 +4239,12 @@ class XSSScanner:
                         self.add_finding(finding)
                         return
                 if polyglot_info.reflected:
+                    if not polyglot_info.executable:
+                        self.console.debug(
+                            f"Polyglot reflected but not executable ({polyglot_info.context}): {location}"
+                        )
+                        continue
+                    poc_url, poc_command = self.poc_for_point(point, payload)
                     self.add_finding(
                         Finding(
                             kind="Reflected XSS (polyglot)",
@@ -4162,10 +4252,13 @@ class XSSScanner:
                             parameter=point.param,
                             method=point.method.upper(),
                             payload=payload,
-                            evidence="Polyglot payload reflected and potentially executable",
+                            evidence=f"polyglot payload reflected unescaped and executable "
+                            f"({polyglot_info.detail})",
                             confidence="high",
                             context=info.context,
-                            detail="Polyglot payload used for efficiency"
+                            detail="Polyglot payload used for efficiency",
+                            poc_url=poc_url,
+                            poc_command=poc_command,
                         )
                     )
                     return
@@ -4196,6 +4289,7 @@ class XSSScanner:
                 self._stored_checked.add(point.key())
                 stored_page = await self.check_stored(point, payload_token, payload)
                 if stored_page:
+                    _, stored_poc_command = self.poc_for_point(point, payload)
                     self.add_finding(
                         Finding(
                             kind="Stored XSS (payload persisted)",
@@ -4207,6 +4301,8 @@ class XSSScanner:
                             confidence="high",
                             context=payload_info.context,
                             detail="Persistence verified over HTTP; execution not re-confirmed",
+                            poc_url=stored_page,
+                            poc_command=stored_poc_command,
                         )
                     )
                     return
@@ -4222,6 +4318,7 @@ class XSSScanner:
                     return
 
             confidence = "high" if payload_info.executable else "low"
+            poc_url, poc_command = self.poc_for_point(point, payload)
             self.add_finding(
                 Finding(
                     kind="Reflected XSS (HTTP evidence)",
@@ -4233,6 +4330,8 @@ class XSSScanner:
                     confidence=confidence,
                     context=info.context,
                     detail="Browser verification unavailable or inconclusive",
+                    poc_url=poc_url,
+                    poc_command=poc_command,
                 )
             )
             return
@@ -4269,6 +4368,7 @@ class XSSScanner:
                     target_path = self.screenshot_dir / f"{token}.png"
                     screenshot = await browser.screenshot(str(target_path))
 
+                poc_url, poc_command = self.poc_for_point(point, payload)
                 return Finding(
                     kind="Reflected XSS",
                     url=self.build_get_url(point, payload) if point.method.upper() == "GET" else point.url,
@@ -4280,6 +4380,8 @@ class XSSScanner:
                     context=info.context,
                     detail="JavaScript execution confirmed in browser",
                     screenshot=screenshot,
+                    poc_url=poc_url,
+                    poc_command=poc_command,
                 )
         except Exception as exc:
             self.console.debug(f"Browser confirmation error: {exc}")
@@ -4321,7 +4423,15 @@ class XSSScanner:
                 response.text, token, payload, response.header("content-type", "")
             )
             if not info.reflected or not info.executable:
+                if info.reflected and not info.executable:
+                    self.console.debug(
+                        f"Header {header} reflected but not executable; suppression: "
+                        "no finding without executable context"
+                    )
                 continue
+            poc_url, poc_command = self.poc_for_point(
+                InjectionPoint(url=url, method="GET", param=header, source="header"), payload
+            )
             self.add_finding(
                 Finding(
                     kind="Header XSS (reflection)",
@@ -4329,10 +4439,12 @@ class XSSScanner:
                     parameter=header,
                     method="GET",
                     payload=payload,
-                    evidence=f"injected header reflected unescaped ({info.detail})",
+                    evidence=f"injected header reflected unescaped and executable ({info.detail})",
                     confidence="medium",
                     context=info.context,
                     detail="Header reflections cannot be browser-verified without a proxy",
+                    poc_url=poc_url,
+                    poc_command=poc_command,
                 )
             )
             return
@@ -4507,7 +4619,7 @@ class XSSScanner:
                             method="GET",
                             payload=payload_for_kind(kind),
                             evidence=hit.get("evidence", ""),
-                            confidence="confirmed" if executed else "medium",
+                            confidence="confirmed" if executed else "low",
                             context=f"dom/{kind}",
                             detail=(
                                 "Attacker-controlled data reached an instrumented DOM sink and executed"
@@ -4515,6 +4627,7 @@ class XSSScanner:
                                 else "Attacker-controlled data reached a DOM sink; execution not confirmed"
                             ),
                             screenshot=screenshot,
+                            poc_url=vector,
                         )
                     )
                     return
@@ -4559,12 +4672,23 @@ class XSSScanner:
             result = await self.http.get(test_url)
             if result.error or not result.text:
                 continue
+            # Strict evidence policy: the callback must be injected into an
+            # actual JavaScript response (a real JSONP endpoint), never into an
+            # HTML page that merely echoes the query string back.
+            content_type = (result.header("content-type", "") or "").lower()
+            if "javascript" not in content_type:
+                self.console.debug(
+                    f"JSONP candidate {endpoint.url} reflected into non-JS content-type "
+                    f"({content_type or 'none'}); skipping"
+                )
+                continue
             # Raw payload present (not HTML-escaped and not URL-encoded)
             if payload in result.text and f"&lt;" not in result.text[: result.text.find(payload) + len(payload) + 64]:
                 self.jsonp_findings.append({
                     'url': endpoint.url,
                     'callback_param': endpoint.callback_param,
                     'evidence': f"callback parameter reflected unescaped with {payload[:48]}",
+                    'poc_url': test_url,
                 })
                 self.console.warn(f"JSONP XSS found: {endpoint.url} - {endpoint.callback_param}")
     
@@ -5141,13 +5265,14 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
         lines += [
             "## JSONP XSS Findings",
             "",
-            "| # | URL | Callback Parameter | Evidence |",
-            "|---|-----|-------------------|---------|",
+            "| # | URL | Callback Parameter | PoC URL | Evidence |",
+            "|---|-----|-------------------|---------|---------|",
         ]
         for index, finding in enumerate(scanner.jsonp_findings, 1):
             url = finding['url'].replace("|", "%7C")
+            poc = str(finding.get('poc_url', '') or '').replace("|", "%7C")
             lines.append(
-                f"| {index} | {url} | {finding['callback_param']} | {finding['evidence'][:80]} |"
+                f"| {index} | {url} | {finding['callback_param']} | {poc} | {finding['evidence'][:80]} |"
             )
         lines += [""]
     
@@ -5200,6 +5325,14 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
                 f"- **Context:** {finding.context or 'n/a'}",
                 f"- **Evidence:** {finding.evidence or 'n/a'}",
                 f"- **Detail:** {finding.detail or 'n/a'}",
+            ]
+            if finding.poc_url:
+                lines.append(f"- **PoC URL:** {finding.poc_url}")
+            else:
+                lines.append("- **PoC URL:** n/a")
+            if finding.poc_command:
+                lines += ["", "```bash", finding.poc_command, "```", ""]
+            lines += [
                 f"- **Screenshot:** {finding.screenshot or 'n/a'}",
                 "",
                 "```html",
@@ -5309,12 +5442,13 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
                 "<tr>"
                 f"<td><code>{html_lib.escape(truncate(finding['url'], 300))}</code></td>"
                 f"<td>{html_lib.escape(finding['callback_param'])}</td>"
+                f"<td><code>{html_lib.escape(truncate(finding.get('poc_url', ''), 300))}</code></td>"
                 f"<td>{html_lib.escape(truncate(finding['evidence'], 300))}</td>"
                 "</tr>"
             )
         content_parts.append(
             "<h2>JSONP XSS Findings</h2>"
-            "<table><thead><tr><th>URL</th><th>Callback Parameter</th><th>Evidence</th></tr></thead>"
+            "<table><thead><tr><th>URL</th><th>Callback Parameter</th><th>PoC URL</th><th>Evidence</th></tr></thead>"
             "<tbody>" + "".join(jsonp_rows) + "</tbody></table>"
         )
     
@@ -5453,6 +5587,11 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
     if scanner.findings:
         rows = []
         for finding in scanner.findings:
+            poc_cell = (
+                html_lib.escape(truncate(finding.poc_url, 300))
+                if finding.poc_url
+                else html_lib.escape(truncate(finding.poc_command, 160))
+            )
             rows.append(
                 "<tr>"
                 f'<td><span class="badge {html_lib.escape(finding.confidence)}">'
@@ -5462,13 +5601,14 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
                 f"<td><code>{html_lib.escape(finding.parameter)}</code></td>"
                 f"<td><code>{html_lib.escape(truncate(finding.url, 300))}</code></td>"
                 f"<td><code>{html_lib.escape(truncate(finding.payload, 300))}</code></td>"
+                f"<td><code>{poc_cell}</code></td>"
                 f"<td>{html_lib.escape(truncate(finding.evidence, 300))}</td>"
                 "</tr>"
             )
         content_parts.append(
             "<h2>XSS Findings</h2>"
             "<table><thead><tr><th>Severity</th><th>Type</th><th>Method</th>"
-            "<th>Parameter</th><th>URL</th><th>Payload</th><th>Evidence</th></tr></thead>"
+            "<th>Parameter</th><th>URL</th><th>Payload</th><th>PoC</th><th>Evidence</th></tr></thead>"
             "<tbody>" + "".join(rows) + "</tbody></table>"
         )
     

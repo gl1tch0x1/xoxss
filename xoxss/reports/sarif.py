@@ -98,6 +98,17 @@ def build_sarif_document(
         method = str(getattr(finding, "method", "GET"))
         parameter = str(getattr(finding, "parameter", ""))
         url = str(getattr(finding, "url", target))
+        poc_url = str(getattr(finding, "poc_url", "") or "")
+        poc_command = str(getattr(finding, "poc_command", "") or "")
+
+        message_text = (
+            f"{kind} via {method} parameter '{parameter}': "
+            f"{_truncate(evidence or 'reflected payload')}"
+        )
+        if poc_url:
+            message_text += f" | PoC: {_truncate(poc_url, 400)}"
+        if poc_command:
+            message_text += f" | PoC command: {_truncate(poc_command, 400)}"
 
         results.append(
             {
@@ -105,10 +116,7 @@ def build_sarif_document(
                 "ruleIndex": rule_order.index(rule_id),
                 "level": level,
                 "message": {
-                    "text": (
-                        f"{kind} via {method} parameter '{parameter}': "
-                        f"{_truncate(evidence or 'reflected payload')}"
-                    )
+                    "text": message_text
                 },
                 "locations": [
                     {
@@ -130,6 +138,8 @@ def build_sarif_document(
                     "evidence": getattr(finding, "evidence", ""),
                     "detail": getattr(finding, "detail", ""),
                     "screenshot": getattr(finding, "screenshot", ""),
+                    "pocUrl": poc_url,
+                    "pocCommand": poc_command,
                     "timestamp": getattr(finding, "timestamp", ""),
                 },
                 "partialFingerprints": {"xoxssFinding/v1": _finding_key(finding)},
