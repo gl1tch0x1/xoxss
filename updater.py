@@ -7,9 +7,9 @@ origin remote, fast-forwards the current branch, and refreshes the installed
 package so code and dependencies stay in sync.
 
 Usage:
-    python updater.py            # fetch, fast-forward, reinstall
+    python updater.py            # preserve local changes, fast-forward, reinstall
     python updater.py --check    # report only (no changes)
-    python updater.py -y         # auto-stash uncommitted local changes and continue
+    python updater.py --no-auto-stash  # refuse to update a dirty checkout
     python updater.py --extras interactsh,playwright   # also refresh named extras
 
 The update performs two guarded operations:
@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parent
 
@@ -160,19 +161,49 @@ def check_only(branch: str) -> int:
     return 0
 
 
-def stash_if_needed(auto_yes: bool) -> None:
+def stash_if_needed(auto_stash: bool = True) -> Optional[str]:
     if not is_dirty():
-        return
-    if auto_yes:
-        step("Uncommitted changes found; stashing them (git stash -u)")
-        git(["stash", "push", "-u", "-m", "xoxss updater auto-stash"])
-        warn("your changes were stashed - restore with `git stash pop` afterwards.")
-    else:
+        return None
+    if not auto_stash:
         die("uncommitted local changes would block the update. "
-            "Commit or stash them, or re-run with -y to auto-stash.")
+            "Commit or stash them, or allow the updater to temporarily stash them.")
+
+    previous_stash = out(git(["rev-parse", "--verify", "refs/stash"], check=False))
+    step("Uncommitted changes found; preserving them in a temporary stash")
+    git(["stash", "push", "-u", "-m", "xoxss updater temporary stash"])
+    stash_commit = out(git(["rev-parse", "--verify", "refs/stash"], check=False))
+    if not stash_commit or stash_commit == previous_stash or is_dirty():
+        if stash_commit and stash_commit != previous_stash:
+            restore_stash(stash_commit)
+        raise RuntimeError(
+            "could not safely stash all local changes; no update was attempted"
+        )
+    return stash_commit
 
 
-def update(branch: str, auto_yes: bool, extras: list[str]) -> int:
+def restore_stash(stash_commit: str) -> bool:
+    """Restore the updater's exact stash, keeping it if conflicts occur."""
+    result = git(["stash", "apply", "--index", stash_commit], check=False)
+    if result.returncode != 0:
+        warn(
+            "local changes could not be reapplied cleanly. The stash is preserved; "
+            "resolve conflicts, then restore it with `git stash apply --index "
+            f"{stash_commit}`."
+        )
+        return False
+
+    commits = out(git(["stash", "list", "--format=%H"])).splitlines()
+    try:
+        stash_index = commits.index(stash_commit)
+    except ValueError:
+        warn(f"restored local changes; temporary stash remains at {stash_commit}")
+        return True
+    git(["stash", "drop", f"stash@{{{stash_index}}}"])
+    info("local changes were restored after the update")
+    return True
+
+
+def update(branch: str, auto_stash: bool, extras: list[str]) -> int:
     old_version = local_version()
     if ui is not None and ui.enabled():
         print(ui.panel("xoxss updater", [
@@ -185,41 +216,54 @@ def update(branch: str, auto_yes: bool, extras: list[str]) -> int:
         print("=" * 60)
         info(f"current version: {old_version}")
 
-    stash_if_needed(auto_yes)
-    behind, ahead = fetch_state(branch)
+    stash_commit = stash_if_needed(auto_stash)
+    try:
+        behind, ahead = fetch_state(branch)
 
-    if ahead:
-        warn(f"local branch is {ahead} commit(s) ahead of origin/{branch}; "
-             "your commits stay intact, the update only fast-forwards shared history.")
-    if behind == 0:
-        if ui is not None and ui.enabled():
-            print(f"{ui.paint(ui.glyphs()['tick'] + ' code is already up to date', ui.GREEN)}")
+        if ahead:
+            warn(f"local branch is {ahead} commit(s) ahead of origin/{branch}; "
+                 "your commits stay intact, the update only fast-forwards shared history.")
+        if behind == 0:
+            if ui is not None and ui.enabled():
+                print(f"{ui.paint(ui.glyphs()['tick'] + ' code is already up to date', ui.GREEN)}")
+            else:
+                info("code is already up to date")
+            new_version = old_version
         else:
-            info("code is already up to date")
-        new_version = old_version
-    else:
-        log = out(git(["log", "--oneline", f"HEAD..origin/{branch}", "-n", "15"]))
-        incoming = len(out(git(["rev-list", f"HEAD..origin/{branch}"])).splitlines())
-        log_lines = [
-            f"{ui.paint(ui.glyphs()['bullet'] + ' ' + commit, ui.CYAN)}"
-            if ui is not None and ui.enabled() else commit
-            for commit in log.splitlines()
-        ]
-        if ui is not None and ui.enabled():
-            print(ui.panel(f"{incoming} incoming commit(s)", log_lines, accent=ui.CYAN))
-        else:
-            info(f"{incoming} new commit(s) available:")
-            for line_text in log_lines:
-                print(f"      {line_text}")
+            log = out(git(["log", "--oneline", f"HEAD..origin/{branch}", "-n", "15"]))
+            incoming = len(out(git(["rev-list", f"HEAD..origin/{branch}"])).splitlines())
+            log_lines = [
+                f"{ui.paint(ui.glyphs()['bullet'] + ' ' + commit, ui.CYAN)}"
+                if ui is not None and ui.enabled() else commit
+                for commit in log.splitlines()
+            ]
+            if ui is not None and ui.enabled():
+                print(ui.panel(f"{incoming} incoming commit(s)", log_lines, accent=ui.CYAN))
+            else:
+                info(f"{incoming} new commit(s) available:")
+                for line_text in log_lines:
+                    print(f"      {line_text}")
 
-        step(f"Fast-forwarding {branch} to origin/{branch}")
-        result = git(["pull", "--ff-only", "origin", branch], check=False)
-        if result.returncode != 0:
-            die(f"update failed:\n{(result.stderr or result.stdout).strip()}\n"
-                "If you rebased or rewrote history locally, resolve it manually "
-                "or re-clone.", 1)
-        new_version = local_version()
-        info(f"updated {branch}: {version_line(old_version, new_version)}")
+            step(f"Fast-forwarding {branch} to origin/{branch}")
+            result = git(["pull", "--ff-only", "origin", branch], check=False)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"update failed:\n{(result.stderr or result.stdout).strip()}\n"
+                    "If you rebased or rewrote history locally, resolve it manually "
+                    "or re-clone."
+                )
+            new_version = local_version()
+            info(f"updated {branch}: {version_line(old_version, new_version)}")
+    except BaseException:
+        if stash_commit:
+            restore_stash(stash_commit)
+        raise
+
+    if stash_commit and not restore_stash(stash_commit):
+        raise RuntimeError(
+            "the code update completed, but local changes need conflict resolution; "
+            "the temporary stash has been preserved"
+        )
 
     # Refresh the installed package so the running tool matches the new code.
     step("Refreshing the installed package (pip install -U .)")
@@ -257,7 +301,9 @@ def main() -> int:
         epilog="Example: python updater.py -y --extras interactsh,playwright",
     )
     parser.add_argument("-y", "--yes", action="store_true",
-                        help="non-interactive: auto-stash uncommitted local changes")
+                        help="legacy alias for automatic local-change preservation")
+    parser.add_argument("--no-auto-stash", dest="auto_stash", action="store_false", default=True,
+                        help="refuse to update when local changes are present")
     parser.add_argument("--check", action="store_true",
                         help="only report whether an update is available; change nothing")
     parser.add_argument("--extras", default="",
@@ -271,7 +317,7 @@ def main() -> int:
     try:
         if args.check:
             return check_only(branch)
-        return update(branch, args.yes, extras)
+        return update(branch, args.auto_stash or args.yes, extras)
     except RuntimeError as exc:
         die(str(exc))
     except KeyboardInterrupt:

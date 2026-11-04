@@ -267,15 +267,20 @@ python updater.py
 # report whether an update is available, without changing anything
 python updater.py --check
 
-# auto-stash uncommitted changes, and refresh extras after updating
+# local changes are temporarily stashed, restored after updating, and extras refreshed
 python updater.py -y
 python updater.py -y --extras interactsh,playwright
+
+# opt out of automatic local-change preservation
+python updater.py --no-auto-stash
 ```
 
 The installer refuses to run outside a repository checkout and falls back to
 the core scanner even when an optional extra fails. The updater never rewrites
-history — it uses `git pull --ff-only` and aborts on uncommitted changes unless
-`-y` (auto-stash) is given.
+history — it temporarily stashes tracked and untracked local changes, fast-forwards
+with `git pull --ff-only`, then restores the changes. If restoration conflicts, the
+stash is kept and the updater asks you to resolve the conflict. Use `--no-auto-stash`
+to make a dirty checkout stop before updating.
 
 The bundled Docker image is intentionally HTTP-only: no browser, no external scanners,
 non-root user — suitable for reflection checks in CI:
