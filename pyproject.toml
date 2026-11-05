@@ -36,6 +36,8 @@ dependencies = [
 [project.optional-dependencies]
 interactsh = ["cryptography>=42"]
 playwright = ["playwright>=1.40"]
+http2 = ["curl_cffi>=0.7"]
+ast = ["tree-sitter>=0.23", "tree-sitter-javascript>=0.23"]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",

@@ -20,6 +20,18 @@ try:
 except Exception:  # pragma: no cover - caller reports the missing dependency
     aiohttp = None
 
+try:  # optional HTTP/2 + TLS-fingerprint transport (--http2 / --impersonate)
+    from curl_cffi import CurlHttpVersion
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession
+    from curl_cffi.requests.exceptions import ImpersonateError as CurlImpersonateError
+
+    CURL_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    CurlHttpVersion = None  # type: ignore
+    CurlAsyncSession = None  # type: ignore
+    CurlImpersonateError = type("_CurlImpersonateUnavailable", (Exception,), {})  # type: ignore
+    CURL_AVAILABLE = False
+
 if TYPE_CHECKING:  # pragma: no cover - optional runtime dependency
     from aiohttp import ClientResponse, ClientSession
 
@@ -96,13 +108,35 @@ class HttpEngine:
         max_response_bytes: int = 5 * 1024 * 1024,
         redirect_scope: Optional[Any] = None,
         auth_state: Optional[str] = None,
+        http2: bool = False,
+        impersonate: Optional[str] = None,
     ):
         self.console = console
         self.stats = stats
         self.base_headers = dict(headers or {})
-        self.base_headers.setdefault("User-Agent", USER_AGENT)
-        self.base_headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        self.base_headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+        self.http2 = bool(http2)
+        self.impersonate = (impersonate or "").strip() or None
+        self.transport = "aiohttp"
+        if self.http2 or self.impersonate:
+            if CURL_AVAILABLE:
+                self.transport = "curl"
+            else:
+                # Degrade gracefully instead of failing the whole scan.
+                self.http2 = False
+                self.impersonate = None
+                try:
+                    console.debug(
+                        "HTTP/2 or impersonation requested but curl_cffi is not "
+                        "installed; falling back to the aiohttp HTTP/1.1 transport"
+                    )
+                except Exception:
+                    pass
+        if not self.impersonate:
+            # Impersonation profiles already provide a coherent browser header
+            # set; overriding them would weaken the TLS/HTTP fingerprint.
+            self.base_headers.setdefault("User-Agent", USER_AGENT)
+            self.base_headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            self.base_headers.setdefault("Accept-Language", "en-US,en;q=0.9")
         self.cookies = dict(cookies or {})
         self.timeout = timeout
         self.retries = max(0, retries)
@@ -125,6 +159,43 @@ class HttpEngine:
         self._use_smart_rate = False
 
     async def start(self) -> None:
+        if self.transport == "curl":
+            if self.session is not None:
+                return
+            assert CurlAsyncSession is not None, "curl_cffi is not installed"
+            options: Dict[str, Any] = {
+                "headers": self.base_headers,
+                "timeout": self.timeout,
+                "verify": not self.insecure,
+            }
+            if self.cookies:
+                options["cookies"] = self.cookies
+            if self.proxy:
+                options["proxy"] = self.proxy
+            if self.impersonate:
+                options["impersonate"] = self.impersonate
+            if self.http2 and CurlHttpVersion is not None:
+                # CURL_HTTP_VERSION_2_0 negotiates h2 over ALPN and falls back
+                # to HTTP/1.1 when the origin cannot speak HTTP/2.
+                options["http_version"] = CurlHttpVersion.V2_0
+            try:
+                self.session = CurlAsyncSession(**options)  # type: ignore[assignment]
+            except Exception as exc:
+                # A misspelled impersonation profile (or a curl build without
+                # HTTP/2) must not abort the scan; degrade to aiohttp.
+                self.console.warn(
+                    f"Could not start the curl transport ({exc}); "
+                    "falling back to the aiohttp HTTP/1.1 transport",
+                    important=False,
+                )
+                self.transport = "aiohttp"
+                self.http2 = False
+                self.impersonate = None
+                await self.start()
+                return
+            if self.auth_state:
+                self._load_auth_state_cookies_curl()
+            return
         if self.session is not None and not self.session.closed:
             return
         assert aiohttp is not None, "aiohttp is not installed"
@@ -211,9 +282,55 @@ class HttpEngine:
         except Exception as exc:
             self.console.warn(f"Could not load HTTP auth cookies from --auth-state: {exc}")
 
+    def _load_auth_state_cookies_curl(self) -> None:
+        """Load Playwright storage-state cookies into the curl session."""
+        if self.session is None or not self.auth_state:
+            return
+        try:
+            path = Path(self.auth_state).expanduser()
+            if not path.is_file() or path.stat().st_size > 10 * 1024 * 1024:
+                raise ValueError("file is missing or exceeds 10 MiB")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            cookies = data.get("cookies", []) if isinstance(data, dict) else []
+            if not isinstance(cookies, list):
+                raise ValueError("storage state has no valid cookies array")
+            loaded = 0
+            for item in cookies[:5000]:
+                if not isinstance(item, dict):
+                    continue
+                name, value = item.get("name"), item.get("value")
+                domain = str(item.get("domain") or "").lstrip(".")
+                cookie_path = str(item.get("path") or "/")
+                expires = item.get("expires")
+                if expires not in (None, -1, -1.0, 0, 0.0):
+                    try:
+                        if float(expires) <= time.time():
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                if not name or not domain or any(ch in domain for ch in "/:@"):
+                    continue
+                try:
+                    self.session.cookies.set(
+                        str(name), str(value or ""), domain=domain,
+                        path=cookie_path, secure=bool(item.get("secure")),
+                    )
+                except Exception:
+                    continue
+                loaded += 1
+            self.console.info(
+                f"Loaded {loaded} domain-scoped auth cookie(s) from Playwright storage state",
+                important=False,
+            )
+        except Exception as exc:
+            self.console.warn(f"Could not load HTTP auth cookies from --auth-state: {exc}")
+
     async def close(self) -> None:
-        if self.session is not None and not self.session.closed:
-            await self.session.close()
+        if self.session is not None:
+            try:
+                await self.session.close()
+            except Exception:
+                pass
         self.session = None
 
     def enable_smart_rate(self, initial_rate: float) -> None:
@@ -284,6 +401,18 @@ class HttpEngine:
             if expiry > time.monotonic():
                 hit = HttpResponse(**{**cached.__dict__, "from_cache": True})
                 return hit
+
+        if self.transport == "curl":
+            return await self._request_curl(
+                method,
+                url,
+                headers=headers,
+                data=data,
+                json_body=json_body,
+                allow_redirects=allow_redirects,
+                cache=cache,
+                cache_key=cache_key,
+            )
 
         delay = 0.0
         last_error = "request failed after retries"
@@ -443,6 +572,202 @@ class HttpEngine:
         return HttpResponse(url=url, error=last_error)
 
     # -- internals --------------------------------------------------------------------
+    async def _request_curl(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        data: Optional[Dict[str, str]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        allow_redirects: bool = True,
+        cache: bool = False,
+        cache_key: str = "",
+    ) -> HttpResponse:
+        """curl_cffi transport with the same retry/cache/redirect semantics.
+
+        Multiplexes concurrent requests over a persistent HTTP/2 connection and,
+        when ``impersonate`` is set, presents a real browser TLS fingerprint.
+        """
+        delay = 0.0
+        last_error = "request failed after retries"
+        request_headers: Optional[Dict[str, str]] = None
+        if headers:
+            request_headers = {**self.base_headers, **headers}
+        for attempt in range(self.retries + 1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                host = (urlsplit(url).hostname or "").lower()
+                host_semaphore = self._host_semaphores.setdefault(
+                    host, asyncio.Semaphore(self.per_host_concurrency)
+                )
+                async with host_semaphore, self.semaphore:
+                    assert self.session is not None
+                    current_url, current_method = url, method
+                    current_data, current_json = data, json_body
+                    response: Any = None
+                    started = time.monotonic()
+                    for redirect_count in range(11):
+                        await self._apply_rate_limit(urlsplit(current_url).hostname or "")
+                        options: Dict[str, Any] = {
+                            "headers": request_headers,
+                            "data": current_data,
+                            "json": current_json,
+                            "allow_redirects": False,
+                            "timeout": self.timeout,
+                            "verify": not self.insecure,
+                        }
+                        if self.proxy:
+                            options["proxy"] = self.proxy
+                        if self.impersonate:
+                            options["impersonate"] = self.impersonate
+                        if self.http2 and CurlHttpVersion is not None:
+                            options["http_version"] = CurlHttpVersion.V2_0
+                        response = await self.session.request(
+                            current_method, current_url, **options
+                        )
+                        self.stats.requests += 1
+                        response_headers = {
+                            str(k).lower(): str(v) for k, v in response.headers.items()
+                        }
+                        location = (
+                            response_headers.get("location")
+                            or response.headers.get("Location")
+                            or ""
+                        )
+                        is_redirect = int(response.status_code) in (301, 302, 303, 307, 308) and location
+                        if not (allow_redirects and is_redirect):
+                            break
+                        response_url = str(getattr(response, "url", current_url) or current_url)
+                        next_url = urljoin(response_url, location)
+                        current_parts = urlsplit(response_url)
+                        next_parts = urlsplit(next_url)
+                        same_origin = (
+                            current_parts.scheme.lower(), current_parts.hostname, current_parts.port
+                        ) == (
+                            next_parts.scheme.lower(), next_parts.hostname, next_parts.port
+                        )
+                        if not same_origin or (
+                            self.redirect_scope is not None and not self.redirect_scope(next_url)
+                        ):
+                            self._close_curl_response(response)
+                            return HttpResponse(
+                                url=response_url,
+                                status=int(response.status_code),
+                                headers=response_headers,
+                                error="redirect target is outside the request origin or scan scope",
+                            )
+                        self._close_curl_response(response)
+                        if redirect_count == 10:
+                            return HttpResponse(url=current_url, error="too many redirects")
+                        if response.status_code == 303 or (
+                            response.status_code in (301, 302) and current_method.upper() == "POST"
+                        ):
+                            current_method, current_data, current_json = "GET", None, None
+                        current_url = next_url
+                    assert response is not None
+                    try:
+                        raw = bytes(getattr(response, "content", b"") or b"")
+                        truncated = len(raw) > self.max_response_bytes
+                        if truncated:
+                            raw = raw[: self.max_response_bytes]
+                        encoding = getattr(response, "encoding", None) or "utf-8"
+                        try:
+                            text = raw.decode(encoding, "replace")
+                        except (LookupError, RuntimeError):
+                            text = raw.decode("utf-8", "replace")
+                        elapsed = time.monotonic() - started
+                        status = int(response.status_code)
+                        result = HttpResponse(
+                            url=str(getattr(response, "url", current_url) or current_url),
+                            status=status,
+                            headers=response_headers,
+                            text=text,
+                            raw=raw,
+                            elapsed=elapsed,
+                            truncated=truncated,
+                        )
+                        if truncated:
+                            self.stats.truncated_responses += 1
+                            self.console.debug(
+                                f"Response from {truncate(result.url, 120)} exceeded "
+                                f"{self.max_response_bytes} bytes; analysis used a truncated body"
+                            )
+                        if self._use_smart_rate and self._smart_limiter:
+                            self._smart_limiter.record_request(
+                                success=status < 400, elapsed=elapsed, is_retry=False
+                            )
+                        if status in self.RETRY_STATUS and attempt < self.retries:
+                            delay = self._retry_delay(response, attempt)
+                            self.stats.blocked += 1
+                            self.console.debug(
+                                f"{method} {truncate(url, 120)} -> HTTP {status}, retrying in {delay:.1f}s"
+                            )
+                            continue
+                        self.console.debug(
+                            f"{method} {truncate(url, 120)} -> {status} ({elapsed * 1000:.0f} ms)"
+                        )
+                        if cache and cache_key:
+                            self._store_cache(cache_key, result)
+                        return result
+                    finally:
+                        self._close_curl_response(response)
+            except asyncio.CancelledError:
+                raise
+            except CurlImpersonateError as exc:
+                # An unknown --impersonate profile is a configuration error, not
+                # a target failure: drop the fingerprint and continue on aiohttp.
+                self.console.warn(
+                    f"Unsupported --impersonate profile ({exc}); "
+                    "falling back to the aiohttp HTTP/1.1 transport",
+                    important=False,
+                )
+                self.transport = "aiohttp"
+                self.http2 = False
+                self.impersonate = None
+                await self.close()
+                return await self.request(
+                    method,
+                    url,
+                    headers=headers,
+                    data=data,
+                    json_body=json_body,
+                    allow_redirects=allow_redirects,
+                    cache=cache,
+                )
+            except asyncio.TimeoutError:
+                delay = min(8.0, 0.6 * (2 ** attempt))
+                self.console.debug(f"{method} {truncate(url, 120)} -> timeout, retry {attempt + 1}/{self.retries}")
+                if self._use_smart_rate and self._smart_limiter:
+                    self._smart_limiter.record_request(success=False, elapsed=delay, is_retry=True)
+            except Exception as exc:
+                dns_exc = exc if isinstance(exc, socket.gaierror) else getattr(exc, "os_error", None)
+                delay = min(8.0, 0.6 * (2 ** attempt))
+                if isinstance(dns_exc, socket.gaierror):
+                    host = urlsplit(url).hostname or "unknown host"
+                    last_error = f"DNS resolution failed for {host}: {dns_exc}"
+                    if dns_exc.errno != socket.EAI_AGAIN:
+                        self.console.debug(last_error)
+                        break
+                else:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                self.console.debug(f"{method} {truncate(url, 120)} -> {last_error}")
+                host = urlsplit(url).hostname or ""
+                if host:
+                    self._host_failures[host] += 1
+                if self._use_smart_rate and self._smart_limiter:
+                    self._smart_limiter.record_request(success=False, elapsed=delay, is_retry=True)
+        self.stats.errors += 1
+        return HttpResponse(url=url, error=last_error)
+
+    @staticmethod
+    def _close_curl_response(response: Any) -> None:
+        try:
+            response.close()
+        except Exception:
+            pass
+
     @staticmethod
     def _cache_key(
         method: str,
@@ -477,7 +802,10 @@ class HttpEngine:
 
     @staticmethod
     def _retry_delay(response: ClientResponse, attempt: int) -> float:
-        retry_after = response.headers.get("Retry-After", "")
+        try:
+            retry_after = response.headers.get("Retry-After", "") or response.headers.get("retry-after", "")
+        except Exception:
+            retry_after = ""
         if retry_after.isdigit():
             return min(30.0, float(retry_after))
         return min(8.0, 0.7 * (2 ** attempt)) + random.uniform(0, 0.4)

@@ -5,6 +5,12 @@ selenium>=4.22.0
 webdriver-manager>=4.0.1
 uvloop>=0.19.0; sys_platform != "win32"
 
+# Optional: HTTP/2 multiplexing + browser TLS fingerprints (--http2 / --impersonate)
+# pip install "xoxss[http2]"  (installs curl_cffi)
+
+# Optional: scope-aware tree-sitter DOM taint backend
+# pip install "xoxss[ast]"  (installs tree-sitter and tree-sitter-javascript)
+
 # Optional: Playwright browser backend (--browser playwright)
 # pip install playwright && playwright install chromium
 # playwright>=1.40

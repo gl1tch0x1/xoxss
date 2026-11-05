@@ -251,6 +251,10 @@ def build_parser(
     advanced.add_argument("--trusted-types", action="store_true", help="analyze Trusted Types CSP directive")
     advanced.add_argument("--graphql", action="store_true", help="detect GraphQL XSS vulnerabilities")
     advanced.add_argument("--websocket", action="store_true", help="detect WebSocket XSS vulnerabilities")
+    advanced.add_argument(
+        "--ws-active", action="store_true",
+        help="actively inject marker frames into WebSocket endpoints discovered in page JavaScript (requires --websocket)",
+    )
     advanced.add_argument("--file-upload", action="store_true", help="detect file upload XSS vulnerabilities")
     advanced.add_argument("--postmessage", action="store_true", help="detect postMessage XSS vulnerabilities")
 
@@ -282,6 +286,14 @@ def build_parser(
     network.add_argument("--rate-limit", type=float, default=0.0, help="requests per second (0 = unlimited)")
     network.add_argument("--proxy", help="HTTP(S) proxy, e.g. http://127.0.0.1:8080")
     network.add_argument("--insecure", action="store_true", help="ignore TLS certificate errors")
+    network.add_argument(
+        "--http2", action="store_true",
+        help="multiplex requests over HTTP/2 via curl_cffi (requires the [http2] extra; falls back to aiohttp)",
+    )
+    network.add_argument(
+        "--impersonate", metavar="PROFILE",
+        help="curl_cffi browser TLS fingerprint to emulate, e.g. chrome124 or firefox133 (implies the curl transport)",
+    )
     network.add_argument(
         "--max-response-bytes", type=int, default=5 * 1024 * 1024,
         metavar="N", help="maximum response body bytes analyzed (default: 5242880)",

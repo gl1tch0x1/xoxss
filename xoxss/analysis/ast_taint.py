@@ -13,6 +13,7 @@ expression, which keeps false positives manageable on real-world bundles.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -223,7 +224,29 @@ def _sanitizer_in(expr: str) -> Tuple[bool, str]:
 
 
 def analyze_javascript(code: str, url: str = "") -> List[TaintFlow]:
-    """Extract DOM-XSS source -> sink flows from a JavaScript blob."""
+    """Extract DOM-XSS source -> sink flows from a JavaScript blob.
+
+    Uses the scope-aware tree-sitter backend when it is installed, and falls
+    back to the dependency-free regex analyser otherwise.  Set
+    ``XOXSS_AST_BACKEND=regex`` to force the regex path, or
+    ``XOXSS_AST_BACKEND=tree-sitter`` to require the CST path when available.
+    """
+    if not code:
+        return []
+    backend = os.environ.get("XOXSS_AST_BACKEND", "auto").strip().lower()
+    if backend != "regex":
+        try:
+            from xoxss.analysis.cst_taint import AVAILABLE, analyze_javascript_cst
+
+            if AVAILABLE:
+                return analyze_javascript_cst(code, url)
+        except Exception:
+            pass
+    return analyze_javascript_regex(code, url)
+
+
+def analyze_javascript_regex(code: str, url: str = "") -> List[TaintFlow]:
+    """Dependency-free regex taint analysis (fallback backend)."""
     if not code:
         return []
     # Cap pathological bundles; the caller normally already truncates.
@@ -318,6 +341,7 @@ __all__ = [
     "SINK_PATTERNS",
     "TaintFlow",
     "analyze_javascript",
+    "analyze_javascript_regex",
     "find_sources",
     "strip_comments",
     "summarize_flows",

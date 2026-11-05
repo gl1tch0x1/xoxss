@@ -25,9 +25,6 @@ import argparse
 import asyncio
 import copy
 import hashlib
-import gzip
-import html as html_lib
-import io
 import json
 import os
 import random
@@ -197,6 +194,19 @@ from xoxss.analysis.mutation_probe import (
     reverse_normalization,
 )
 from xoxss.analysis.payload_grammar import assemble_variants
+from xoxss.engine.crawler import COMMON_ENDPOINTS, CrawlerMixin
+from xoxss.utils.urlpolicy import (
+    DANGEROUS_PATH_WORDS,
+    SCANNABLE_EXTENSIONS,
+    SKIP_EXTENSIONS,
+    looks_like_dangerous,
+    looks_like_page,
+    looks_like_scan_target,
+    normalize_scan_url,
+)
+
+# Backwards-compatible name used throughout the scanner.
+normalize_url = normalize_scan_url
 
 try:
     from xoxss.utils import ui as _ui
@@ -248,51 +258,6 @@ PAYLOAD_SOURCES: Tuple[str, ...] = (
 MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
 MAX_REMOTE_PAYLOADS = 5000
 
-# Common paths probed by ``--discover-paths`` (kept intentionally small and safe: GET only).
-COMMON_ENDPOINTS: Tuple[str, ...] = (
-    "/api",
-    "/api/v1",
-    "/api/v2",
-    "/graphql",
-    "/rest",
-    "/admin",
-    "/login",
-    "/signin",
-    "/search",
-    "/find",
-    "/query",
-    "/upload",
-    "/profile",
-    "/account",
-    "/user",
-    "/users",
-    "/settings",
-    "/dashboard",
-    "/contact",
-    "/feedback",
-    "/comment",
-    "/comments",
-    "/posts",
-    "/post",
-    "/news",
-    "/blog",
-    "/article",
-    "/download",
-    "/redirect",
-    "/callback",
-    "/oauth",
-    "/sso",
-    "/status",
-    "/health",
-    "/swagger.json",
-    "/openapi.json",
-    "/api/docs",
-    "/docs",
-    "/debug",
-    "/test",
-    "/.well-known/security.txt",
-)
-
 # Parameter names tried on discovered endpoints that do not expose any query string.
 FUZZ_PARAM_NAMES: Tuple[str, ...] = (
     "q",
@@ -331,22 +296,6 @@ JS_ENDPOINT_PATTERNS = (
     ),
     re.compile(r"""["'`]((?:https?://|/|\./|\.\./)[^"'`\s<>]{1,500})["'`]""", re.I),
 )
-
-# Extensions worth scanning even though they are not HTML pages.
-SCANNABLE_EXTENSIONS = {
-    ".json",
-    ".xml",
-    ".php",
-    ".asp",
-    ".aspx",
-    ".jsp",
-    ".do",
-    ".action",
-    ".cgi",
-    ".pl",
-    ".py",
-    ".rb",
-}
 
 # Known vulnerable JavaScript libraries (simplified retire.js-style database)
 # Format: library_name -> (min_vulnerable_version, max_vulnerable_version, cve_id, severity)
@@ -527,62 +476,6 @@ def merge_query(url: str, extra: Dict[str, str]) -> str:
             out.append((key, old))
     out.extend(remaining.items())
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(out, doseq=True), ""))
-
-
-def normalize_url(url: str) -> str:
-    parts = urlsplit(url.strip())
-    scheme = (parts.scheme or "http").lower()
-    netloc = parts.netloc.lower()
-    path = parts.path or "/"
-    query = urlencode(parse_qsl(parts.query, keep_blank_values=True))
-    return urlunsplit((scheme, netloc, path, query, ""))
-
-
-SKIP_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".bmp", ".tif", ".tiff",
-    ".css", ".woff", ".woff2", ".ttf", ".eot", ".otf",
-    ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".webm", ".ogg",
-    ".pdf", ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
-    ".exe", ".msi", ".dmg", ".apk", ".ipa", ".bin", ".iso",
-    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv",
-    ".js", ".mjs", ".map", ".json", ".xml", ".txt", ".rss", ".atom",
-}
-
-DANGEROUS_PATH_WORDS = (
-    "logout", "log-out", "signout", "sign-out", "delete", "remove", "destroy",
-    "unsubscribe", "cancel-account", "deactivate", "reset-password",
-)
-
-
-def looks_like_page(url: str) -> bool:
-    path = urlsplit(url).path.lower()
-    ext = os.path.splitext(path)[1]
-    if ext and ext in SKIP_EXTENSIONS:
-        return False
-    if any(word in path for word in DANGEROUS_PATH_WORDS):
-        return False
-    return True
-
-
-def looks_like_dangerous(url: str) -> bool:
-    lowered = (urlsplit(url).path or "").lower()
-    return any(word in lowered for word in DANGEROUS_PATH_WORDS)
-
-
-def looks_like_scan_target(url: str, fuzz_params: bool = False) -> bool:
-    """True when a discovered URL is worth scanning for XSS."""
-    if looks_like_dangerous(url):
-        return False
-    parts = urlsplit(url)
-    if parts.query:
-        return True
-    path = parts.path.lower()
-    ext = os.path.splitext(path)[1]
-    if ext in SKIP_EXTENSIONS and ext not in SCANNABLE_EXTENSIONS:
-        return False
-    if looks_like_page(url):
-        return True
-    return bool(fuzz_params)
 
 
 def extract_endpoints_from_text(text: str, base_url: str) -> List[str]:
@@ -2122,7 +2015,7 @@ def build_poc(point: InjectionPoint, payload: str) -> Tuple[str, str]:
 # --------------------------------------------------------------------------------------
 
 
-class XSSScanner:
+class XSSScanner(CrawlerMixin):
     def __init__(self, target: str, args: argparse.Namespace, console: Console):
         if not re.match(r"^https?://", target, re.IGNORECASE):
             target = "http://" + target
@@ -2179,6 +2072,8 @@ class XSSScanner:
             redirect_scope=self.scope.in_scope,
             max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
             auth_state=getattr(args, "auth_state", None),
+            http2=getattr(args, "http2", False),
+            impersonate=getattr(args, "impersonate", None),
         )
         
         # Enable smart rate limiting if requested
@@ -2781,34 +2676,6 @@ class XSSScanner:
         )
 
     # -- discovery --------------------------------------------------------------------
-    async def prepare_urls(self) -> List[str]:
-        recon = await self.recon_seeds()
-        if not self.args.crawl:
-            combined = list(dict.fromkeys([self.target, *recon]))
-            return combined[: max(1, self.args.max_urls)]
-        self.console.info(
-            f"Crawling {self.target} (depth {self.args.crawl_depth}, max {self.args.max_urls})"
-        )
-        # Recon seeds first so a tight --max-urls budget still covers the
-        # passive/JS/OpenAPI surface the operator explicitly asked for.
-        seeds = [*recon, *(await self.discover_seeds())]
-        urls = await self.crawl(seeds)
-        if self.pool and getattr(self.args, "browser_discovery", False):
-            observed = await self.discover_browser_requests(urls)
-            urls = list(dict.fromkeys([*urls, *observed]))[: max(1, self.args.max_urls)]
-        if self.target not in urls:
-            urls.insert(0, self.target)
-        self.state.extra["endpoints"] = sorted(self.endpoints)[:5000]
-        self.state.extra["endpoint_sources"] = {
-            endpoint: sorted(sources)
-            for endpoint, sources in list(self.endpoint_sources.items())[:5000]
-        }
-        self.console.ok(
-            f"Crawl complete: {len(urls)} URL(s), {len(self.endpoints)} endpoint(s)",
-            important=False,
-        )
-        return urls
-
     async def discover_browser_requests(self, urls: Sequence[str]) -> List[str]:
         """Visit a bounded route sample and merge same-scope browser API traffic."""
         discovered: List[str] = []
@@ -3143,225 +3010,6 @@ class XSSScanner:
             errors.append({"source": label, "error": str(error)[:1000]})
         self.console.warn(f"{label} failed: {error}")
 
-    async def discover_seeds(self) -> List[str]:
-        """Collect extra crawl seeds from robots.txt, sitemaps and common paths."""
-        seeds: List[str] = []
-        parts = urlsplit(self.target)
-        origin = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
-
-        if getattr(self.args, "discover", True):
-            sitemap_urls: List[str] = []
-            robots = await self.http.get(urljoin(origin, "/robots.txt"), cache=True)
-            if robots.ok and robots.text:
-                for line in robots.text.splitlines():
-                    key, _, value = line.partition(":")
-                    key = key.strip().lower()
-                    value = value.strip()
-                    if not value:
-                        continue
-                    if key == "sitemap":
-                        sitemap_urls.append(value)
-                    elif key in ("allow", "disallow"):
-                        # Wildcard and root-only rules are not concrete endpoints.
-                        if value != "/" and "*" not in value and "$" not in value:
-                            seeds.append(urljoin(origin, value))
-            sitemap_urls.append(urljoin(origin, "/sitemap.xml"))
-            seeds.extend(await self.parse_sitemaps(sitemap_urls))
-            if seeds:
-                self.console.debug(f"Seed discovery produced {len(seeds)} candidate(s)")
-
-        if getattr(self.args, "discover_paths", False):
-            seeds.extend(await self.probe_common_endpoints(origin))
-
-        result: List[str] = []
-        seen: Set[str] = set()
-        for url in seeds:
-            if not url or not self.scope.in_scope(url) or looks_like_dangerous(url):
-                continue
-            if not looks_like_scan_target(url, fuzz_params=True):
-                continue
-            normalized = normalize_url(url)
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            result.append(url)
-            self._record_endpoint(url, "seed")
-        return result
-
-    async def parse_sitemaps(
-        self,
-        urls: Sequence[str],
-        max_sitemaps: int = 10,
-        max_urls: int = 2000,
-    ) -> List[str]:
-        found: List[str] = []
-        queue: List[str] = [url for url in dict.fromkeys(urls) if url]
-        visited: Set[str] = set()
-        while queue and len(visited) < max_sitemaps and len(found) < max_urls:
-            sitemap_url = queue.pop(0)
-            if sitemap_url in visited:
-                continue
-            visited.add(sitemap_url)
-            response = await self.http.get(sitemap_url, cache=True)
-            if response.error or not response.text:
-                continue
-            text = response.text[:2_000_000]
-            if sitemap_url.lower().endswith(".gz") or response.raw.startswith(b"\x1f\x8b"):
-                try:
-                    with gzip.GzipFile(fileobj=io.BytesIO(response.raw)) as compressed:
-                        decoded = compressed.read(2_000_001)
-                    if len(decoded) > 2_000_000:
-                        self.console.debug(f"Ignoring oversized compressed sitemap: {sitemap_url}")
-                        continue
-                    text = decoded.decode("utf-8", "replace")
-                except (OSError, EOFError) as exc:
-                    self.console.debug(f"Could not decode compressed sitemap {sitemap_url}: {exc}")
-                    continue
-            locations = [
-                html_lib.unescape(loc.strip())
-                for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", text, re.I)
-            ]
-            locations = [urljoin(sitemap_url, location) for location in locations]
-            if "<sitemapindex" in text.lower():
-                for location in locations:
-                    if location not in visited:
-                        queue.append(location)
-            else:
-                for location in locations:
-                    found.append(location)
-                    if len(found) >= max_urls:
-                        break
-        return found
-
-    async def probe_common_endpoints(self, origin: str) -> List[str]:
-        paths: List[str] = list(COMMON_ENDPOINTS)
-        wordlist = getattr(self.args, "endpoint_wordlist", None)
-        if wordlist:
-            try:
-                with open(wordlist, "r", encoding="utf-8-sig", errors="replace") as handle:
-                    for line in handle:
-                        entry = line.strip()
-                        if entry and not entry.startswith("#"):
-                            paths.append(entry if entry.startswith("/") else "/" + entry)
-            except OSError as exc:
-                self.console.warn(f"Cannot read endpoint wordlist {wordlist}: {exc}")
-
-        targets: List[str] = []
-        seen: Set[str] = set()
-        for path in paths:
-            candidate = urljoin(origin, path)
-            if candidate not in seen:
-                seen.add(candidate)
-                targets.append(candidate)
-
-        self.console.info(f"Probing {len(targets)} common endpoint path(s)")
-        semaphore = asyncio.Semaphore(max(1, min(10, self.args.concurrency)))
-
-        async def probe(candidate: str) -> Optional[str]:
-            async with semaphore:
-                response = await self.http.get(candidate, allow_redirects=False, cache=True)
-                if response.error:
-                    return None
-                if response.status in (200, 201, 204, 301, 302, 303, 307, 308, 401, 403, 405):
-                    return response.url or candidate
-                return None
-
-        results = await asyncio.gather(*(probe(candidate) for candidate in targets), return_exceptions=True)
-        found: List[str] = []
-        for item in results:
-            if isinstance(item, str):
-                found.append(item)
-                self._record_endpoint(item, "wordlist")
-        if found:
-            self.console.debug(f"Common-path probing found {len(found)} endpoint(s)")
-        return found
-
-    def _record_endpoint(self, url: str, source: str = "crawl") -> None:
-        try:
-            normalized = normalize_url(url)
-        except ValueError:
-            return
-        if not self.scope.in_scope(normalized) or looks_like_dangerous(normalized):
-            return
-        if not looks_like_scan_target(normalized, fuzz_params=True):
-            return
-        self.endpoint_sources.setdefault(normalized, set()).add(source)
-        if normalized in self.endpoints:
-            return
-        self.endpoints.add(normalized)
-        self.stats.endpoints = len(self.endpoints)
-        self.console.debug(f"Endpoint [{source}]: {truncate(normalized, 130)}")
-
-    async def _crawl_page(self, url: str, depth: int) -> List[str]:
-        response = await self.http.get(url, cache=True)
-        if response.error or not response.text:
-            return []
-        text = response.text[:3_000_000]
-        content_type = response.header("content-type", "").lower()
-        links: List[str] = []
-        is_html = "html" in content_type or text.lstrip().startswith("<")
-        if is_html and HAS_BS4:
-            soup = _soup(text)
-            links.extend(self._links_from_soup(soup, url))
-            if HAS_RECON and extract_attr_urls is not None:
-                links.extend(extract_attr_urls(text, url))
-            if HAS_RECON and extract_html_parameters is not None:
-                discovered = self._mined_params.setdefault(url, [])
-                for name in extract_html_parameters(text):
-                    if name not in discovered:
-                        discovered.append(name)
-            
-            # Check script tags for vulnerable libraries
-            scripts = extract_scripts(url, text)
-            if getattr(self.args, "check_libs", True):
-                for script in scripts:
-                    if not script.inline:
-                        vulns = check_vulnerable_libs(script.url)
-                        for vuln in vulns:
-                            if vuln not in self.vulnerable_libs:
-                                self.vulnerable_libs.append(vuln)
-                                self.console.warn(
-                                    f"Vulnerable library: {vuln.name} {vuln.version} ({vuln.severity}) - {vuln.cve} @ {truncate(vuln.url, 80)}"
-                                )
-            
-            links.extend(await self._endpoints_from_scripts(scripts, url))
-        else:
-            links.extend(extract_endpoints_from_text(text, url))
-        # Follow .js files that were reached through links (not only <script src>).
-        for link in list(links):
-            path = urlsplit(link).path.lower()
-            if path.endswith((".js", ".mjs")) and self.scope.in_scope(link):
-                links.extend(await self._endpoints_from_js_file(link))
-        for link in links:
-            self._record_endpoint(link, "crawl")
-        self.console.debug(f"Crawled {truncate(url, 120)} (depth {depth})")
-        return links
-
-    def _links_from_soup(self, soup: Any, page_url: str) -> List[str]:
-        links: List[str] = []
-        for tag in soup.find_all(["a", "area", "link"], href=True):
-            href = tag.get("href")
-            if isinstance(href, str):
-                links.append(urljoin(page_url, href))
-        for tag in soup.find_all(["iframe", "frame"], src=True):
-            src = tag.get("src")
-            if isinstance(src, str):
-                links.append(urljoin(page_url, src))
-        for tag in soup.find_all("form", action=True):
-            action = tag.get("action")
-            if isinstance(action, str):
-                links.append(urljoin(page_url, action))
-        for tag in soup.find_all("object", data=True):
-            data = tag.get("data")
-            if isinstance(data, str):
-                links.append(urljoin(page_url, data))
-        for tag in soup.find_all("meta", attrs={"http-equiv": True}):
-            if str(tag.get("http-equiv", "")).lower() == "refresh":
-                match = re.search(r"url\s*=\s*['\"]?([^'\"\s;]+)", str(tag.get("content", "")), re.I)
-                if match:
-                    links.append(urljoin(page_url, match.group(1)))
-        return links
-
     async def _endpoints_from_scripts(self, scripts: Sequence[DomScript], page_url: str) -> List[str]:
         endpoints: List[str] = []
         for script in scripts:
@@ -3494,66 +3142,6 @@ class XSSScanner:
                 tags=["dom", "ast"],
             )
         )
-
-    async def crawl(self, seeds: Optional[Sequence[str]] = None) -> List[str]:
-        limit = max(1, self.args.max_urls)
-        depth_limit = max(1, self.args.crawl_depth)
-        seen: Set[str] = set()
-        ordered: List[str] = []
-        frontier: List[str] = []
-
-        for candidate in [self.target, *(seeds or [])]:
-            if len(ordered) >= limit or self._stop.is_set():
-                break
-            if not candidate or not self.scope.in_scope(candidate) or looks_like_dangerous(candidate):
-                continue
-            if not looks_like_scan_target(candidate, fuzz_params=True):
-                continue
-            normalized = normalize_url(candidate)
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            ordered.append(candidate)
-            frontier.append(candidate)
-            self._record_endpoint(candidate, "seed")
-
-        for depth in range(depth_limit):
-            if not frontier or len(ordered) >= limit or self._stop.is_set():
-                break
-            results = await asyncio.gather(
-                *(self._crawl_page(url, depth) for url in frontier),
-                return_exceptions=True,
-            )
-            next_frontier: List[str] = []
-            for result in results:
-                if isinstance(result, BaseException) or not result:
-                    continue
-                for link in result:
-                    if len(ordered) >= limit or self._stop.is_set():
-                        break
-                    link = link.split("#", 1)[0]
-                    if not link or link.startswith(("mailto:", "tel:", "javascript:", "data:")):
-                        continue
-                    if not self.scope.in_scope(link) or looks_like_dangerous(link):
-                        continue
-                    if not looks_like_scan_target(
-                        link, fuzz_params=bool(getattr(self.args, "fuzz_params", False))
-                    ):
-                        continue
-                    normalized = normalize_url(link)
-                    if normalized in seen:
-                        continue
-                    seen.add(normalized)
-                    ordered.append(link)
-                    next_frontier.append(link)
-                    self._record_endpoint(link, "crawl")
-            frontier = next_frontier
-            self.state.extra["discovered"] = ordered[:limit]
-            self.console.debug(
-                f"Crawl depth {depth + 1}/{depth_limit}: {len(ordered)} URL(s), "
-                f"{len(self.endpoints)} endpoint(s)"
-            )
-        return ordered
 
     async def _scan_urls(self, urls: Sequence[str]) -> None:
         # A fixed worker count avoids allocating one asyncio task per URL for
@@ -4360,6 +3948,84 @@ class XSSScanner:
                 )
 
     # -- DOM XSS ----------------------------------------------------------------------
+    async def _probe_websocket_frames(self, page_url: str, scripts: Sequence[DomScript]) -> None:
+        """Actively inject marker frames into WebSocket endpoints found in page JS."""
+        from xoxss.analysis.websocket import (
+            WebSocketActiveProbe,
+            extract_websocket_urls,
+            websocket_http_equivalent,
+        )
+
+        js_text = "\n".join(script.content for script in scripts if script.content)
+        endpoints = extract_websocket_urls(js_text, page_url)
+        if not endpoints:
+            return
+        parts = urlsplit(page_url)
+        origin = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+        headers = self._parse_headers(self.args.headers)
+        cookies = self._parse_cookies(self.args.cookies)
+        probe = WebSocketActiveProbe(
+            self.console,
+            timeout=min(10.0, max(3.0, float(self.args.timeout))),
+            headers=headers,
+            cookies=cookies,
+            origin=origin,
+            insecure=bool(getattr(self.args, "insecure", False)),
+            proxy=getattr(self.args, "proxy", None),
+        )
+        checked = 0
+        for endpoint in endpoints:
+            if checked >= 3 or self._stop.is_set():
+                break
+            if not self.scope.in_scope(websocket_http_equivalent(endpoint)):
+                self.console.debug(f"Skipping out-of-scope WebSocket endpoint: {truncate(endpoint, 120)}")
+                continue
+            checked += 1
+            marker = unique_token(prefix="ws")
+            hits = await probe.probe(endpoint, markers=[marker])
+            for hit in hits:
+                if not hit.reflected:
+                    if hit.error:
+                        self.console.debug(
+                            f"WebSocket probe failed for {truncate(endpoint, 120)}: {hit.error}"
+                        )
+                    continue
+                poc_command = (
+                    f"printf '%s' {shlex.quote(hit.payload)} | "
+                    f"websocat -1 {shlex.quote(endpoint)}"
+                )
+                evidence = (
+                    f"{hit.evidence}; response frame: "
+                    f"{truncate(hit.response or '', 240)}"
+                )
+                self.websocket_findings.append({
+                    "url": endpoint,
+                    "sink": "frame-reflection",
+                    "location": page_url[:500],
+                    "description": evidence[:500],
+                    "payload": hit.payload,
+                })
+                self.add_finding(
+                    Finding(
+                        kind="WebSocket frame reflection",
+                        url=page_url,
+                        parameter="websocket-frame",
+                        method="WS",
+                        payload=hit.payload,
+                        evidence=evidence,
+                        confidence="medium" if hit.executable else "low",
+                        context=hit.context,
+                        detail=(
+                            "The endpoint echoed the injected frame. Browser execution depends "
+                            "on the page's message handler and sink; verify manually."
+                        ),
+                        poc_url=endpoint,
+                        poc_command=poc_command,
+                    )
+                )
+                return
+
+    # -- DOM XSS ----------------------------------------------------------------------
     def dom_vectors(self, url: str, limit: int = 16) -> List[Tuple[str, str, str]]:
         vectors: List[Tuple[str, str, str]] = []
         templates = [("<img src=x onerror=\"{m}\">", "html"), ("{m}", "js")]
@@ -4447,6 +4113,8 @@ class XSSScanner:
                     f"postMessage/WebSocket sinks on {url}: "
                     f"{len(self.postmessage_findings)} pm, {len(self.websocket_findings)} ws"
                 )
+            if self.args.websocket and getattr(self.args, "ws_active", False):
+                await self._probe_websocket_frames(url, scripts)
 
         # --dom-clobbering: static check on the page markup
         if self.args.dom_clobbering and response.text:
@@ -5528,6 +5196,8 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
             for target in targets
         ),
         max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
+        http2=getattr(args, "http2", False),
+        impersonate=getattr(args, "impersonate", None),
     )
     custom_params = [
         item.strip()
@@ -5679,6 +5349,8 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
             for target in targets
         ),
         max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
+        http2=getattr(args, "http2", False),
+        impersonate=getattr(args, "impersonate", None),
     )
     harvester = ParameterHarvester(
         http, console, limit=max(1, args.param_limit), timeout=max(10.0, args.timeout * 2)
@@ -5818,6 +5490,8 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
             for target in targets
         ),
         max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
+        http2=getattr(args, "http2", False),
+        impersonate=getattr(args, "impersonate", None),
     )
     probe.http = http
     try:

@@ -90,11 +90,14 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 
 **Discovery**
 
-- Level-by-level concurrent crawler with depth and URL budgets; parses links, forms,
-  iframes, `object`, meta-refresh, `robots.txt`, recursive sitemaps and JavaScript.
+- Level-by-level concurrent crawler (`engine/crawler.py`) with depth and URL budgets; parses
+  links, forms, iframes, `object`, meta-refresh, `robots.txt`, recursive sitemaps and
+  JavaScript.
 - JavaScript intelligence: hidden endpoints, parameter names, GraphQL/WebSocket URLs,
   source maps and embedded `sourcesContent`, leaked credential patterns, and
-  source-to-sink taint flows with sanitizer awareness.
+  source-to-sink taint flows with sanitizer awareness. A scope-aware tree-sitter CST
+  backend resolves shadowed variables and closures in minified bundles; the regex
+  analyzer remains available via `XOXSS_AST_BACKEND=regex`.
 - OpenAPI/Swagger discovery, including path parameters and JSON/form request bodies.
 - Passive subdomain enumeration (crt.sh, certspotter, HackerTarget, OTX, urlscan) and
   historic URL mining (Wayback, Common Crawl, urlscan, OTX).
@@ -223,6 +226,8 @@ injected parameter — no cookies or session data.
 | Firefox / Chrome / Edge | For Selenium mode | Use `--no-browser` for HTTP-only operation. |
 | Playwright | Optional | `--browser playwright`; requires `playwright install chromium`. |
 | `cryptography` | Optional | Native `--interactsh` decryption. |
+| `curl_cffi` | Optional | `--http2` multiplexing and `--impersonate` TLS fingerprints (`pip install "xoxss[http2]"`). |
+| `tree-sitter` + `tree-sitter-javascript` | Optional | Scope-aware CST taint backend (`pip install "xoxss[ast]"`); the regex analyzer remains the fallback. |
 | `uvloop` | Optional | Faster event loop on non-Windows platforms. |
 | External binaries | Optional | `subfinder`, `gau`, `waybackurls`, `katana`, `httpx`, `arjun`, `x8`, `dalfox`, `nuclei`; missing tools contribute nothing. |
 
@@ -402,6 +407,7 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--trusted-types` | Trusted Types CSP analysis. |
 | `--graphql` | GraphQL endpoint detection and introspection exposure. |
 | `--websocket` | WebSocket sink analysis (`onmessage`/`eval` flows). |
+| `--ws-active` | Actively inject marker frames into WebSocket endpoints discovered in page JavaScript (requires `--websocket`). Frame reflections are reported conservatively; they still require handler verification. |
 | `--file-upload` | File upload form discovery. |
 | `--postmessage` | `postMessage` handler analysis (origin validation). |
 
@@ -433,6 +439,8 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--timeout S` / `--retries N` | Per-request timeout (default `20`) / retries (default `2`). |
 | `--rate-limit N` | Global requests-per-second cap; `0` is unlimited. |
 | `--proxy URL` / `--insecure` | HTTP(S) proxy / disable TLS verification (authorized targets only). |
+| `--http2` | Multiplex requests over HTTP/2 through the optional `curl_cffi` transport; degrades to aiohttp HTTP/1.1 when unavailable. |
+| `--impersonate PROFILE` | Emulate a browser TLS/JA3/JA4 fingerprint (for example `chrome124`, `firefox133`); implies the curl transport. |
 | `--max-response-bytes N` | Maximum response body size analyzed (default `5242880`). |
 | `--headers "Name: Value"` / `--cookies "a=b; c=d"` | Extra headers and cookies for HTTP probes. |
 | `--auth-state PATH` | Playwright storage-state JSON for browser discovery/verification and scoped HTTP cookies. |
@@ -764,13 +772,15 @@ use collectors you control.
 
 ## Architecture
 
-The current codebase is split into focused CLI, transport, analysis, recon, reporting
-and browser modules. `scanner.py` remains the scan coordinator and target orchestrator.
+The current codebase is split into focused CLI, transport, crawl engine, analysis, recon,
+reporting and browser modules. `scanner.py` remains the scan coordinator and target
+orchestrator.
 
 ```mermaid
 flowchart LR
     CLI["cli.py and stdin"] --> SCAN["scanner.py<br/>scope and coordinator"]
-    SCAN --> HTTP["core/http.py<br/>HTTP transport and retries"]
+    SCAN --> HTTP["core/http.py<br/>HTTP/1.1 and optional curl_cffi HTTP/2"]
+    SCAN --> CRAWLER["engine/crawler.py<br/>BFS spider and sitemaps"]
     SCAN --> RECON["recon modules<br/>passive, JS, OpenAPI"]
     SCAN --> PARAM["scan/parameters.py<br/>batch, controls, bisection"]
     SCAN --> REFLECT["scan/reflection.py<br/>context and browser gate"]
@@ -805,10 +815,12 @@ xoxss/
   scanner.py              scan coordinator, findings and target orchestration
   cli.py                  CLI parser construction
   core/
-    http.py               shared asynchronous HTTP transport and response model
+    http.py               shared asynchronous HTTP transport (aiohttp + optional curl_cffi HTTP/2)
     browser.py            Selenium and Playwright backends
     config.py             typed configuration schema (CLI remains authoritative)
     state.py              crash-safe checkpoint/resume state and URL lifecycle
+  engine/
+    crawler.py            BFS spider, sitemap walker and endpoint recorder
   detection/
     reflection.py         token alignment, context and surviving-character analysis
     context.py            context classification helpers
@@ -817,7 +829,8 @@ xoxss/
     waf.py                WAF signatures and blocking heuristics
     encoders.py           composable encoder registry
   analysis/
-    ast_taint.py          JavaScript source-to-sink flow analysis
+    ast_taint.py          JavaScript source-to-sink flow analysis (regex fallback)
+    cst_taint.py          scope-aware tree-sitter CST taint backend
     proto_pollution.py    static hints, probes, gadgets, exploit URLs
     mutation_probe.py     bounded response transformation observations
     payload_grammar.py    constraint-driven payload variants
