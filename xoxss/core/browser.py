@@ -646,7 +646,7 @@ class PlaywrightEngine:
 
     async def start(self) -> bool:
         try:
-            from playwright.async_api import async_playwright
+            from playwright.async_api import async_playwright  # type: ignore[reportMissingImports]
         except Exception:
             self.console.warn(
                 "Playwright is not installed - use --browser firefox or install it "

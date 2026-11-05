@@ -469,8 +469,10 @@ subfinder -d example.com -silent | httpx -silent | python -m xoxss --mass --json
 ### Parameter audit (collector + Gxss)
 
 `--param-audit` is a standalone reconnaissance mode that harvests historic URLs the way
-`collector` does, extracts unique parameter names, and tests each parameter
-individually with a unique marker (the Gxss technique). It does not crawl, launch a
+`collector` does, extracts unique parameter names, and probes bounded batches of
+unique markers with dynamic controls and response-delta bisection. URL-encoded form
+POSTs remain one parameter per request; JSON POST bodies use the same batched workflow.
+It does not crawl, launch a
 browser, download payloads, or create a checkpoint.
 
 | Option | Description |
@@ -481,8 +483,8 @@ browser, download payloads, or create a checkpoint.
 | `--param-subs` / `--param-limit N` | Include subdomains in harvesting (on) / maximum URLs (default `5000`). |
 | `--param-max-checks N` | Maximum parameter names to probe (default `10000`). |
 | `--param-marker STRING` | Alphanumeric marker prefix (default `XoxssReflect`). |
-| `--param-batch-size N` | Unique markers per GET request (default `100`, maximum `100`). |
-| `--param-data BODY` | POST form body for reflection checks, e.g. `user=test&pass=test`. |
+| `--param-batch-size N` | Unique markers per GET or JSON POST request (default `100`, maximum `100`). |
+| `--param-data BODY` | POST form body or JSON object, e.g. `user=test&pass=test` or `{"user":"test"}`. |
 | `--param-output PATH` / `--jsonl PATH` | JSON audit report / one candidate object per line. |
 
 The audit JSON contains `mode`, `targets`, `source`, `stats`, `errors` and a
@@ -496,8 +498,9 @@ When Arjun or x8 is installed, the main discovery flow can also add their hidden
 parameter names to the scanner's candidate set. GET reflection probes batch unique
 markers and compare against two benign controls. Response-delta bisection is used when
 a batch changes the response without reflecting any marker. Dynamic baselines are
-recorded so response drift does not become reflection evidence by itself. POST checks
-remain one parameter per request.
+recorded so response drift does not become reflection evidence by itself. URL-encoded
+form POSTs remain one parameter per request; JSON POST bodies use bounded batches and
+bisection.
 
 ## Recipes
 
@@ -755,13 +758,13 @@ use collectors you control.
 
 ## Architecture
 
-The current codebase is split into focused analysis, recon, reporting and browser
-modules. `scanner.py` remains the CLI and orchestration hub and still owns the shared
-HTTP engine and scan coordinator.
+The current codebase is split into focused CLI, transport, analysis, recon, reporting
+and browser modules. `scanner.py` remains the scan coordinator and target orchestrator.
 
 ```mermaid
 flowchart LR
-    CLI["CLI and stdin"] --> SCAN["scanner.py<br/>scope, HTTP and coordinator"]
+    CLI["cli.py and stdin"] --> SCAN["scanner.py<br/>scope and coordinator"]
+    SCAN --> HTTP["core/http.py<br/>HTTP transport and retries"]
     SCAN --> RECON["recon modules<br/>passive, JS, OpenAPI"]
     SCAN --> PARAM["scan/parameters.py<br/>batch, controls, bisection"]
     SCAN --> REFLECT["scan/reflection.py<br/>context and browser gate"]
@@ -771,7 +774,9 @@ flowchart LR
     SCAN --> STATE["checkpoint and events"]
 ```
 
-The parameter-audit batching path is:
+The parameter-audit batching path is shared by GET query parameters and JSON POST body
+properties; URL-encoded form POST bodies keep their one-parameter request behavior.
+The batching path is:
 
 ```mermaid
 flowchart TD
@@ -791,8 +796,10 @@ flowchart TD
 ```text
 xoxss.py                  compatibility entry point for `python xoxss.py`
 xoxss/
-  scanner.py              CLI, shared HTTP engine and scan coordinator
+  scanner.py              scan coordinator, findings and target orchestration
+  cli.py                  CLI parser construction
   core/
+    http.py               shared asynchronous HTTP transport and response model
     browser.py            Selenium and Playwright backends
     config.py             typed configuration schema (CLI remains authoritative)
   detection/

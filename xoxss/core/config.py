@@ -76,6 +76,10 @@ class ScanConfig:
     stored_pages: int = 10
     report_reflections: bool = False
     check_libs: bool = True
+    mutation_probes: bool = False
+    mutation_probe_limit: int = 12
+    adaptive_payloads: bool = False
+    param_batch_size: int = 100
 
     # Advanced Detection
     polyglot: bool = False
@@ -175,3 +179,7 @@ class ScanConfig:
             raise ValueError("configuration values must be positive: " + ", ".join(invalid))
         if self.retries < 0 or self.rate_limit < 0 or self.oob_interval <= 0 or self.oob_wait < 0:
             raise ValueError("retries, rate limits, and OOB timing must be non-negative (interval must be positive)")
+        if not 0 <= self.mutation_probe_limit <= 14:
+            raise ValueError("mutation_probe_limit must be between 0 and 14")
+        if not 1 <= self.param_batch_size <= 100:
+            raise ValueError("param_batch_size must be between 1 and 100")

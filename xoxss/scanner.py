@@ -186,6 +186,8 @@ from xoxss.reports.html import write_html_report
 from xoxss.reports.json import report_payload, write_json_report
 from xoxss.reports.markdown import write_markdown_report
 from xoxss.scan.reflection import ReflectionInfo, analyze_reflection, browser_prequalified
+from xoxss.core.http import HttpEngine, HttpResponse, RateLimiter, USER_AGENT
+from xoxss.cli import EXAMPLES, build_parser as _build_cli_parser
 from xoxss.analysis.mutation_probe import (
     MutationObservation,
     apply_observed_normalization,
@@ -201,12 +203,7 @@ except Exception:  # pragma: no cover - standalone checkout edge case
     _ui = None
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, never executed
-    # These imports exist purely for static analysis. The runtime import below is
-    # guarded so the scanner can start and print a friendly error when aiohttp is
-    # missing; referring to ``aiohttp`` in annotations would otherwise make it a
-    # variable (``None``) and trigger reportInvalidTypeForm.
-    import aiohttp
-    from aiohttp import ClientResponse, ClientSession
+    # BeautifulSoup is optional at runtime but used in the helper's annotation.
     from bs4 import BeautifulSoup as BeautifulSoupType
 
 try:  # required
@@ -238,10 +235,6 @@ APP_NAME = "XOX$$"
 VERSION = "2.0.0"
 CODENAME = "PERSISTENT"
 DEFAULT_STATE_DIR = ".xoxss"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
 
 # Remote payload lists. They are downloaded to the system temp directory at start-up
 # (``/tmp`` on POSIX, ``%TEMP%`` on Windows) and removed when the scan finishes.
@@ -1052,26 +1045,6 @@ class WAFReport:
         return ", ".join(self.names) if self.names else "none detected"
 
 
-@dataclass
-class HttpResponse:
-    url: str
-    status: int = 0
-    headers: Dict[str, str] = field(default_factory=dict)
-    text: str = ""
-    elapsed: float = 0.0
-    error: Optional[str] = None
-    from_cache: bool = False
-    truncated: bool = False
-    raw: bytes = field(default=b"", repr=False)
-
-    @property
-    def ok(self) -> bool:
-        return self.error is None and 200 <= self.status < 400
-
-    def header(self, name: str, default: str = "") -> str:
-        return self.headers.get(name.lower(), default)
-
-
 # --------------------------------------------------------------------------------------
 # Persistent state
 # --------------------------------------------------------------------------------------
@@ -1224,437 +1197,6 @@ class StateStore:
 # --------------------------------------------------------------------------------------
 # Rate limiting
 # --------------------------------------------------------------------------------------
-
-
-class RateLimiter:
-    def __init__(self, rate_per_second: float = 0.0):
-        self.interval = (1.0 / rate_per_second) if rate_per_second and rate_per_second > 0 else 0.0
-        self._lock = asyncio.Lock()
-        self._next_at = 0.0
-
-    async def acquire(self) -> None:
-        if self.interval <= 0:
-            return
-        async with self._lock:
-            now = time.monotonic()
-            wait = max(0.0, self._next_at - now)
-            self._next_at = max(now, self._next_at) + self.interval
-        if wait:
-            await asyncio.sleep(wait)
-
-
-# --------------------------------------------------------------------------------------
-# HTTP engine
-# --------------------------------------------------------------------------------------
-
-
-class HttpEngine:
-    """aiohttp wrapper with retries, backoff, rate limiting and a small TTL cache."""
-
-    RETRY_STATUS = {429, 500, 502, 503, 504}
-
-    def __init__(
-        self,
-        console: Console,
-        stats: ScanStats,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        cookies: Optional[Dict[str, str]] = None,
-        timeout: float = 20.0,
-        retries: int = 2,
-        rate: float = 0.0,
-        concurrency: int = 16,
-        per_host_concurrency: int = 4,
-        proxy: Optional[str] = None,
-        insecure: bool = False,
-        cache_ttl: float = 60.0,
-        cache_size: int = 512,
-        max_response_bytes: int = 5 * 1024 * 1024,
-        redirect_scope: Optional[Any] = None,
-        auth_state: Optional[str] = None,
-    ):
-        self.console = console
-        self.stats = stats
-        self.base_headers = dict(headers or {})
-        self.base_headers.setdefault("User-Agent", USER_AGENT)
-        self.base_headers.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-        self.base_headers.setdefault("Accept-Language", "en-US,en;q=0.9")
-        self.cookies = dict(cookies or {})
-        self.timeout = timeout
-        self.retries = max(0, retries)
-        self.proxy = proxy
-        self.insecure = insecure
-        self.cache_ttl = cache_ttl
-        self.cache_size = cache_size
-        self.max_response_bytes = max(1024, int(max_response_bytes))
-        self.redirect_scope = redirect_scope
-        self.auth_state = auth_state
-        self.rate = rate
-        self.limiter = RateLimiter(rate)
-        self.semaphore = asyncio.Semaphore(max(1, concurrency))
-        self.per_host_concurrency = max(1, int(per_host_concurrency))
-        self._host_semaphores: Dict[str, asyncio.Semaphore] = {}
-        self.session: Optional[ClientSession] = None
-        self._cache: Dict[str, Tuple[float, HttpResponse]] = {}
-        self._host_failures: Counter = Counter()
-        self._smart_limiter = None
-        self._use_smart_rate = False
-
-    async def start(self) -> None:
-        if self.session is not None and not self.session.closed:
-            return
-        assert aiohttp is not None, "aiohttp is not installed"
-        resolver = aiohttp.ThreadedResolver()
-        # The c-ares resolver is fast on Unix event loops. Windows defaults to
-        # ProactorEventLoop, which is not compatible with aiodns 3.x callbacks.
-        if sys.platform != "win32":
-            try:
-                resolver = aiohttp.AsyncResolver()
-            except Exception:
-                pass
-        connector = aiohttp.TCPConnector(
-            resolver=resolver,
-            limit=100,
-            ttl_dns_cache=300,
-            ssl=not self.insecure,
-            enable_cleanup_closed=True,
-        )
-        timeout = aiohttp.ClientTimeout(total=self.timeout, connect=min(self.timeout, 10.0))
-        # Playwright storage-state cookies can legitimately target loopback/IP
-        # hosts in the local benchmark and private test environments. Keep the
-        # default strict behavior unless the operator supplied auth state.
-        cookie_jar = aiohttp.CookieJar(unsafe=bool(self.auth_state))
-        self.session = aiohttp.ClientSession(
-            headers=self.base_headers,
-            cookies=self.cookies,
-            timeout=timeout,
-            connector=connector,
-            cookie_jar=cookie_jar,
-        )
-        if self.auth_state:
-            self._load_auth_state_cookies()
-
-    def _load_auth_state_cookies(self) -> None:
-        """Load Playwright cookies into aiohttp with their original host/path scope."""
-        if self.session is None or not self.auth_state:
-            return
-        try:
-            from http.cookies import SimpleCookie
-            from email.utils import formatdate
-            from yarl import URL
-
-            path = Path(self.auth_state).expanduser()
-            if not path.is_file() or path.stat().st_size > 10 * 1024 * 1024:
-                raise ValueError("file is missing or exceeds 10 MiB")
-            data = json.loads(path.read_text(encoding="utf-8"))
-            cookies = data.get("cookies", []) if isinstance(data, dict) else []
-            if not isinstance(cookies, list):
-                raise ValueError("storage state has no valid cookies array")
-            loaded = 0
-            for item in cookies[:5000]:
-                if not isinstance(item, dict):
-                    continue
-                name, value = item.get("name"), item.get("value")
-                domain = str(item.get("domain") or "").lstrip(".")
-                cookie_path = str(item.get("path") or "/")
-                expires = item.get("expires")
-                if expires not in (None, -1, -1.0, 0, 0.0):
-                    try:
-                        expiry_time = float(expires)
-                        if expiry_time <= time.time():
-                            continue
-                    except (TypeError, ValueError):
-                        expiry_time = 0.0
-                else:
-                    expiry_time = 0.0
-                if not name or not domain or any(ch in domain for ch in "/:@"):
-                    continue
-                cookie = SimpleCookie()
-                cookie[str(name)] = str(value or "")
-                if item.get("domain"):
-                    cookie[str(name)]["domain"] = str(item["domain"])
-                cookie[str(name)]["path"] = cookie_path
-                if item.get("secure"):
-                    cookie[str(name)]["secure"] = True
-                if expiry_time > 0:
-                    cookie[str(name)]["expires"] = formatdate(expiry_time, usegmt=True)
-                scheme = "https" if item.get("secure") else "http"
-                self.session.cookie_jar.update_cookies(
-                    cookie, response_url=URL(f"{scheme}://{domain}{cookie_path}")
-                )
-                loaded += 1
-            self.console.info(f"Loaded {loaded} domain-scoped auth cookie(s) from Playwright storage state", important=False)
-        except Exception as exc:
-            self.console.warn(f"Could not load HTTP auth cookies from --auth-state: {exc}")
-
-    async def close(self) -> None:
-        if self.session is not None and not self.session.closed:
-            await self.session.close()
-        self.session = None
-    
-    def enable_smart_rate(self, initial_rate: float) -> None:
-        """Enable adaptive smart rate limiting."""
-        if not HAS_ADVANCED:
-            return
-        from xoxss.analysis.rate_limit import SmartRateLimiter
-        self._smart_limiter = SmartRateLimiter(initial_rate)
-        self._use_smart_rate = True
-    
-    async def _apply_rate_limit(self, host: str) -> None:
-        """Apply rate limiting (smart or standard)."""
-        if self._use_smart_rate and self._smart_limiter:
-            await self._smart_limiter.acquire()
-        else:
-            await self.limiter.acquire()
-
-    # -- public API -------------------------------------------------------------------
-    async def get(
-        self,
-        url: str,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        allow_redirects: bool = True,
-        cache: bool = False,
-    ) -> HttpResponse:
-        return await self.request("GET", url, headers=headers, allow_redirects=allow_redirects, cache=cache)
-
-    async def post(
-        self,
-        url: str,
-        *,
-        data: Optional[Dict[str, str]] = None,
-        json_body: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        allow_redirects: bool = True,
-    ) -> HttpResponse:
-        return await self.request(
-            "POST",
-            url,
-            data=data,
-            json_body=json_body,
-            headers=headers,
-            allow_redirects=allow_redirects,
-        )
-
-    async def request(
-        self,
-        method: str,
-        url: str,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        data: Optional[Dict[str, str]] = None,
-        json_body: Optional[Dict[str, Any]] = None,
-        allow_redirects: bool = True,
-        cache: bool = False,
-    ) -> HttpResponse:
-        if self.redirect_scope is not None and not self.redirect_scope(url):
-            self.stats.errors += 1
-            return HttpResponse(url=url, error="request target is outside the configured scan scope")
-        if self.session is None:
-            await self.start()
-
-        cache_key = self._cache_key(method, url, headers, data, json_body)
-        if cache and cache_key in self._cache:
-            expiry, cached = self._cache[cache_key]
-            if expiry > time.monotonic():
-                hit = HttpResponse(**{**cached.__dict__, "from_cache": True})
-                return hit
-
-        delay = 0.0
-        last_error = "request failed after retries"
-        for attempt in range(self.retries + 1):
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                host = (urlsplit(url).hostname or "").lower()
-                host_semaphore = self._host_semaphores.setdefault(
-                    host, asyncio.Semaphore(self.per_host_concurrency)
-                )
-                async with host_semaphore, self.semaphore:
-                    assert self.session is not None
-                    current_url, current_method = url, method
-                    current_data, current_json = data, json_body
-                    for redirect_count in range(11):
-                        await self._apply_rate_limit(urlsplit(current_url).hostname or "")
-                        if redirect_count == 0:
-                            started = time.monotonic()
-                        response = await self.session.request(
-                            current_method,
-                            current_url,
-                            headers=headers,
-                            data=current_data,
-                            json=current_json,
-                            allow_redirects=False,
-                            proxy=self.proxy,
-                            ssl=not self.insecure,
-                        )
-                        self.stats.requests += 1
-                        location = response.headers.get("Location")
-                        is_redirect = response.status in (301, 302, 303, 307, 308) and location
-                        if not (allow_redirects and is_redirect):
-                            break
-                        next_url = urljoin(str(response.url), location)
-                        current_parts = urlsplit(str(response.url))
-                        next_parts = urlsplit(next_url)
-                        same_origin = (
-                            current_parts.scheme.lower(), current_parts.hostname, current_parts.port
-                        ) == (
-                            next_parts.scheme.lower(), next_parts.hostname, next_parts.port
-                        )
-                        if not same_origin or (
-                            self.redirect_scope is not None and not self.redirect_scope(next_url)
-                        ):
-                            result = HttpResponse(
-                                url=str(response.url), status=response.status,
-                                headers={k.lower(): v for k, v in response.headers.items()},
-                                error="redirect target is outside the request origin or scan scope",
-                            )
-                            response.release()
-                            return result
-                        response.release()
-                        if redirect_count == 10:
-                            return HttpResponse(url=current_url, error="too many redirects")
-                        if response.status == 303 or (response.status in (301, 302) and current_method.upper() == "POST"):
-                            current_method, current_data, current_json = "GET", None, None
-                        current_url = next_url
-                    try:
-                        raw = bytearray()
-                        while len(raw) <= self.max_response_bytes:
-                            chunk = await response.content.read(min(65536, self.max_response_bytes + 1 - len(raw)))
-                            if not chunk:
-                                break
-                            raw.extend(chunk)
-                        truncated = len(raw) > self.max_response_bytes
-                        if truncated:
-                            del raw[self.max_response_bytes:]
-                        try:
-                            text = bytes(raw).decode(response.get_encoding() or "utf-8", "replace")
-                        except (LookupError, RuntimeError):
-                            text = bytes(raw).decode("utf-8", "replace")
-                        elapsed = time.monotonic() - started
-                        result = HttpResponse(
-                            url=str(response.url),
-                            status=response.status,
-                            headers={k.lower(): v for k, v in response.headers.items()},
-                            text=text,
-                            raw=bytes(raw),
-                            elapsed=elapsed,
-                            truncated=truncated,
-                        )
-                        if truncated:
-                            self.stats.truncated_responses += 1
-                            self.console.debug(
-                                f"Response from {truncate(str(response.url), 120)} exceeded "
-                                f"{self.max_response_bytes} bytes; analysis used a truncated body"
-                            )
-                        # Track for smart rate limiter
-                        if self._use_smart_rate and self._smart_limiter:
-                            self._smart_limiter.record_request(
-                                success=response.status < 400,
-                                elapsed=elapsed,
-                                is_retry=False
-                            )
-                        
-                        if response.status in self.RETRY_STATUS and attempt < self.retries:
-                            delay = self._retry_delay(response, attempt)
-                            self.stats.blocked += 1
-                            self.console.debug(
-                                f"{method} {truncate(url, 120)} -> HTTP {response.status}, retrying in {delay:.1f}s"
-                            )
-                            continue
-                        self.console.debug(
-                            f"{method} {truncate(url, 120)} -> {response.status} ({elapsed * 1000:.0f} ms)"
-                        )
-                        if cache:
-                            self._store_cache(cache_key, result)
-                        return result
-                    finally:
-                        response.release()
-            except asyncio.CancelledError:
-                raise
-            except asyncio.TimeoutError:
-                delay = min(8.0, 0.6 * (2 ** attempt))
-                self.console.debug(f"{method} {truncate(url, 120)} -> timeout, retry {attempt + 1}/{self.retries}")
-                if self._use_smart_rate and self._smart_limiter:
-                    self._smart_limiter.record_request(success=False, elapsed=delay, is_retry=True)
-            except socket.gaierror as exc:
-                host = urlsplit(url).hostname or "unknown host"
-                last_error = f"DNS resolution failed for {host}: {exc}"
-                if exc.errno != socket.EAI_AGAIN:
-                    self.console.debug(last_error)
-                    break
-                delay = min(8.0, 0.6 * (2 ** attempt))
-                self.console.debug(
-                    f"{last_error}; retry {attempt + 1}/{self.retries} in {delay:.1f}s"
-                )
-                if host != "unknown host":
-                    self._host_failures[host] += 1
-            except Exception as exc:  # aiohttp errors, DNS, TLS, connection resets
-                dns_exc = exc if isinstance(exc, socket.gaierror) else getattr(exc, "os_error", None)
-                if isinstance(dns_exc, socket.gaierror):
-                    host = urlsplit(url).hostname or "unknown host"
-                    last_error = f"DNS resolution failed for {host}: {dns_exc}"
-                    if dns_exc.errno != socket.EAI_AGAIN:
-                        self.console.debug(last_error)
-                        break
-                    delay = min(8.0, 0.6 * (2 ** attempt))
-                    self.console.debug(
-                        f"{last_error}; retry {attempt + 1}/{self.retries} in {delay:.1f}s"
-                    )
-                    if host != "unknown host":
-                        self._host_failures[host] += 1
-                    continue
-                delay = min(8.0, 0.6 * (2 ** attempt))
-                last_error = f"{type(exc).__name__}: {exc}"
-                self.console.debug(f"{method} {truncate(url, 120)} -> {last_error}")
-                host = urlsplit(url).hostname or ""
-                if host:
-                    self._host_failures[host] += 1
-                if self._use_smart_rate and self._smart_limiter:
-                    self._smart_limiter.record_request(success=False, elapsed=delay, is_retry=True)
-
-        self.stats.errors += 1
-        return HttpResponse(url=url, error=last_error)
-
-    # -- internals --------------------------------------------------------------------
-    @staticmethod
-    def _cache_key(
-        method: str,
-        url: str,
-        headers: Optional[Dict[str, str]],
-        data: Optional[Dict[str, str]],
-        json_body: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        raw = json.dumps(
-            [method.upper(), url, headers or {}, data or {}, json_body or {}],
-            sort_keys=True,
-            default=str,
-        )
-        return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
-
-    def _store_cache(self, key: str, response: HttpResponse) -> None:
-        if len(self._cache) >= self.cache_size:
-            # drop the oldest entry (dicts keep insertion order)
-            self._cache.pop(next(iter(self._cache)), None)
-        self._cache[key] = (time.monotonic() + self.cache_ttl, response)
-
-    def peek(self, url: str) -> Optional[HttpResponse]:
-        """Cached GET response for ``url`` without any network activity."""
-        cache_key = self._cache_key("GET", url, None, None, None)
-        entry = self._cache.get(cache_key)
-        if entry is None:
-            return None
-        expiry, cached = entry
-        if expiry <= time.monotonic():
-            return None
-        return HttpResponse(**{**cached.__dict__, "from_cache": True})
-
-    @staticmethod
-    def _retry_delay(response: ClientResponse, attempt: int) -> float:
-        retry_after = response.headers.get("Retry-After", "")
-        if retry_after.isdigit():
-            return min(30.0, float(retry_after))
-        return min(8.0, 0.7 * (2 ** attempt)) + random.uniform(0, 0.4)
 
 
 # --------------------------------------------------------------------------------------
@@ -2219,26 +1761,6 @@ class PayloadEngine:
 
     def probe(self, token: str) -> str:
         return f"{token} <>\"'`()=/\\\\"
-
-    def _lazy_pool_for(self, context: str) -> List[str]:
-        cached = self._lazy_pool_cache.get(context)
-        if cached is not None:
-            return cached
-        contexts: List[str] = []
-        if context in self._lazy_by_context:
-            contexts.append(context)
-        if "generic" in self._lazy_by_context:
-            contexts.append("generic")
-        seen: Set[str] = set(self._seen)
-        pool: List[str] = []
-        for ctx in contexts:
-            for template in self._lazy_by_context.get(ctx, []):
-                if template in seen:
-                    continue
-                seen.add(template)
-                pool.append(template)
-        self._lazy_pool_cache[context] = pool
-        return pool
 
     def _lazy_pool_for(self, context: str) -> List[str]:
         cached = self._lazy_pool_cache.get(context)
@@ -2893,7 +2415,7 @@ class XSSScanner:
                 self.console.debug(f"Encoder chain failed: {exc}")
         return result
 
-    def _browser_factory(self) -> BrowserEngine:
+    def _browser_factory(self) -> Any:
         use_playwright = (self.args.browser or "").lower() == "playwright" or bool(
             getattr(self.args, "auth_state", None)
         )
@@ -4607,9 +4129,18 @@ class XSSScanner:
 
         # Use polyglot payloads if enabled
         if HAS_ADVANCED and getattr(self.args, 'polyglot', False):
-            from xoxss.analysis.polyglot import PolyglotGenerator as PolyglotPayloadGenerator
+            from xoxss.analysis.polyglot import (
+                PolyglotContext,
+                PolyglotGenerator as PolyglotPayloadGenerator,
+            )
             polyglot_gen = PolyglotPayloadGenerator()
-            polyglots = polyglot_gen.generate_polyglots(token, [info.context], self.args.max_payloads)
+            target_context = next(
+                (context for context in PolyglotContext if context.value == info.context),
+                PolyglotContext.HTML,
+            )
+            polyglots = polyglot_gen.generate_polyglots(
+                token, [target_context], self.args.max_payloads
+            )
             for polyglot in polyglots:
                 if self._stop.is_set():
                     return
@@ -5655,22 +5186,6 @@ def write_sarif_report(path: Path, scanner: XSSScanner) -> None:
 # CLI
 # --------------------------------------------------------------------------------------
 
-EXAMPLES = """
-examples:
-  xoxss https://target.tld --crawl --headless
-  xoxss https://target.tld/?q=1 --browser chrome --headless --dom
-  xoxss https://target.tld --god
-  xoxss https://target.tld --deep --report all
-  xoxss https://target.tld --god
-  xoxss https://target.tld --deep --report all
-  xoxss -l targets.txt --threads 20 --rate-limit 15 --report all
-  xoxss https://target.tld --no-browser --report-reflections --report json
-  xoxss https://target.tld --tamper all --max-payloads 12 --scan-headers
-  xoxss https://target.tld --stored --stored-pages 20 --screenshot
-"""
-
-
-# --------------------------------------------------------------------------------------
 # god mode (--god / --yolo)
 # --------------------------------------------------------------------------------------
 
@@ -5719,7 +5234,7 @@ def _locate_browser(kind: str) -> Optional[str]:
 def _god_browser_choice() -> Optional[Tuple[str, Optional[str]]]:
     """Best browser backend for god mode: Playwright first, then local engines."""
     with suppress(Exception):
-        import playwright  # noqa: F401
+        import playwright  # noqa: F401  # type: ignore[reportMissingImports]
 
         return "playwright", None
     for kind in ("chrome", "edge", "firefox", "chromium"):
@@ -5782,6 +5297,8 @@ def apply_god_preset(
     args.stored = True
     bump("stored_pages", 20, "--stored-pages")
     args.report_reflections = True
+    args.mutation_probes = True
+    args.adaptive_payloads = True
 
     # -- advanced analysis (cheap, HTTP-level) -------------------------------------------
     args.polyglot = True
@@ -5840,7 +5357,7 @@ def apply_god_preset(
         and unclaimed("--interactsh")
     ):
         try:
-            import cryptography  # noqa: F401
+            import cryptography  # noqa: F401  # type: ignore[reportMissingImports]
         except Exception:
             console.warn("God mode: cryptography missing - automatic blind-XSS callbacks disabled")
         else:
@@ -5856,380 +5373,11 @@ def apply_god_preset(
             args.external_tools = True
 
 
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="xoxss",
-        description=f"{APP_NAME} v{VERSION} - advanced, persistent, context-aware XSS scanner",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=EXAMPLES,
-    )
-    parser.add_argument("target", nargs="*", help="target URL(s); http:// is assumed when missing")
-    parser.add_argument("-l", "--target-list", help="file with one target URL/domain per line")
-    parser.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
-    parser.add_argument(
-        "--profile", choices=("quick", "balanced", "deep"), default="balanced",
-        help="scan preset: quick (HTTP-only, local payloads), balanced (default), or deep",
-    )
-
-    crawl = parser.add_argument_group("discovery")
-    crawl.add_argument("--crawl", action="store_true", help="crawl the target before scanning")
-    crawl.add_argument(
-        "--deep",
-        action="store_true",
-        help="deep crawl preset: depth 5, 1500 URLs, robots/sitemap/JS + path discovery, parameter fuzzing",
-    )
-    godmode = parser.add_argument_group("god mode")
-    godmode.add_argument(
-        "--god",
-        "--yolo",
-        dest="god",
-        action="store_true",
-        help="full-automatic maximum-aggression preset: recon + deep crawl + fuzzing + browser "
-        "verification + interactsh blind-XSS + external tools; no other flags needed",
-    )
-    crawl.add_argument("--crawl-depth", type=int, default=3, help="crawl depth (default: 3)")
-    crawl.add_argument("--max-urls", type=int, default=500, help="maximum URLs to scan (default: 500)")
-    crawl.add_argument("--allow-subdomains", action="store_true", help="treat subdomains as in scope")
-    crawl.add_argument("--include", nargs="+", help="regexes URLs must match")
-    crawl.add_argument("--exclude", nargs="+", help="regexes URLs must not match")
-    crawl.add_argument(
-        "--discover",
-        dest="discover",
-        action="store_true",
-        default=True,
-        help="discover endpoints from robots.txt, sitemaps and JavaScript (default: on when crawling)",
-    )
-    crawl.add_argument("--no-discover", dest="discover", action="store_false", help="disable robots/sitemap/JS discovery")
-    crawl.add_argument("--discover-paths", action="store_true", help="probe common endpoint paths")
-    crawl.add_argument("--endpoint-wordlist", help="extra endpoint paths to probe, one per line")
-    crawl.add_argument("--js-files", type=int, default=25, help="maximum JavaScript files parsed per scan (default: 25)")
-    crawl.add_argument(
-        "--fuzz-params",
-        dest="fuzz_params",
-        action="store_true",
-        default=False,
-        help="test common parameter names on endpoints without a query string",
-    )
-    crawl.add_argument("--no-fuzz-params", dest="fuzz_params", action="store_false", help="disable parameter fuzzing")
-    crawl.add_argument("--fuzz-param-limit", type=int, default=10, help="parameter names per endpoint (default: 10)")
-    crawl.add_argument(
-        "--subdomains",
-        action="store_true",
-        help="enumerate passive subdomains (crt.sh, certspotter, OTX, urlscan) before scanning",
-    )
-    crawl.add_argument(
-        "--subdomain-brute",
-        type=int,
-        default=0,
-        metavar="N",
-        help="also resolve the first N built-in/wordlist subdomain candidates",
-    )
-    crawl.add_argument(
-        "--passive-urls",
-        action="store_true",
-        help="collect historic URLs from Wayback, Common Crawl, urlscan and OTX",
-    )
-    crawl.add_argument(
-        "--openapi",
-        action="store_true",
-        help="discover OpenAPI/Swagger documents and test their query/body parameters",
-    )
-    crawl.add_argument(
-        "--fuzz-paths",
-        action="store_true",
-        help="brute-force common paths with the internal soft-404-aware fuzzer",
-    )
-    crawl.add_argument(
-        "--mine-params",
-        action="store_true",
-        help="mine hidden query parameters by response delta and reflection",
-    )
-    crawl.add_argument(
-        "--external-tools",
-        action="store_true",
-        help="use installed recon, parameter discovery (arjun/x8), and XSS verification tools",
-    )
-    crawl.add_argument(
-        "--max-param-targets", type=int, default=100,
-        help="maximum in-scope endpoints sent to external hidden-parameter tools (default: 100)",
-    )
-
-    injection = parser.add_argument_group("injection")
-    injection.add_argument(
-        "--payload-file",
-        help="custom payloads or JSON lists ('context|payload' supported; repeat with ':').",
-    )
-    injection.add_argument(
-        "--payload-dir",
-        action="append",
-        metavar="DIR",
-        help="load every .txt/.lst/.json payload corpus under DIR (repeatable)",
-    )
-    injection.add_argument(
-        "--lazy-payloads",
-        dest="lazy_payloads",
-        action="store_true",
-        default=True,
-        help="load the bundled LazyXss payload pack (default: on)",
-    )
-    injection.add_argument(
-        "--no-lazy-payloads",
-        dest="lazy_payloads",
-        action="store_false",
-        help="disable the bundled LazyXss payload pack",
-    )
-    injection.add_argument(
-        "--remote-payloads",
-        dest="remote_payloads",
-        action="store_true",
-        default=True,
-        help="download XSS payload lists from GitHub into temp storage (default: on)",
-    )
-    injection.add_argument(
-        "--no-remote-payloads",
-        dest="remote_payloads",
-        action="store_false",
-        help="disable the remote payload download",
-    )
-    injection.add_argument(
-        "--payload-source",
-        action="append",
-        metavar="URL",
-        help="extra GitHub raw payload URL (repeatable)",
-    )
-    injection.add_argument("--payload-limit", type=int, default=600, help="maximum remote payloads to keep (0 = unlimited, capped internally; default: 600)")
-    injection.add_argument("--payload-tmp-dir", help="temp directory for downloaded payloads (default: system temp)")
-    injection.add_argument("--keep-payloads", action="store_true", help="keep downloaded payloads after the scan")
-    injection.add_argument(
-        "--tamper",
-        choices=sorted(TAMPERS.keys()) + ["all"],
-        help="payload evasion transform",
-    )
-    injection.add_argument(
-        "--encoder",
-        action="append",
-        metavar="NAME",
-        help="encoder registry transform applied after --tamper (repeatable; see --list-encoders)",
-    )
-    injection.add_argument("--max-payloads", type=int, default=6, help="payloads per injection point (default: 6)")
-    injection.add_argument("--mutation-probes", action="store_true", help="probe one endpoint for bounded Unicode, decoding, byte-mask, and multibyte transformations")
-    injection.add_argument("--mutation-probe-limit", type=int, default=12, help="maximum transformation probes per endpoint (default: 12, hard cap: 14)")
-    injection.add_argument("--adaptive-payloads", action="store_true", help="add bounded whitespace/quote and empirically observed Unicode payload variants")
-    injection.add_argument("--scan-headers", action="store_true", help="test header reflection")
-    injection.add_argument("--header-list", nargs="+", help="custom header names to inject")
-    injection.add_argument("--dom", dest="dom", action="store_true", default=True, help="DOM XSS analysis (default: on)")
-    injection.add_argument("--no-dom", dest="dom", action="store_false", help="disable DOM XSS analysis")
-    injection.add_argument("--stored", action="store_true", help="look for persisted (stored) payloads")
-    injection.add_argument("--stored-pages", type=int, default=10, help="pages checked for stored XSS (default: 10)")
-    injection.add_argument(
-        "--report-reflections",
-        action="store_true",
-        help="also report reflections / static candidates that could not be executed",
-    )
-    injection.add_argument(
-        "--check-libs",
-        dest="check_libs",
-        action="store_true",
-        default=True,
-        help="check for vulnerable JavaScript libraries (default: on)",
-    )
-    injection.add_argument("--no-check-libs", dest="check_libs", action="store_false", help="disable library vulnerability checking")
-    injection.add_argument(
-        "--blind",
-        metavar="CALLBACK_URL",
-        help="blind XSS callback URL (XSS Hunter / Burp Collaborator / interactsh); "
-        "injects out-of-band probes into every parameter and form",
-    )
-
-    oob = parser.add_argument_group("out-of-band")
-    oob.add_argument(
-        "--interactsh",
-        nargs="?",
-        const="oast.pro",
-        metavar="SERVER",
-        help="register with an interactsh server and poll it to confirm blind-XSS callbacks",
-    )
-    oob.add_argument(
-        "--oob-poll",
-        metavar="URL",
-        help="poll a JSON/text collector endpoint for markers (XSS Hunter, Burp bridge, ...)",
-    )
-    oob.add_argument(
-        "--oob-file",
-        metavar="PATH",
-        help="tail a local JSON-lines/text collector file (requires --blind for the callback)",
-    )
-    oob.add_argument("--oob-interval", type=float, default=5.0, help="seconds between OOB polls (default: 5)")
-    oob.add_argument(
-        "--oob-wait",
-        type=float,
-        default=0.0,
-        help="seconds to wait after the scan for late out-of-band callbacks",
-    )
-
-    # Advanced features (Phase 1 & 2)
-    advanced = parser.add_argument_group("advanced")
-    advanced.add_argument("--polyglot", action="store_true", help="use polyglot payloads for faster scanning")
-    advanced.add_argument("--per-char-probe", action="store_true", help="use per-character probing for precise context detection")
-    advanced.add_argument("--jsonp", action="store_true", help="detect and test JSONP endpoints for XSS")
-    advanced.add_argument("--csp-analyze", action="store_true", help="analyze CSP headers for bypass opportunities")
-    advanced.add_argument("--mxss", action="store_true", help="detect mutation XSS vulnerabilities")
-    advanced.add_argument("--proto-pollution", action="store_true", help="detect prototype pollution vulnerabilities")
-    advanced.add_argument("--cors-analyze", action="store_true", help="analyze CORS misconfigurations")
-    advanced.add_argument("--smart-rate", action="store_true", help="use adaptive smart rate limiting")
-    advanced.add_argument("--dom-clobbering", action="store_true", help="detect DOM clobbering vulnerabilities")
-    advanced.add_argument("--trusted-types", action="store_true", help="analyze Trusted Types CSP directive")
-    advanced.add_argument("--graphql", action="store_true", help="detect GraphQL XSS vulnerabilities")
-    advanced.add_argument("--websocket", action="store_true", help="detect WebSocket XSS vulnerabilities")
-    advanced.add_argument("--file-upload", action="store_true", help="detect file upload XSS vulnerabilities")
-    advanced.add_argument("--postmessage", action="store_true", help="detect postMessage XSS vulnerabilities")
-
-    browser = parser.add_argument_group("browser")
-    browser.add_argument(
-        "--browser",
-        choices=["firefox", "chrome", "chromium", "edge", "playwright"],
-        default="firefox",
-        help="browser backend for verification: selenium firefox/chrome/edge or playwright (default: firefox)",
-    )
-    browser.add_argument("--headless", action="store_true", help="run the browser headless")
-    browser.add_argument("--no-browser", action="store_true", help="HTTP-only mode (no Selenium)")
-    browser.add_argument("--browser-workers", type=int, default=1, help="parallel browser instances (default: 1)")
-    browser.add_argument("--browser-discovery", action="store_true", help="visit a bounded sample of crawled pages and scan same-scope XHR/fetch/navigation URLs")
-    browser.add_argument("--browser-discovery-pages", type=int, default=10, help="maximum pages visited for browser route discovery (default: 10, max: 25)")
-    browser.add_argument("--dom-source-probes", action="store_true", help="actively test storage, window.name, and postMessage DOM XSS sources (adds up to four browser reloads per candidate page)")
-    browser.add_argument("--auth-state", metavar="PATH", help="Playwright storage-state JSON for authenticated browser discovery and verification")
-    browser.add_argument("--confirm", choices=["auto", "browser", "http"], default="auto", help="verification strategy")
-    browser.add_argument("--screenshot", action="store_true", help="save a screenshot for confirmed findings")
-    browser.add_argument("--binary", help="explicit browser binary path")
-    browser.add_argument("--user-agent", default=USER_AGENT, help="User-Agent override")
-
-    network = parser.add_argument_group("network")
-    network.add_argument("--threads", type=int, default=10, help="parallel URL workers (default: 10)")
-    network.add_argument("--concurrency", type=int, default=16, help="parallel HTTP requests (default: 16)")
-    network.add_argument("--per-host-concurrency", type=int, default=4, help="maximum simultaneous HTTP requests per host (default: 4)")
-    network.add_argument("--timeout", type=float, default=20.0, help="request/browser timeout in seconds")
-    network.add_argument("--retries", type=int, default=2, help="retries per request (default: 2)")
-    network.add_argument("--rate-limit", type=float, default=0.0, help="requests per second (0 = unlimited)")
-    network.add_argument("--proxy", help="HTTP(S) proxy, e.g. http://127.0.0.1:8080")
-    network.add_argument("--insecure", action="store_true", help="ignore TLS certificate errors")
-    network.add_argument(
-        "--max-response-bytes", type=int, default=5 * 1024 * 1024,
-        metavar="N", help="maximum response body bytes analyzed (default: 5242880)",
-    )
-    network.add_argument("--headers", nargs="+", help="extra headers: 'Name: Value'")
-    network.add_argument("--cookies", nargs="+", help="cookies: 'name=value' or 'a=b; c=d'")
-
-    mass = parser.add_argument_group("mass mode")
-    mass.add_argument(
-        "--mass",
-        action="store_true",
-        help="stateless fast sweep: one request per parameter, no crawl/browser/state",
-    )
-    mass.add_argument(
-        "--mass-params",
-        metavar="NAMES",
-        default="",
-        help="comma-separated parameters tried on URLs without a query string",
-    )
-    mass.add_argument(
-        "--mass-payloads",
-        type=int,
-        default=4,
-        help="payloads tried per parameter in mass mode (default: 4)",
-    )
-    mass.add_argument(
-        "--jsonl",
-        metavar="PATH",
-        help="append one JSON finding per line (mass mode or --param-audit)",
-    )
-
-    params = parser.add_argument_group("parameter audit")
-    params.add_argument(
-        "--param-audit",
-        action="store_true",
-        help="collect Wayback parameters and probe each one for reflection (collector + Gxss style) and exit",
-    )
-    params.add_argument(
-        "--param-input",
-        metavar="PATH",
-        help="read seed URLs from a file (when set alone, Wayback harvesting is skipped)",
-    )
-    params.add_argument(
-        "--param-source",
-        choices=["wayback", "passive", "both", "none"],
-        help="URL source for --param-audit (default: wayback, or none when --param-input is used)",
-    )
-    params.add_argument(
-        "--param-limit",
-        type=int,
-        default=5000,
-        help="maximum historic URLs to harvest for parameter audit (default: 5000)",
-    )
-    params.add_argument(
-        "--param-max-checks",
-        type=int,
-        default=10000,
-        help="maximum parameter reflection checks per audit (default: 10000)",
-    )
-    params.add_argument(
-        "--param-batch-size", type=int, default=100,
-        help="GET parameter names per reflection request (default: 100, max: 100)",
-    )
-    params.add_argument(
-        "--param-marker",
-        default="XoxssReflect",
-        help="alphanumeric reflection marker used for each parameter (default: XoxssReflect)",
-    )
-    params.add_argument(
-        "--param-data",
-        metavar="BODY",
-        help="POST form body for Gxss-style checks, e.g. 'user=test&pass=test'",
-    )
-    params.add_argument(
-        "--param-output",
-        metavar="PATH",
-        help="write the parameter-audit JSON report to this file",
-    )
-    params.add_argument(
-        "--param-subs",
-        dest="param_subs",
-        action="store_true",
-        default=True,
-        help="include subdomains in Wayback harvesting (default: on)",
-    )
-    params.add_argument(
-        "--no-param-subs",
-        dest="param_subs",
-        action="store_false",
-        help="only harvest the exact host, not its subdomains",
-    )
-
-    output = parser.add_argument_group("output")
-    output.add_argument("-o", "--output", help="write the full text log to this file")
-    output.add_argument("--report", default="all", help="json, md, html, sarif, all or none (default: all)")
-    output.add_argument("--report-dir", default=os.path.join(DEFAULT_STATE_DIR, "reports"), help="report directory")
-    output.add_argument(
-        "--events-jsonl", metavar="PATH",
-        help="write versioned JSONL scan lifecycle, discovery, and finding events",
-    )
-    output.add_argument("--verbose", action="store_true", help="verbose (debug) output")
-    output.add_argument("--quiet", action="store_true", help="only print findings and errors")
-    output.add_argument("--no-color", action="store_true", help="disable ANSI colours")
-    output.add_argument("--fail-on-findings", action="store_true", help="exit with status 2 when findings exist")
-
-    persistence = parser.add_argument_group("persistence")
-    persistence.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help="state/report root (default: .xoxss)")
-    persistence.add_argument("--no-state", action="store_true", help="disable checkpoints")
-    persistence.add_argument("--no-resume", action="store_true", help="ignore and reset the existing checkpoint")
-
-    misc = parser.add_argument_group("misc")
-    misc.add_argument("--list-payloads", action="store_true", help="print built-in payloads and exit")
-    misc.add_argument("--doctor", action="store_true", help="check the installation and exit")
-    misc.add_argument("--list-tampers", action="store_true", help="print available tampers and exit")
-    misc.add_argument(
-        "--list-encoders", action="store_true", help="print the encoder registry and exit"
-    )
-    return parser
+    """Compatibility wrapper around the dedicated CLI parser module."""
+    return _build_cli_parser(APP_NAME, VERSION, DEFAULT_STATE_DIR, USER_AGENT, TAMPERS.keys())
 
 
 def print_payloads() -> None:
@@ -6338,7 +5486,7 @@ def run_doctor(console: Console, args: argparse.Namespace) -> int:
         backend = (args.browser or "firefox").lower()
         if backend == "playwright":
             try:
-                import playwright  # noqa: F401
+                import playwright  # noqa: F401  # type: ignore[reportMissingImports]
             except Exception:
                 report("fail", "browser", "--browser playwright but playwright is not installed")
             else:
@@ -6438,6 +5586,8 @@ MASS_PARAMETERS: Tuple[str, ...] = (
     "redirect",
     "next",
 )
+
+
 
 
 async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int]:
@@ -6603,6 +5753,7 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
             + str(globals().get("_PARAM_IMPORT_ERROR", "unknown error"))
         )
         return 1, 0
+    assert ParameterHarvester is not None and ReflectionProbe is not None
 
     targets = gather_targets(args, console)
     if targets is None:
@@ -6713,18 +5864,29 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         await http.close()
 
     if args.param_data:
-        # Gxss -d: test form fields from an explicit body on the first seed.
+        # Accept either URL-encoded form data or a JSON object on the first seed.
         if not seed_urls:
             console.error("--param-data requires at least one target URL")
             return 1, 0
         try:
-            pairs = parse_qsl(args.param_data, keep_blank_values=True)
+            json_data = json.loads(args.param_data)
         except Exception:
-            pairs = []
-        if not pairs:
-            console.error("--param-data must be a form body such as 'user=test&pass=test'")
-            return 1, 0
-        report = harvester.from_pairs(seed_urls[0], pairs, source="post")
+            json_data = None
+        if isinstance(json_data, dict):
+            paths = ReflectionProbe._json_leaf_paths(json_data)
+            report = harvester.from_names(seed_urls[0], paths, source="json-post")
+        else:
+            try:
+                pairs = parse_qsl(args.param_data, keep_blank_values=True)
+            except Exception:
+                pairs = []
+            if not pairs:
+                console.error(
+                    "--param-data must be a form body such as 'user=test&pass=test' "
+                    "or a JSON object such as '{\"user\":\"test\"}'"
+                )
+                return 1, 0
+            report = harvester.from_pairs(seed_urls[0], pairs, source="post")
     else:
         report = harvester.harvest(seed_urls, domain="", source="audit")
     report.errors.extend(source_errors)
@@ -7027,37 +6189,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             return 1
         console.info(
-            "Parameter audit: collector-style URL harvest + Gxss-style per-parameter reflection probe",
-            important=False,
-        )
-        install_uvloop()
-        try:
-            code, reflected = asyncio.run(run_param_audit(args, console))
-            if args.fail_on_findings and reflected:
-                code = 2
-        except KeyboardInterrupt:
-            console.warn("Interrupted")
-            code = 130
-        except Exception as exc:
-            console.error(f"Fatal error: {exc}")
-            if args.verbose:
-                console.raw(traceback.format_exc())
-            code = 1
-        return code
-
-    if args.mass and getattr(args, "param_audit", False):
-        console.error("--mass and --param-audit are separate modes; choose one")
-        return 1
-
-    if getattr(args, "param_audit", False):
-        if not HAS_PARAM_AUDIT:
-            console.error(
-                "Parameter-audit modules failed to import: "
-                + str(globals().get("_PARAM_IMPORT_ERROR", "unknown error"))
-            )
-            return 1
-        console.info(
-            "Parameter audit: collector-style URL harvest + Gxss-style per-parameter reflection probe",
+            "Parameter audit: URL harvest + batched GET/JSON reflection probes",
             important=False,
         )
         install_uvloop()

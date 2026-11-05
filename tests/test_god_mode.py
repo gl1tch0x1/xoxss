@@ -43,6 +43,8 @@ def test_god_preset_enables_full_stack():
     assert args.stored is True
     assert args.stored_pages >= 20
     assert args.report_reflections is True
+    assert args.mutation_probes is True
+    assert args.adaptive_payloads is True
 
     #advanced analysis
     assert args.polyglot is True

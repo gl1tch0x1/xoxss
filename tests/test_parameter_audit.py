@@ -11,6 +11,7 @@ import pytest
 
 from xoxss.scan.parameters import (
     ParameterHarvester,
+    ParameterCandidate,
     ReflectionProbe,
     parameter_risk,
 )
@@ -49,6 +50,13 @@ class _EchoHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0") or 0)
         body = self.rfile.read(length).decode("utf-8", "replace")
+        if "application/json" in self.headers.get("Content-Type", "").lower():
+            try:
+                document = json.loads(body)
+            except ValueError:
+                document = {}
+            self._render({key: [str(value)] for key, value in document.items()})
+            return
         self._render(parse_qs(body, keep_blank_values=True))
 
 
@@ -183,6 +191,97 @@ def test_post_parameter_probe(server):
     assert by_name["user"].reflected is True
     assert by_name["user"].method == "POST"
     assert by_name["pass"].reflected is False
+
+
+def test_json_post_parameter_batch_attributes_markers():
+    class EchoJSON:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, **kwargs):
+            body = kwargs["json_body"]
+            self.calls.append(body)
+            return SimpleNamespace(
+                status=200,
+                headers={"content-type": "application/json"},
+                text=str({"q": body.get("q", "")}),
+                error=None,
+            )
+
+        async def get(self, url, **kwargs):
+            raise AssertionError("JSON audit must use POST")
+
+    async def run():
+        http = EchoJSON()
+        candidates = [
+            ParameterCandidate(name="q", sample_url="https://app.test/search"),
+            ParameterCandidate(name="safe", sample_url="https://app.test/search"),
+        ]
+        result = await ReflectionProbe(http, Console(quiet=True)).probe_candidates(
+            candidates, data='{"q":"hello","safe":"world"}'
+        )
+        return http, result
+
+    http, result = asyncio.run(run())
+    by_name = {candidate.name: candidate for candidate in result}
+    assert len(http.calls) == 3  # two controls, one batched JSON request
+    assert by_name["q"].reflected is True
+    assert by_name["q"].method == "POST"
+    assert by_name["safe"].reflected is False
+
+
+def test_json_post_parameter_bisection_isolates_response_delta():
+    class DeltaJSON:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, **kwargs):
+            body = kwargs["json_body"]
+            self.calls.append(body)
+            # q changes response behavior without reflecting its marker.
+            changed = str(body.get("q", "")).startswith("Audit")
+            return SimpleNamespace(
+                status=200,
+                headers={"content-type": "application/json"},
+                text='{"state":"changed"}' if changed else '{"state":"stable"}',
+                error=None,
+            )
+
+        async def get(self, url, **kwargs):
+            raise AssertionError("JSON audit must use POST")
+
+    async def run():
+        http = DeltaJSON()
+        candidates = [
+            ParameterCandidate(name="q", sample_url="https://app.test/search", risk="high"),
+            ParameterCandidate(name="safe", sample_url="https://app.test/search", risk="normal"),
+        ]
+        result = await ReflectionProbe(http, Console(quiet=True), marker="Audit").probe_candidates(
+            candidates, data='{"q":"hello","safe":"world"}'
+        )
+        return http, result
+
+    http, result = asyncio.run(run())
+    by_name = {candidate.name: candidate for candidate in result}
+    assert len(http.calls) == 5  # controls, full batch, and two bisected requests
+    assert not by_name["q"].reflected
+    assert "changed the response" in by_name["q"].evidence
+    assert "no response delta" in by_name["safe"].evidence
+
+
+def test_param_audit_accepts_json_body_end_to_end(server):
+    args = build_parser().parse_args(
+        [
+            server + "/json",
+            "--param-audit",
+            "--param-source", "none",
+            "--param-data", '{"q":"hello","safe":"world"}',
+            "--quiet",
+        ]
+    )
+    code, reflected = asyncio.run(run_param_audit(args, Console(quiet=True)))
+    assert code == 0
+    assert reflected == 1
 
 
 def test_reflection_probe_records_dynamic_control_baseline():

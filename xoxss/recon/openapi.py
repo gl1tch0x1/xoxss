@@ -13,21 +13,22 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Tuple
 from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
 
-try:  # pragma: no cover
-    from typing import Protocol
-except Exception:  # pragma: no cover
-    Protocol = object  # type: ignore
-
-
 class HttpLike(Protocol):  # pragma: no cover
-    async def get(self, url: str, **kwargs: Any) -> Any: ...
+    async def get(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        allow_redirects: bool = True,
+        cache: bool = False,
+    ) -> Any: ...
 
 
 class ConsoleLike(Protocol):  # pragma: no cover
-    def info(self, message: str, important: bool = True) -> None: ...
+    def info(self, message: str, important: bool = False) -> None: ...
     def debug(self, message: str) -> None: ...
     def warn(self, message: str, important: bool = True) -> None: ...
 

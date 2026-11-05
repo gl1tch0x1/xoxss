@@ -19,29 +19,40 @@ that can be fed into the main scanner or triaged on its own.
 from __future__ import annotations
 
 import asyncio
+import copy
 from difflib import SequenceMatcher
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from xoxss.detection.context import ContextDetector
 
 
-try:  # pragma: no cover - structural typing
-    from typing import Protocol
-except Exception:  # pragma: no cover
-    Protocol = object  # type: ignore
-
-
 class HttpLike(Protocol):  # pragma: no cover
-    async def get(self, url: str, **kwargs: Any) -> Any: ...
-    async def post(self, url: str, **kwargs: Any) -> Any: ...
+    async def get(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        allow_redirects: bool = True,
+        cache: bool = False,
+    ) -> Any: ...
+
+    async def post(
+        self,
+        url: str,
+        *,
+        data: Optional[Dict[str, str]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        allow_redirects: bool = True,
+    ) -> Any: ...
 
 
 class ConsoleLike(Protocol):  # pragma: no cover
-    def info(self, message: str, important: bool = True) -> None: ...
+    def info(self, message: str, important: bool = False) -> None: ...
     def warn(self, message: str, important: bool = True) -> None: ...
     def debug(self, message: str) -> None: ...
     def ok(self, message: str, important: bool = True) -> None: ...
@@ -456,6 +467,12 @@ class ReflectionProbe:
         post_pairs: Optional[List[Tuple[str, str]]] = None
         if data:
             try:
+                json_body = json.loads(data)
+            except Exception:
+                json_body = None
+            if isinstance(json_body, dict):
+                return await self._probe_json_batches(candidates, json_body)
+            try:
                 post_pairs = parse_qsl(data, keep_blank_values=True)
             except Exception:
                 post_pairs = []
@@ -613,6 +630,169 @@ class ReflectionProbe:
         # Dynamic pages must differ from both controls before a noisy response
         # is allowed to trigger a potentially expensive bisection tree.
         return bool(changed_against) and all(changed_against)
+
+    @staticmethod
+    def _json_leaf_paths(value: Any) -> Dict[str, Tuple[Any, ...]]:
+        """Map readable dotted/indexed paths to mutable JSON leaf paths."""
+        paths: Dict[str, Tuple[Any, ...]] = {}
+
+        def visit(node: Any, segments: Tuple[Any, ...], label: str) -> None:
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    child_label = f"{label}.{key}" if label else str(key)
+                    visit(child, (*segments, key), child_label)
+            elif isinstance(node, list):
+                for index, child in enumerate(node):
+                    visit(child, (*segments, index), f"{label}[{index}]")
+            else:
+                paths[label] = segments
+
+        visit(value, (), "")
+        return paths
+
+    @staticmethod
+    def _set_json_path(document: Dict[str, Any], path: Sequence[Any], value: str) -> None:
+        node: Any = document
+        for segment in path[:-1]:
+            node = node[segment]
+        node[path[-1]] = value
+
+    async def _probe_json_batches(
+        self, candidates: Sequence[ParameterCandidate], document: Dict[str, Any]
+    ) -> List[ParameterCandidate]:
+        """Batch and bisect top-level or nested JSON body leaves."""
+        paths = self._json_leaf_paths(document)
+        groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for candidate in candidates:
+            candidate.reflected = False
+            if candidate.name not in paths:
+                candidate.evidence = "JSON body property not present"
+                continue
+            url = candidate.sample_url or next(iter(candidate.urls), "")
+            if not url:
+                candidate.evidence = "no endpoint URL available for JSON body probe"
+                continue
+            key = self._base_key(url)
+            group = groups.setdefault(key, {"url": url, "candidates": {}})
+            group["candidates"][candidate.name] = candidate
+
+        semaphore = asyncio.Semaphore(self.concurrency)
+
+        async def probe_group(group: Dict[str, Any]) -> None:
+            url = str(group["url"])
+            by_name: Dict[str, ParameterCandidate] = group["candidates"]
+            baselines: List[Any] = []
+            async with semaphore:
+                for _ in range(2):
+                    # Preserve the application's JSON schema during controls;
+                    # changing a field or injecting an unknown key would skew
+                    # the response-delta baseline we are trying to measure.
+                    try:
+                        response = await self.http.post(
+                            url,
+                            json_body=copy.deepcopy(document),
+                            headers={"Content-Type": "application/json"},
+                            allow_redirects=False,
+                        )
+                    except Exception:
+                        continue
+                    if not getattr(response, "error", None):
+                        baselines.append(response)
+                baseline_similarity: Optional[float] = None
+                baseline_dynamic = len(baselines) < 2
+                if len(baselines) == 2:
+                    first = self._normalized_body(str(getattr(baselines[0], "text", "") or ""), [])
+                    second = self._normalized_body(str(getattr(baselines[1], "text", "") or ""), [])
+                    baseline_similarity = SequenceMatcher(None, first, second, autojunk=True).ratio()
+                    baseline_dynamic = (
+                        getattr(baselines[0], "status", 0) != getattr(baselines[1], "status", 0)
+                        or baseline_similarity < 0.985
+                    )
+                for candidate in by_name.values():
+                    candidate.baseline_similarity = baseline_similarity
+                    candidate.baseline_dynamic = baseline_dynamic
+                    candidate.method = "POST"
+                    candidate.probe_url = url
+
+                async def probe_bucket(bucket: Sequence[ParameterCandidate]) -> None:
+                    if not bucket:
+                        return
+                    markers = {item.name: self._new_marker() for item in bucket}
+                    body = copy.deepcopy(document)
+                    for name, marker in markers.items():
+                        self._set_json_path(body, paths[name], marker)
+                    try:
+                        response = await self.http.post(
+                            url,
+                            json_body=body,
+                            headers={"Content-Type": "application/json"},
+                            allow_redirects=False,
+                        )
+                    except Exception as exc:
+                        for item in bucket:
+                            item.evidence = f"batched JSON request failed: {str(exc)[:240]}"
+                        return
+                    if getattr(response, "error", None):
+                        for item in bucket:
+                            item.evidence = f"batched JSON request failed: {str(response.error)[:240]}"
+                        return
+                    text = str(getattr(response, "text", "") or "")
+                    remaining: List[ParameterCandidate] = []
+                    reflected_names: Set[str] = set()
+                    for item in bucket:
+                        marker = markers[item.name]
+                        item.status = int(getattr(response, "status", 0) or 0)
+                        if marker in text:
+                            reflected_names.add(item.name)
+                            item.marker = marker
+                            item.reflected = True
+                            index = text.find(marker)
+                            try:
+                                analysis = self.detector.detect_context(text, index, marker)
+                                item.context = analysis.context_type.name.lower()
+                                context = f", context {item.context}, confidence {analysis.confidence:.2f}"
+                            except Exception:
+                                context = ""
+                            item.evidence = f"unique JSON batch marker reflected (HTTP {item.status}{context})"
+                        else:
+                            remaining.append(item)
+                    if not remaining:
+                        return
+                    if reflected_names:
+                        for item in remaining:
+                            item.evidence = "no unique marker reflection in this JSON batch; other properties reflected"
+                        return
+                    if self._response_changed(response, baselines, list(markers.values()), baseline_dynamic):
+                        if len(remaining) > 1:
+                            midpoint = len(remaining) // 2
+                            await probe_bucket(remaining[:midpoint])
+                            await probe_bucket(remaining[midpoint:])
+                        else:
+                            remaining[0].evidence = (
+                                f"JSON property changed the response without reflecting its marker "
+                                f"(HTTP {remaining[0].status})"
+                            )
+                    else:
+                        for item in remaining:
+                            item.evidence = f"JSON marker not reflected; no response delta (HTTP {item.status})"
+
+                ordered = sorted(by_name.values(), key=lambda item: (item.risk != "high", item.name))
+                for offset in range(0, len(ordered), self.batch_size):
+                    await probe_bucket(ordered[offset:offset + self.batch_size])
+
+        results = await asyncio.gather(
+            *(probe_group(group) for group in groups.values()), return_exceptions=True
+        )
+        for group, result in zip(groups.values(), results):
+            if isinstance(result, Exception):
+                self.console.warn(f"JSON parameter batch failed for {group['url']}: {str(result)[:200]}")
+        reflected = sum(candidate.reflected for candidate in candidates)
+        if candidates:
+            self.console.info(
+                f"Batched JSON reflection probe: {reflected}/{len(candidates)} reflecting property(s)",
+                important=False,
+            )
+        return list(candidates)
 
     async def _probe_get_batches(
         self, candidates: Sequence[ParameterCandidate]

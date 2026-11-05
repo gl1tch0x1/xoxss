@@ -95,9 +95,6 @@ class PerCharProbe:
         },
     }
 
-    def __init__(self):
-        self._probe_marker = "X0XSS_CH4R_PR0B3"
-
     def generate_probe_string(self, unique_marker: str) -> str:
         """
         Generate a probe string with all special characters.

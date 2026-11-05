@@ -19,21 +19,22 @@ import re
 import socket
 import string
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 from urllib.parse import quote
 
-try:  # pragma: no cover - typing only
-    from typing import Protocol
-except Exception:  # pragma: no cover
-    Protocol = object  # type: ignore
-
-
 class HttpLike(Protocol):  # pragma: no cover - structural typing
-    async def get(self, url: str, **kwargs: Any) -> Any: ...
+    async def get(
+        self,
+        url: str,
+        *,
+        headers: Optional[Dict[str, str]] = None,
+        allow_redirects: bool = True,
+        cache: bool = False,
+    ) -> Any: ...
 
 
 class ConsoleLike(Protocol):  # pragma: no cover
-    def info(self, message: str, important: bool = True) -> None: ...
+    def info(self, message: str, important: bool = False) -> None: ...
     def warn(self, message: str, important: bool = True) -> None: ...
     def debug(self, message: str) -> None: ...
 
