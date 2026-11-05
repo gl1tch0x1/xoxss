@@ -99,7 +99,10 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 - Passive subdomain enumeration (crt.sh, certspotter, HackerTarget, OTX, urlscan) and
   historic URL mining (Wayback, Common Crawl, urlscan, OTX).
 - Parameter audit combining collector-style Wayback harvesting with bounded batches
-  of unique reflection markers, dynamic controls and response-delta bisection.
+  of unique reflection markers, dynamic controls and response-delta bisection across
+  GET query strings, URL-encoded form bodies and JSON POST bodies.
+- Multi-header reflection probing: one marker per candidate header in a single request,
+  with an executable-payload follow-up only for headers that actually reflect.
 - Internal path fuzzing with soft-404 detection, hidden-parameter mining, and parameter
   fuzzing on endpoints that expose no query string.
 - Optional orchestration of installed `subfinder`, `gau`, `waybackurls`, `katana`,
@@ -470,9 +473,9 @@ subfinder -d example.com -silent | httpx -silent | python -m xoxss --mass --json
 
 `--param-audit` is a standalone reconnaissance mode that harvests historic URLs the way
 `collector` does, extracts unique parameter names, and probes bounded batches of
-unique markers with dynamic controls and response-delta bisection. URL-encoded form
-POSTs remain one parameter per request; JSON POST bodies use the same batched workflow.
-It does not crawl, launch a
+unique markers with dynamic controls and response-delta bisection. GET query strings,
+URL-encoded form bodies and JSON POST bodies all use the same batched workflow: two
+benign controls, one marker per field, then delta bisection. It does not crawl, launch a
 browser, download payloads, or create a checkpoint.
 
 | Option | Description |
@@ -483,7 +486,7 @@ browser, download payloads, or create a checkpoint.
 | `--param-subs` / `--param-limit N` | Include subdomains in harvesting (on) / maximum URLs (default `5000`). |
 | `--param-max-checks N` | Maximum parameter names to probe (default `10000`). |
 | `--param-marker STRING` | Alphanumeric marker prefix (default `XoxssReflect`). |
-| `--param-batch-size N` | Unique markers per GET or JSON POST request (default `100`, maximum `100`). |
+| `--param-batch-size N` | Unique markers per GET, form or JSON request (default `100`, maximum `100`). |
 | `--param-data BODY` | POST form body or JSON object, e.g. `user=test&pass=test` or `{"user":"test"}`. |
 | `--param-output PATH` / `--jsonl PATH` | JSON audit report / one candidate object per line. |
 
@@ -495,12 +498,12 @@ The audit JSON contains `mode`, `targets`, `source`, `stats`, `errors` and a
 exits `2` when any parameter reflects.
 
 When Arjun or x8 is installed, the main discovery flow can also add their hidden query
-parameter names to the scanner's candidate set. GET reflection probes batch unique
-markers and compare against two benign controls. Response-delta bisection is used when
-a batch changes the response without reflecting any marker. Dynamic baselines are
-recorded so response drift does not become reflection evidence by itself. URL-encoded
-form POSTs remain one parameter per request; JSON POST bodies use bounded batches and
-bisection.
+parameter names to the scanner's candidate set. GET, URL-encoded form and JSON POST
+reflection probes all batch unique markers and compare against two benign controls.
+Response-delta bisection is used when a batch changes the response without reflecting
+any marker. Dynamic baselines are recorded so response drift does not become reflection
+evidence by itself. Form bodies are grouped by full request URL so query parameters
+that influence the endpoint are never mixed across requests.
 
 ## Recipes
 
@@ -659,11 +662,14 @@ Each requested format is written as:
 |---|---|---|
 | JSON | `.json` | Full payload: stats, recon, OOB, analyzer results, findings (each finding includes `poc_url` / `poc_command`). |
 | Markdown | `.md` | Human-readable summary, tables, per-finding details with a PoC line and a `curl` PoC block. |
-| HTML | `.html` | Self-contained dark-theme report with cards, tables and a PoC column. |
+| HTML | `.html` | Self-contained dark-theme report with cards, tables, a PoC column and click-to-expand screenshot evidence. |
 | SARIF | `.sarif` | SARIF v2.1.0 for code-scanning platforms. Rules derive from findings (`xoxss/reflected-xss`, …); `confirmed`/`high` → `error`, `medium` → `warning`, `low` → `note`. Each result embeds `pocUrl` / `pocCommand` properties. |
 
 Screenshots go to `<state-dir>/screenshots/` (`<token>.png`, `dom-<token>.png`) and are
-linked from findings. `--jsonl` is mass-mode output only: one finding object per line,
+linked from findings. The HTML report renders each one as a thumbnail that opens in a
+keyboard-accessible lightbox dialog (Escape or a backdrop click closes it). Only images
+inside the scanner's screenshot directory are inlined; any other path stays as escaped
+text so a report can never embed arbitrary local files. `--jsonl` is mass-mode output only: one finding object per line,
 appended across runs.
 Full scans can use `--events-jsonl` for live lifecycle and finding events. JSON reports
 include verification availability and coverage notes for request failures and truncated
@@ -771,16 +777,16 @@ flowchart LR
     SCAN --> ANALYSIS["analysis modules<br/>taint, mutation, DOM and protocol checks"]
     SCAN --> BROWSER["core/browser.py<br/>Playwright and Selenium"]
     SCAN --> REPORTS["reports modules<br/>JSON, HTML, Markdown and SARIF"]
-    SCAN --> STATE["checkpoint and events"]
+    SCAN --> STATE["core/state.py<br/>checkpoint and resume state"]
+    SCAN --> EVENTS["console events and JSONL"]
 ```
 
-The parameter-audit batching path is shared by GET query parameters and JSON POST body
-properties; URL-encoded form POST bodies keep their one-parameter request behavior.
-The batching path is:
+The parameter-audit batching path is shared by GET query parameters, URL-encoded form
+bodies and JSON POST body properties. The batching path is:
 
 ```mermaid
 flowchart TD
-    C["Ranked parameter candidates"] --> B["Bounded GET batch<br/>unique marker per name"]
+    C["Ranked parameter candidates"] --> B["Bounded batch<br/>GET, form or JSON<br/>unique marker per name"]
     B --> CTRL["Two benign control responses"]
     CTRL --> DYN{"Baseline dynamic?"}
     DYN --> RESP["Compare batch response<br/>against controls"]
@@ -802,6 +808,7 @@ xoxss/
     http.py               shared asynchronous HTTP transport and response model
     browser.py            Selenium and Playwright backends
     config.py             typed configuration schema (CLI remains authoritative)
+    state.py              crash-safe checkpoint/resume state and URL lifecycle
   detection/
     reflection.py         token alignment, context and surviving-character analysis
     context.py            context classification helpers

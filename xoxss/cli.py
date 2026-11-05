@@ -13,8 +13,6 @@ examples:
   xoxss https://target.tld/?q=1 --browser chrome --headless --dom
   xoxss https://target.tld --god
   xoxss https://target.tld --deep --report all
-  xoxss https://target.tld --god
-  xoxss https://target.tld --deep --report all
   xoxss -l targets.txt --threads 20 --rate-limit 15 --report all
   xoxss https://target.tld --no-browser --report-reflections --report json
   xoxss https://target.tld --tamper all --max-payloads 12 --scan-headers
@@ -187,7 +185,7 @@ def build_parser(
     injection.add_argument("--mutation-probes", action="store_true", help="probe one endpoint for bounded Unicode, decoding, byte-mask, and multibyte transformations")
     injection.add_argument("--mutation-probe-limit", type=int, default=12, help="maximum transformation probes per endpoint (default: 12, hard cap: 14)")
     injection.add_argument("--adaptive-payloads", action="store_true", help="add bounded whitespace/quote and empirically observed Unicode payload variants")
-    injection.add_argument("--scan-headers", action="store_true", help="test header reflection")
+    injection.add_argument("--scan-headers", action="store_true", help="test header reflection (one marker per header, batched)")
     injection.add_argument("--header-list", nargs="+", help="custom header names to inject")
     injection.add_argument("--dom", dest="dom", action="store_true", default=True, help="DOM XSS analysis (default: on)")
     injection.add_argument("--no-dom", dest="dom", action="store_false", help="disable DOM XSS analysis")
@@ -345,7 +343,7 @@ def build_parser(
     )
     params.add_argument(
         "--param-batch-size", type=int, default=100,
-        help="GET parameter names per reflection request (default: 100, max: 100)",
+        help="parameter names per reflection request (default: 100, max: 100)",
     )
     params.add_argument(
         "--param-marker",

@@ -115,15 +115,6 @@ def _query_pairs(url: str) -> List[Tuple[str, str]]:
         return []
 
 
-def _replace_parameter(url: str, name: str, value: str) -> str:
-    parts = urlsplit(url)
-    pairs = parse_qsl(parts.query, keep_blank_values=True)
-    replaced = [(key, value if key == name else val) for key, val in pairs]
-    return urlunsplit(
-        (parts.scheme, parts.netloc, parts.path, urlencode(replaced, doseq=True), parts.fragment)
-    )
-
-
 @dataclass
 class ParameterCandidate:
     """One parameter name plus collection and reflection evidence."""
@@ -422,49 +413,12 @@ class ReflectionProbe:
         # text that already existed on the page.
         return f"{self.marker}{uuid.uuid4().hex[:8]}"
 
-    async def _baseline(
-        self,
-        url: str,
-        name: str,
-        post_pairs: Optional[Sequence[Tuple[str, str]]],
-    ) -> Tuple[Optional[float], bool]:
-        """Compare two benign controls to measure page noise before probing."""
-        controls = (self._new_marker(), self._new_marker())
-        responses: List[Any] = []
-        for control in controls:
-            try:
-                if post_pairs is None:
-                    response = await self.http.get(
-                        _replace_parameter(url, name, control),
-                        allow_redirects=False,
-                        cache=False,
-                    )
-                else:
-                    body = [(key, control if key == name else value) for key, value in post_pairs]
-                    response = await self.http.post(
-                        url, data=dict(body), allow_redirects=False,
-                    )
-                if getattr(response, "error", None):
-                    return None, True
-                responses.append(response)
-            except Exception:
-                return None, True
-        first, second = responses
-        first_status = int(getattr(first, "status", 0) or 0)
-        second_status = int(getattr(second, "status", 0) or 0)
-        first_body = (getattr(first, "text", "") or "").replace(controls[0], "<CONTROL>")
-        second_body = (getattr(second, "text", "") or "").replace(controls[1], "<CONTROL>")
-        similarity = SequenceMatcher(None, first_body[:50_000], second_body[:50_000]).ratio()
-        return similarity, first_status != second_status or similarity < 0.985
-
     async def probe_candidates(
         self,
         candidates: Sequence[ParameterCandidate],
         *,
         data: str = "",
     ) -> List[ParameterCandidate]:
-        semaphore = asyncio.Semaphore(self.concurrency)
-        post_pairs: Optional[List[Tuple[str, str]]] = None
         if data:
             try:
                 json_body = json.loads(data)
@@ -475,114 +429,11 @@ class ReflectionProbe:
             try:
                 post_pairs = parse_qsl(data, keep_blank_values=True)
             except Exception:
-                post_pairs = []
-            if not post_pairs:
-                self.console.warn("POST reflection data could not be parsed; falling back to GET")
                 post_pairs = None
-
-        if post_pairs is None:
-            return await self._probe_get_batches(candidates)
-
-        async def probe(candidate: ParameterCandidate) -> ParameterCandidate:
-            async with semaphore:
-                marker = self._new_marker()
-                if post_pairs is not None:
-                    names = {name for name, _value in post_pairs}
-                    if candidate.name not in names:
-                        return candidate
-                    urls = [candidate.sample_url]
-                else:
-                    urls = []
-                    for url in candidate.urls or [candidate.sample_url]:
-                        if url and url not in urls and _query_pairs(url):
-                            urls.append(url)
-                    urls = urls[: self.urls_per_param]
-                if not urls:
-                    return candidate
-
-                baseline_url = (
-                    candidate.sample_url if post_pairs is not None else urls[0]
-                )
-                candidate.baseline_similarity, candidate.baseline_dynamic = await self._baseline(
-                    baseline_url, candidate.name, post_pairs
-                )
-
-                candidate.marker = marker
-                last_status = 0
-                for request_url in urls:
-                    if post_pairs is not None:
-                        body = [
-                            (name, marker if name == candidate.name else value)
-                            for name, value in post_pairs
-                        ]
-                        try:
-                            response = await self.http.post(
-                                request_url,
-                                data=dict(body),
-                                allow_redirects=False,
-                            )
-                        except Exception as exc:
-                            candidate.evidence = f"request failed: {exc}"[:300]
-                            continue
-                        candidate.method = "POST"
-                        candidate.probe_url = request_url
-                    else:
-                        probe_url = _replace_parameter(request_url, candidate.name, marker)
-                        try:
-                            response = await self.http.get(probe_url, allow_redirects=False)
-                        except Exception as exc:
-                            candidate.evidence = f"request failed: {exc}"[:300]
-                            continue
-                        candidate.method = "GET"
-                        candidate.probe_url = probe_url
-
-                    if getattr(response, "error", None):
-                        candidate.evidence = f"request failed: {response.error}"[:300]
-                        continue
-
-                    body_text = getattr(response, "text", "") or ""
-                    last_status = int(getattr(response, "status", 0) or 0)
-                    candidate.status = last_status
-                    if marker not in body_text:
-                        candidate.evidence = f"marker not reflected (HTTP {last_status})"
-                        continue
-
-                    candidate.reflected = True
-                    index = body_text.find(marker)
-                    try:
-                        analysis = self.detector.detect_context(body_text, index, marker)
-                        candidate.context = analysis.context_type.name.lower()
-                        evidence = (
-                            f"parameter value reflected (HTTP {candidate.status}, "
-                            f"context {candidate.context}, "
-                            f"confidence {analysis.confidence:.2f})"
-                        )
-                    except Exception:
-                        evidence = f"parameter value reflected (HTTP {candidate.status})"
-                    candidate.evidence = evidence
-                    if candidate.baseline_dynamic:
-                        candidate.evidence += "; control responses were dynamic; review the baseline before triage"
-                    candidate.executable = False  # reflection is not execution
-                    break
-                if not candidate.reflected:
-                    candidate.reflected = False
-                    candidate.status = last_status
-                    if not candidate.evidence:
-                        candidate.evidence = f"marker not reflected (HTTP {last_status})"
-                return candidate
-
-        results = await asyncio.gather(*(probe(item) for item in candidates), return_exceptions=True)
-        updated: List[ParameterCandidate] = []
-        for item in results:
-            if isinstance(item, ParameterCandidate):
-                updated.append(item)
-        reflected = sum(1 for item in updated if item.reflected)
-        if updated:
-            self.console.info(
-                f"Gxss-style reflection probe: {reflected}/{len(updated)} reflecting parameter(s)",
-                important=False,
-            )
-        return updated
+            if post_pairs:
+                return await self._probe_form_batches(candidates, post_pairs)
+            self.console.warn("POST reflection data could not be parsed; falling back to GET")
+        return await self._probe_get_batches(candidates)
 
     @staticmethod
     def _base_key(url: str) -> Tuple[str, str, str]:
@@ -662,7 +513,7 @@ class ReflectionProbe:
     ) -> List[ParameterCandidate]:
         """Batch and bisect top-level or nested JSON body leaves."""
         paths = self._json_leaf_paths(document)
-        groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        groups: Dict[Tuple[str, ...], Dict[str, Any]] = {}
         for candidate in candidates:
             candidate.reflected = False
             if candidate.name not in paths:
@@ -790,6 +641,140 @@ class ReflectionProbe:
         if candidates:
             self.console.info(
                 f"Batched JSON reflection probe: {reflected}/{len(candidates)} reflecting property(s)",
+                important=False,
+            )
+        return list(candidates)
+
+    async def _probe_form_batches(
+        self, candidates: Sequence[ParameterCandidate], post_pairs: Sequence[Tuple[str, str]]
+    ) -> List[ParameterCandidate]:
+        """Batch and bisect URL-encoded form fields, mirroring GET/JSON probing."""
+        groups: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+        field_names = {name for name, _value in post_pairs}
+        for candidate in candidates:
+            candidate.reflected = False
+            if candidate.name not in field_names:
+                candidate.evidence = "form field not present in POST body"
+                continue
+            url = candidate.sample_url or next(iter(candidate.urls), "")
+            if not url:
+                candidate.evidence = "no endpoint URL available for form body probe"
+                continue
+            # Query parameters can affect the POST endpoint's behavior, so
+            # only combine forms that share the full request URL.
+            parts = urlsplit(url)
+            key = (*self._base_key(url), parts.query)
+            group = groups.setdefault(key, {"url": url, "candidates": {}})
+            group["candidates"][candidate.name] = candidate
+
+        semaphore = asyncio.Semaphore(self.concurrency)
+        base_body = dict(post_pairs)
+
+        async def probe_group(group: Dict[str, Any]) -> None:
+            url = str(group["url"])
+            by_name: Dict[str, ParameterCandidate] = group["candidates"]
+            baselines: List[Any] = []
+            async with semaphore:
+                for _ in range(2):
+                    try:
+                        response = await self.http.post(
+                            url, data=dict(base_body), allow_redirects=False,
+                        )
+                    except Exception:
+                        continue
+                    if not getattr(response, "error", None):
+                        baselines.append(response)
+
+                baseline_similarity: Optional[float] = None
+                baseline_dynamic = len(baselines) < 2
+                if len(baselines) == 2:
+                    first = self._normalized_body(str(getattr(baselines[0], "text", "") or ""), [])
+                    second = self._normalized_body(str(getattr(baselines[1], "text", "") or ""), [])
+                    baseline_similarity = SequenceMatcher(None, first, second, autojunk=True).ratio()
+                    baseline_dynamic = (
+                        getattr(baselines[0], "status", 0) != getattr(baselines[1], "status", 0)
+                        or baseline_similarity < 0.985
+                    )
+                for candidate in by_name.values():
+                    candidate.baseline_similarity = baseline_similarity
+                    candidate.baseline_dynamic = baseline_dynamic
+                    candidate.method = "POST"
+                    candidate.probe_url = url
+
+                async def probe_bucket(bucket: Sequence[ParameterCandidate]) -> None:
+                    if not bucket:
+                        return
+                    markers = {item.name: self._new_marker() for item in bucket}
+                    body = dict(base_body)
+                    body.update(markers)
+                    try:
+                        response = await self.http.post(
+                            url, data=body, allow_redirects=False,
+                        )
+                    except Exception as exc:
+                        for item in bucket:
+                            item.evidence = f"batched form request failed: {str(exc)[:240]}"
+                        return
+                    if getattr(response, "error", None):
+                        for item in bucket:
+                            item.evidence = f"batched form request failed: {str(response.error)[:240]}"
+                        return
+
+                    text = str(getattr(response, "text", "") or "")
+                    remaining: List[ParameterCandidate] = []
+                    reflected_names: Set[str] = set()
+                    for item in bucket:
+                        item.status = int(getattr(response, "status", 0) or 0)
+                        marker = markers[item.name]
+                        if marker in text:
+                            reflected_names.add(item.name)
+                            item.marker = marker
+                            item.reflected = True
+                            index = text.find(marker)
+                            try:
+                                analysis = self.detector.detect_context(text, index, marker)
+                                item.context = analysis.context_type.name.lower()
+                                context = f", context {item.context}, confidence {analysis.confidence:.2f}"
+                            except Exception:
+                                context = ""
+                            item.evidence = f"unique form batch marker reflected (HTTP {item.status}{context})"
+                        else:
+                            remaining.append(item)
+
+                    if not remaining:
+                        return
+                    if reflected_names:
+                        for item in remaining:
+                            item.evidence = "no unique marker reflection in this form batch; other fields reflected"
+                        return
+                    if self._response_changed(response, baselines, list(markers.values()), baseline_dynamic):
+                        if len(remaining) > 1:
+                            midpoint = len(remaining) // 2
+                            await probe_bucket(remaining[:midpoint])
+                            await probe_bucket(remaining[midpoint:])
+                        else:
+                            remaining[0].evidence = (
+                                "form field changed the response without reflecting its marker "
+                                f"(HTTP {remaining[0].status})"
+                            )
+                    else:
+                        for item in remaining:
+                            item.evidence = f"form marker not reflected; no response delta (HTTP {item.status})"
+
+                ordered = sorted(by_name.values(), key=lambda item: (item.risk != "high", item.name))
+                for offset in range(0, len(ordered), self.batch_size):
+                    await probe_bucket(ordered[offset:offset + self.batch_size])
+
+        results = await asyncio.gather(
+            *(probe_group(group) for group in groups.values()), return_exceptions=True
+        )
+        for group, result in zip(groups.values(), results):
+            if isinstance(result, Exception):
+                self.console.warn(f"Form parameter batch failed for {group['url']}: {str(result)[:200]}")
+        reflected = sum(candidate.reflected for candidate in candidates)
+        if candidates:
+            self.console.info(
+                f"Batched form reflection probe: {reflected}/{len(candidates)} reflecting field(s)",
                 important=False,
             )
         return list(candidates)

@@ -269,6 +269,109 @@ def test_json_post_parameter_bisection_isolates_response_delta():
     assert "no response delta" in by_name["safe"].evidence
 
 
+def test_form_post_parameter_batch_attributes_markers():
+    """URL-encoded forms batch like GET/JSON: controls + one request for N fields."""
+    class EchoForm:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, **kwargs):
+            body = kwargs["data"]
+            self.calls.append(dict(body))
+            # Only the `user` field is reflected, exactly like a login form
+            # that echoes the submitted username back into the page.
+            return SimpleNamespace(
+                status=200,
+                headers={"content-type": "text/html"},
+                text=f"<html><div>{body.get('user', '')}</div></html>",
+                error=None,
+            )
+
+        async def get(self, url, **kwargs):
+            raise AssertionError("form audit must use POST")
+
+    async def run():
+        http = EchoForm()
+        candidates = [
+            ParameterCandidate(name="user", sample_url="https://app.test/login"),
+            ParameterCandidate(name="pass", sample_url="https://app.test/login"),
+        ]
+        result = await ReflectionProbe(http, Console(quiet=True)).probe_candidates(
+            candidates, data="user=test&pass=test"
+        )
+        return http, result
+
+    http, result = asyncio.run(run())
+    by_name = {candidate.name: candidate for candidate in result}
+    assert len(http.calls) == 3  # two controls, one batched form request
+    assert by_name["user"].reflected is True
+    assert by_name["user"].method == "POST"
+    assert by_name["pass"].reflected is False
+
+
+def test_form_post_parameter_bisection_isolates_response_delta():
+    """A field that changes the response without reflecting is bisected out."""
+    class DeltaForm:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, **kwargs):
+            body = kwargs["data"]
+            self.calls.append(dict(body))
+            changed = str(body.get("q", "")).startswith("Audit")
+            return SimpleNamespace(
+                status=200,
+                headers={"content-type": "text/html"},
+                text="<html>changed</html>" if changed else "<html>stable</html>",
+                error=None,
+            )
+
+        async def get(self, url, **kwargs):
+            raise AssertionError("form audit must use POST")
+
+    async def run():
+        http = DeltaForm()
+        candidates = [
+            ParameterCandidate(name="q", sample_url="https://app.test/search", risk="high"),
+            ParameterCandidate(name="safe", sample_url="https://app.test/search", risk="normal"),
+        ]
+        result = await ReflectionProbe(http, Console(quiet=True), marker="Audit").probe_candidates(
+            candidates, data="q=hello&safe=world"
+        )
+        return http, result
+
+    http, result = asyncio.run(run())
+    by_name = {candidate.name: candidate for candidate in result}
+    assert len(http.calls) == 5  # controls, full batch, and two bisected requests
+    assert not by_name["q"].reflected
+    assert "changed the response" in by_name["q"].evidence
+    assert "no response delta" in by_name["safe"].evidence
+
+
+def test_form_post_probe_rejects_field_not_in_body():
+    class NeverCalled:
+        calls = 0
+
+        async def post(self, url, **kwargs):
+            self.calls += 1
+            raise AssertionError("no request should be sent for a missing field")
+
+        async def get(self, url, **kwargs):
+            raise AssertionError("form audit must use POST")
+
+    async def run():
+        http = NeverCalled()
+        candidates = [ParameterCandidate(name="absent", sample_url="https://app.test/login")]
+        result = await ReflectionProbe(http, Console(quiet=True)).probe_candidates(
+            candidates, data="user=test&pass=test"
+        )
+        return http, result
+
+    http, result = asyncio.run(run())
+    assert http.calls == 0
+    assert "not present" in result[0].evidence
+
+
 def test_param_audit_accepts_json_body_end_to_end(server):
     args = build_parser().parse_args(
         [

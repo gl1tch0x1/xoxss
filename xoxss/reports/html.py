@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import html as html_lib
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
+from urllib.parse import quote
 
 from xoxss.reports.common import APP_NAME, VERSION, fmt_duration, now_iso, truncate
 from xoxss.reports.json import report_payload
@@ -45,6 +47,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .poc-block h3 { font-size: 14px; color: #6ee7ff; margin: 4px 0 10px; }
   .poc-block table { table-layout: fixed; }
   .poc-block th { width: 140px; }
+  .screenshot-thumb { display: block; max-width: min(720px, 100%); padding: 0; border: 1px solid #26384b;
+                      border-radius: 6px; background: #0b0f14; cursor: zoom-in; overflow: hidden; }
+  .screenshot-thumb img { display: block; max-width: 100%; max-height: 280px; object-fit: contain; }
+  .screenshot-thumb:focus-visible, .lightbox-close:focus-visible { outline: 2px solid #6ee7ff; outline-offset: 3px; }
+  .screenshot-caption { margin-top: 6px; color: #7c8b9c; font-size: 11px; }
+  .lightbox { width: min(96vw, 1500px); max-width: none; max-height: 94vh; padding: 44px 12px 12px;
+              border: 1px solid #334155; border-radius: 8px; background: #080b10; color: #d7e0ea; }
+  .lightbox::backdrop { background: rgb(0 0 0 / 84%); }
+  .lightbox img { display: block; max-width: 100%; max-height: calc(94vh - 64px); margin: auto; object-fit: contain; }
+  .lightbox-close { position: absolute; top: 8px; right: 10px; padding: 6px 10px; border: 1px solid #334155;
+                    border-radius: 5px; background: #121922; color: #d7e0ea; cursor: pointer; }
   .empty { padding: 24px; border: 1px dashed #1e2a37; border-radius: 8px; color: #7c8b9c; }
   footer { margin-top: 28px; color: #55657a; font-size: 12px; }
 </style>
@@ -54,6 +67,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <div class="sub">Target <code>__TARGET__</code> &middot; generated __DATE__ by __APPNAME__ v__VERSION__</div>
 <div class="cards">__CARDS__</div>
 __CONTENT__
+<dialog class="lightbox" id="screenshot-lightbox" aria-label="Expanded browser evidence screenshot">
+  <button class="lightbox-close" type="button" aria-label="Close screenshot">Close</button>
+  <img alt="Expanded browser evidence screenshot">
+</dialog>
+<script>
+(() => {
+  const dialog = document.getElementById('screenshot-lightbox');
+  if (!dialog) return;
+  const image = dialog.querySelector('img');
+  document.addEventListener('click', (event) => {
+    const trigger = event.target.closest('[data-screenshot]');
+    if (trigger) {
+      image.src = trigger.dataset.screenshot;
+      dialog.showModal();
+    } else if (event.target.closest('.lightbox-close')) {
+      dialog.close();
+    }
+  });
+  dialog.addEventListener('click', (event) => {
+    if (event.target === dialog) dialog.close();
+  });
+  dialog.addEventListener('close', () => { image.removeAttribute('src'); });
+})();
+</script>
 <footer>Automated result. Manually validate every finding before reporting.</footer>
 </body>
 </html>
@@ -334,9 +371,40 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
                     f"<tr><th>PoC command</th><td><code>{html_lib.escape(finding.poc_command)}</code></td></tr>"
                 )
             if finding.screenshot:
-                detail_rows.append(
-                    f"<tr><th>Screenshot</th><td><code>{html_lib.escape(finding.screenshot)}</code></td></tr>"
+                screenshot = Path(finding.screenshot).expanduser()
+                if not screenshot.is_absolute():
+                    screenshot = Path.cwd() / screenshot
+                screenshot_root = None
+                try:
+                    screenshot = screenshot.resolve()
+                    screenshot_root = Path(
+                        getattr(scanner, "screenshot_dir", Path.cwd())
+                    ).expanduser().resolve()
+                    report_dir = path.parent.resolve()
+                    relative = os.path.relpath(screenshot, report_dir).replace(os.sep, "/")
+                    image_url = quote(relative, safe="/:@-._~")
+                except (OSError, ValueError):
+                    image_url = ""
+                is_scanner_screenshot = (
+                    screenshot_root is not None
+                    and (screenshot_root == screenshot or screenshot_root in screenshot.parents)
                 )
+                if (
+                    image_url
+                    and is_scanner_screenshot
+                    and screenshot.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+                    and screenshot.is_file()
+                ):
+                    escaped_url = html_lib.escape(image_url, quote=True)
+                    screenshot_markup = (
+                        f'<button class="screenshot-thumb" type="button" data-screenshot="{escaped_url}" '
+                        f'aria-label="Expand browser evidence for finding {index}">'
+                        f'<img src="{escaped_url}" alt="Browser evidence for finding {index}" loading="lazy"></button>'
+                        '<div class="screenshot-caption">Select image to expand</div>'
+                    )
+                else:
+                    screenshot_markup = f"<code>{html_lib.escape(finding.screenshot)}</code>"
+                detail_rows.append(f"<tr><th>Screenshot</th><td>{screenshot_markup}</td></tr>")
             details.append(
                 f'<div class="poc-block"><h3>{index}. {html_lib.escape(finding.kind)}'
                 f" - {html_lib.escape(finding.parameter or finding.url)}</h3>"
@@ -358,4 +426,5 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
         .replace("__CARDS__", cards)
         .replace("__CONTENT__", content)
     )
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(document, encoding="utf-8")
