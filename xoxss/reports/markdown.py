@@ -20,6 +20,8 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
         f"- **Target:** `{scanner.target}`",
         f"- **Finished:** {data['finished']}",
         f"- **Duration:** {fmt_duration(scanner.stats.elapsed)}",
+        f"- **URLs scanned:** {scanner.stats.urls_done}/{scanner.stats.urls_total}",
+        f"- **URLs failed:** {scanner.stats.urls_failed}",
         f"- **WAF:** {scanner.waf.label()}",
         f"- **Requests:** {scanner.stats.requests}",
         f"- **Endpoints discovered:** {len(scanner.endpoints)}",
@@ -32,6 +34,17 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
         f"- **XSS Findings:** {len(scanner.findings)}",
         "",
     ]
+    if data.get("coverage_notes"):
+        lines += ["## Coverage notes", ""]
+        lines.extend(f"- {note}" for note in data["coverage_notes"])
+        lines.append("")
+    if scanner.mutation_findings:
+        lines += ["## Input transformation observations", ""]
+        for item in scanner.mutation_findings[:100]:
+            lines.append(
+                f"- `{item['name']}` on `{item['parameter']}` at `{item['url']}`: {item['evidence']}"
+            )
+        lines += ["", "These observations are not XSS findings by themselves.", ""]
 
     if scanner.trusted_types_issues:
         lines += ["## Trusted Types issues", "",

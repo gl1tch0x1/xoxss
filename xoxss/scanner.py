@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import hashlib
+import gzip
 import html as html_lib
+import io
 import json
 import os
 import random
@@ -175,17 +178,6 @@ except Exception as _param_exc:  # pragma: no cover
     ReflectionProbe = None  # type: ignore
 
 
-try:
-    from xoxss.detection.reflection import score_reflection
-
-    HAS_REFLECTION_SCORING = True
-except Exception:  # pragma: no cover - package optional during partial installs
-    HAS_REFLECTION_SCORING = False
-
-    def score_reflection(payload: str, response: str, marker: str = ""):  # type: ignore
-        return 0.0, 100.0
-
-
 from xoxss.reports.sarif import (  # noqa: E402
     build_sarif_document,
     sarif_rule_id,
@@ -193,6 +185,15 @@ from xoxss.reports.sarif import (  # noqa: E402
 from xoxss.reports.html import write_html_report
 from xoxss.reports.json import report_payload, write_json_report
 from xoxss.reports.markdown import write_markdown_report
+from xoxss.scan.reflection import ReflectionInfo, analyze_reflection, browser_prequalified
+from xoxss.analysis.mutation_probe import (
+    MutationObservation,
+    apply_observed_normalization,
+    build_probes,
+    observe,
+    reverse_normalization,
+)
+from xoxss.analysis.payload_grammar import assemble_variants
 
 try:
     from xoxss.utils import ui as _ui
@@ -984,6 +985,7 @@ class ScanStats:
     points: int = 0
     urls_total: int = 0
     urls_done: int = 0
+    urls_failed: int = 0
     findings: int = 0
     browser_checks: int = 0
     endpoints: int = 0
@@ -1039,18 +1041,6 @@ class InjectionPoint:
 
 
 @dataclass
-class ReflectionInfo:
-    reflected: bool = False
-    context: str = "unknown"
-    executable: bool = False
-    raw_specials: List[str] = field(default_factory=list)
-    snippet: str = ""
-    detail: str = ""
-    efficiency: float = 0.0
-    distortion: float = 0.0
-
-
-@dataclass
 class WAFReport:
     names: List[str] = field(default_factory=list)
     blocking: bool = False
@@ -1072,6 +1062,7 @@ class HttpResponse:
     error: Optional[str] = None
     from_cache: bool = False
     truncated: bool = False
+    raw: bytes = field(default=b"", repr=False)
 
     @property
     def ok(self) -> bool:
@@ -1104,6 +1095,10 @@ class StateStore:
         self.findings: List[Dict[str, Any]] = []
         self.waf: List[str] = []
         self.extra: Dict[str, Any] = {}
+        # Keep lifecycle state separate from the legacy ``scanned`` set so
+        # existing checkpoints remain readable and only successful URLs are
+        # eligible for resume skipping.
+        self.url_status: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._last_save = 0.0
         # Periodic per-URL saves hit the disk hundreds of times on big scans;
@@ -1150,6 +1145,12 @@ class StateStore:
         self.findings = list(data.get("findings", []))
         self.waf = list(data.get("waf", []))
         self.extra = dict(data.get("extra", {}))
+        raw_status = self.extra.get("url_status", {})
+        if isinstance(raw_status, dict):
+            self.url_status = {
+                str(url): value for url, value in raw_status.items()
+                if isinstance(value, dict)
+            }
         return True
 
     def save(self, force: bool = False) -> None:
@@ -1173,6 +1174,7 @@ class StateStore:
             "waf": self.waf,
             "extra": self.extra,
         }
+        payload["extra"]["url_status"] = self.url_status
         with self._lock:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1187,7 +1189,20 @@ class StateStore:
 
     def mark_scanned(self, url: str) -> None:
         with self._lock:
-            self.scanned.add(normalize_url(url))
+            normalized = normalize_url(url)
+            self.scanned.add(normalized)
+            self.url_status[normalized] = {"status": "complete", "updated": now_iso()}
+
+    def mark_url_status(self, url: str, status: str, error: str = "") -> None:
+        normalized = normalize_url(url)
+        with self._lock:
+            self.url_status[normalized] = {
+                "status": status,
+                "updated": now_iso(),
+                **({"error": error[:1000]} if error else {}),
+            }
+            if status != "complete":
+                self.scanned.discard(normalized)
 
     def add_finding(self, finding: Finding) -> None:
         with self._lock:
@@ -1195,6 +1210,7 @@ class StateStore:
 
     def reset(self) -> None:
         self.scanned.clear()
+        self.url_status.clear()
         self.findings.clear()
         self.waf.clear()
         self.extra.clear()
@@ -1248,12 +1264,14 @@ class HttpEngine:
         retries: int = 2,
         rate: float = 0.0,
         concurrency: int = 16,
+        per_host_concurrency: int = 4,
         proxy: Optional[str] = None,
         insecure: bool = False,
         cache_ttl: float = 60.0,
         cache_size: int = 512,
         max_response_bytes: int = 5 * 1024 * 1024,
         redirect_scope: Optional[Any] = None,
+        auth_state: Optional[str] = None,
     ):
         self.console = console
         self.stats = stats
@@ -1270,9 +1288,12 @@ class HttpEngine:
         self.cache_size = cache_size
         self.max_response_bytes = max(1024, int(max_response_bytes))
         self.redirect_scope = redirect_scope
+        self.auth_state = auth_state
         self.rate = rate
         self.limiter = RateLimiter(rate)
         self.semaphore = asyncio.Semaphore(max(1, concurrency))
+        self.per_host_concurrency = max(1, int(per_host_concurrency))
+        self._host_semaphores: Dict[str, asyncio.Semaphore] = {}
         self.session: Optional[ClientSession] = None
         self._cache: Dict[str, Tuple[float, HttpResponse]] = {}
         self._host_failures: Counter = Counter()
@@ -1299,12 +1320,72 @@ class HttpEngine:
             enable_cleanup_closed=True,
         )
         timeout = aiohttp.ClientTimeout(total=self.timeout, connect=min(self.timeout, 10.0))
+        # Playwright storage-state cookies can legitimately target loopback/IP
+        # hosts in the local benchmark and private test environments. Keep the
+        # default strict behavior unless the operator supplied auth state.
+        cookie_jar = aiohttp.CookieJar(unsafe=bool(self.auth_state))
         self.session = aiohttp.ClientSession(
             headers=self.base_headers,
             cookies=self.cookies,
             timeout=timeout,
             connector=connector,
+            cookie_jar=cookie_jar,
         )
+        if self.auth_state:
+            self._load_auth_state_cookies()
+
+    def _load_auth_state_cookies(self) -> None:
+        """Load Playwright cookies into aiohttp with their original host/path scope."""
+        if self.session is None or not self.auth_state:
+            return
+        try:
+            from http.cookies import SimpleCookie
+            from email.utils import formatdate
+            from yarl import URL
+
+            path = Path(self.auth_state).expanduser()
+            if not path.is_file() or path.stat().st_size > 10 * 1024 * 1024:
+                raise ValueError("file is missing or exceeds 10 MiB")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            cookies = data.get("cookies", []) if isinstance(data, dict) else []
+            if not isinstance(cookies, list):
+                raise ValueError("storage state has no valid cookies array")
+            loaded = 0
+            for item in cookies[:5000]:
+                if not isinstance(item, dict):
+                    continue
+                name, value = item.get("name"), item.get("value")
+                domain = str(item.get("domain") or "").lstrip(".")
+                cookie_path = str(item.get("path") or "/")
+                expires = item.get("expires")
+                if expires not in (None, -1, -1.0, 0, 0.0):
+                    try:
+                        expiry_time = float(expires)
+                        if expiry_time <= time.time():
+                            continue
+                    except (TypeError, ValueError):
+                        expiry_time = 0.0
+                else:
+                    expiry_time = 0.0
+                if not name or not domain or any(ch in domain for ch in "/:@"):
+                    continue
+                cookie = SimpleCookie()
+                cookie[str(name)] = str(value or "")
+                if item.get("domain"):
+                    cookie[str(name)]["domain"] = str(item["domain"])
+                cookie[str(name)]["path"] = cookie_path
+                if item.get("secure"):
+                    cookie[str(name)]["secure"] = True
+                if expiry_time > 0:
+                    cookie[str(name)]["expires"] = formatdate(expiry_time, usegmt=True)
+                scheme = "https" if item.get("secure") else "http"
+                self.session.cookie_jar.update_cookies(
+                    cookie, response_url=URL(f"{scheme}://{domain}{cookie_path}")
+                )
+                loaded += 1
+            self.console.info(f"Loaded {loaded} domain-scoped auth cookie(s) from Playwright storage state", important=False)
+        except Exception as exc:
+            self.console.warn(f"Could not load HTTP auth cookies from --auth-state: {exc}")
 
     async def close(self) -> None:
         if self.session is not None and not self.session.closed:
@@ -1385,7 +1466,11 @@ class HttpEngine:
             if delay:
                 await asyncio.sleep(delay)
             try:
-                async with self.semaphore:
+                host = (urlsplit(url).hostname or "").lower()
+                host_semaphore = self._host_semaphores.setdefault(
+                    host, asyncio.Semaphore(self.per_host_concurrency)
+                )
+                async with host_semaphore, self.semaphore:
                     assert self.session is not None
                     current_url, current_method = url, method
                     current_data, current_json = data, json_body
@@ -1452,6 +1537,7 @@ class HttpEngine:
                             status=response.status,
                             headers={k.lower(): v for k, v in response.headers.items()},
                             text=text,
+                            raw=bytes(raw),
                             elapsed=elapsed,
                             truncated=truncated,
                         )
@@ -2132,7 +2218,7 @@ class PayloadEngine:
             self.console.ok(f"Loaded {added} custom payloads from {path}", important=False)
 
     def probe(self, token: str) -> str:
-        return f"{token}\"'><()"
+        return f"{token} <>\"'`()=/\\\\"
 
     def _lazy_pool_for(self, context: str) -> List[str]:
         cached = self._lazy_pool_cache.get(context)
@@ -2245,130 +2331,6 @@ class PayloadEngine:
         if "{t}" in template:
             return template.replace("{t}", token)
         return embed_marker(template, marker, context)
-
-
-# --------------------------------------------------------------------------------------
-# Reflection analysis
-# --------------------------------------------------------------------------------------
-
-SPECIAL_CHARS = "<>\"'`()=/"
-
-
-def analyze_reflection(body: str, token: str, sent_payload: str, content_type: str = "") -> ReflectionInfo:
-    """Locate the token in a response and describe the injection context."""
-    info = ReflectionInfo()
-    if not body:
-        return info
-    index = body.find(token)
-    if index < 0:
-        # Some applications normalise case or URL-encode the value.
-        alt = body.lower().find(token.lower())
-        if alt < 0:
-            return info
-        index = alt
-
-    before = body[:index]
-    after = body[index + len(token):]
-    # Context belongs to where the *payload* was inserted, not where the marker
-    # sits inside it (a reflected "<script>" would otherwise look like a script
-    # context even when the injection point is the HTML body).
-    marker_offset = sent_payload.find(token) if token in sent_payload else -1
-    context_index = index - marker_offset if marker_offset >= 0 else index
-    context_index = max(0, min(context_index, len(body) - 1))
-    context_before = body[:context_index]
-    low_before = context_before.lower()
-
-    # Context detection (ordered by precedence).
-    context = "html"
-    in_comment = low_before.rfind("<!--") > low_before.rfind("-->")
-    in_script = low_before.rfind("<script") > low_before.rfind("</script")
-    in_style = low_before.rfind("<style") > low_before.rfind("</style")
-    last_lt = context_before.rfind("<")
-    last_gt = context_before.rfind(">")
-    in_tag = last_lt > last_gt
-
-    if in_comment:
-        context = "comment"
-    elif in_script:
-        context = "script"
-    elif in_style:
-        context = "style"
-    elif in_tag:
-        segment = context_before[last_lt:]
-        double_open = segment.count('"') % 2 == 1
-        single_open = segment.count("'") % 2 == 1
-        if double_open:
-            context = "attr_double"
-        elif single_open:
-            context = "attr_single"
-        elif re.search(r"=\s*[^\s\"'>]*$", segment):
-            context = "attr_unquoted"
-        else:
-            context = "html"
-    elif "json" in content_type.lower() or (
-        body.lstrip()[:1] in ("{", "[") and index < len(body) - 1
-    ):
-        context = "json"
-
-    # Which special characters survived verbatim right after the token?
-    tail_sent = sent_payload[sent_payload.find(token) + len(token):] if token in sent_payload else ""
-    tail_recv = after[: max(1, len(tail_sent) + 8)]
-    raw_specials: List[str] = []
-    for offset, char in enumerate(tail_sent):
-        if char not in SPECIAL_CHARS:
-            continue
-        if offset < len(tail_recv) and tail_recv[offset] == char:
-            raw_specials.append(char)
-
-    # Did the whole payload land verbatim (byte-for-byte)?  Entity-encoded
-    # reflections ("&lt;script&gt;...") are rendered as literal text by browsers -
-    # they cannot execute - so decoding entities here would turn sanitized
-    # reflections into false-positive 'executable' findings under the evidence
-    # policy.  Only byte-for-byte verbatim hits count.
-    verbatim = bool(sent_payload) and sent_payload in body
-
-    raw = set(raw_specials)
-    payload_chars = set(sent_payload)
-
-    def survived(chars: str) -> bool:
-        return any(char in raw for char in chars) or (
-            verbatim and any(char in payload_chars for char in chars)
-        )
-
-    executable = False
-    if context == "html":
-        executable = survived("<")
-    elif context == "attr_double":
-        executable = survived('"')
-    elif context == "attr_single":
-        executable = survived("'")
-    elif context == "attr_unquoted":
-        executable = survived(" >\"'`")
-    elif context == "script":
-        executable = survived("'\"`<")
-    elif context == "style":
-        executable = survived("<")
-    elif context == "comment":
-        executable = survived(">-")
-    elif context == "json":
-        executable = survived('<"\\')
-    elif context == "url":
-        executable = True
-
-    info.reflected = True
-    info.context = context
-    info.executable = executable
-    info.raw_specials = raw_specials
-    info.snippet = re.sub(r"\s+", " ", body[max(0, index - 90): index + len(token) + 90])
-    efficiency, distortion = score_reflection(sent_payload, body, token)
-    info.efficiency = efficiency
-    info.distortion = distortion
-    info.detail = (
-        f"context={context}, raw={''.join(sorted(raw)) or 'none'}, "
-        f"verbatim={'yes' if verbatim else 'no'}, executable={'yes' if executable else 'no'}, "
-        f"efficiency={efficiency:.1f}%"
-    )
-    return info
 
 
 # --------------------------------------------------------------------------------------
@@ -2837,10 +2799,12 @@ class XSSScanner:
             retries=args.retries,
             rate=args.rate_limit,
             concurrency=args.concurrency,
+            per_host_concurrency=getattr(args, "per_host_concurrency", 4),
             proxy=args.proxy,
             insecure=args.insecure,
             redirect_scope=self.scope.in_scope,
             max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
+            auth_state=getattr(args, "auth_state", None),
         )
         
         # Enable smart rate limiting if requested
@@ -2854,12 +2818,16 @@ class XSSScanner:
         self._status_task: Optional[asyncio.Task] = None
         self.screenshot_dir = Path(args.state_dir) / "screenshots"
         self._stored_checked: Set[str] = set()
+        self.mutation_findings: List[Dict[str, str]] = []
+        self._mutation_probed: Set[str] = set()
+        self._mutation_observations: Dict[str, List[MutationObservation]] = {}
         self._proto_tested: Set[str] = set()
         self._proto_warned = False
         self.blind_url: Optional[str] = getattr(args, "blind", None)
         self.blind_markers: List[Dict[str, str]] = []
         self._blind_points: Set[str] = set()
         self.endpoints: Set[str] = set()
+        self.endpoint_sources: Dict[str, Set[str]] = {}
         self._js_files_fetched: int = 0
         self._js_seen: Set[str] = set()
         self.vulnerable_libs: List[VulnerableLib] = []
@@ -2872,6 +2840,7 @@ class XSSScanner:
         self.external_findings: List[Any] = []
         self.external_summary: str = ""
         self._mined_params: Dict[str, List[str]] = {}
+        self._browser_points: Dict[str, List[InjectionPoint]] = {}
         self.discovered_param_names: List[str] = []
         self._ast_seen: Set[str] = set()
         self.oob: Optional[OOBManager] = None  # type: ignore[valid-type]
@@ -2925,10 +2894,13 @@ class XSSScanner:
         return result
 
     def _browser_factory(self) -> BrowserEngine:
-        engine_class = PlaywrightEngine if (self.args.browser or "").lower() == "playwright" else BrowserEngine
+        use_playwright = (self.args.browser or "").lower() == "playwright" or bool(
+            getattr(self.args, "auth_state", None)
+        )
+        engine_class = PlaywrightEngine if use_playwright else BrowserEngine
         return engine_class(
             self.console,
-            kind=self.args.browser,
+            kind="playwright" if use_playwright else self.args.browser,
             headless=self.args.headless,
             page_timeout=max(10.0, self.args.timeout),
             user_agent=self.args.user_agent,
@@ -2936,6 +2908,7 @@ class XSSScanner:
             binary=self.args.binary,
             insecure=self.args.insecure,
             url_allowed=self.scope.in_scope,
+            auth_state=getattr(self.args, "auth_state", None),
         )
 
     # -- prototype pollution ----------------------------------------------------------
@@ -3140,6 +3113,10 @@ class XSSScanner:
                 self._status_task = None
             self.stats.endpoints = len(self.endpoints)
             self.state.extra["endpoints"] = sorted(self.endpoints)[:5000]
+            self.state.extra["endpoint_sources"] = {
+                endpoint: sorted(sources)
+                for endpoint, sources in list(self.endpoint_sources.items())[:5000]
+            }
             self.state.save(force=True)
 
         self.console.rule("reports & summary")
@@ -3435,14 +3412,126 @@ class XSSScanner:
         # passive/JS/OpenAPI surface the operator explicitly asked for.
         seeds = [*recon, *(await self.discover_seeds())]
         urls = await self.crawl(seeds)
+        if self.pool and getattr(self.args, "browser_discovery", False):
+            observed = await self.discover_browser_requests(urls)
+            urls = list(dict.fromkeys([*urls, *observed]))[: max(1, self.args.max_urls)]
         if self.target not in urls:
             urls.insert(0, self.target)
         self.state.extra["endpoints"] = sorted(self.endpoints)[:5000]
+        self.state.extra["endpoint_sources"] = {
+            endpoint: sorted(sources)
+            for endpoint, sources in list(self.endpoint_sources.items())[:5000]
+        }
         self.console.ok(
             f"Crawl complete: {len(urls)} URL(s), {len(self.endpoints)} endpoint(s)",
             important=False,
         )
         return urls
+
+    async def discover_browser_requests(self, urls: Sequence[str]) -> List[str]:
+        """Visit a bounded route sample and merge same-scope browser API traffic."""
+        discovered: List[str] = []
+        budget = min(25, max(1, int(getattr(self.args, "browser_discovery_pages", 10))))
+        for url in urls[:budget]:
+            if self._stop.is_set():
+                break
+            try:
+                async with self.pool.borrow() as browser:  # type: ignore[union-attr]
+                    await browser.navigate(url)
+                    browser_data = await browser.collect()
+                    requests = [
+                        *browser_data.get("requests", []),
+                        *getattr(browser, "observed_requests", []),
+                    ]
+                    for candidate in list(requests):
+                        if not self.scope.in_scope(candidate) or looks_like_dangerous(candidate):
+                            continue
+                        try:
+                            normalized = normalize_url(candidate)
+                        except ValueError:
+                            continue
+                        if normalized not in discovered:
+                            discovered.append(normalized)
+                            self._record_endpoint(normalized, "browser-request")
+                    for detail in browser_data.get("request_details", []):
+                        if not isinstance(detail, dict):
+                            continue
+                        endpoint = str(detail.get("url") or "")
+                        if not self.scope.in_scope(endpoint):
+                            continue
+                        try:
+                            endpoint = normalize_url(endpoint)
+                        except ValueError:
+                            continue
+                        method = str(detail.get("method") or "GET").upper()
+                        # Browser discovery can observe state-changing verbs;
+                        # only replay POST bodies, matching the scanner's
+                        # existing form workflow and avoiding accidental PUT/
+                        # PATCH/DELETE mutations during discovery.
+                        if method != "POST":
+                            continue
+                        body_text = str(detail.get("post_data") or "")[:16000]
+                        content_type = str(detail.get("content_type") or "").lower()
+                        if not body_text:
+                            continue
+                        body: Dict[str, Any] = {}
+                        is_json = "json" in content_type or body_text.lstrip().startswith("{")
+                        if is_json:
+                            try:
+                                parsed_body = json.loads(body_text)
+                                if isinstance(parsed_body, dict):
+                                    body = parsed_body
+                            except (TypeError, ValueError):
+                                continue
+                        else:
+                            body = dict(parse_qsl(body_text, keep_blank_values=True))
+                            if not body:
+                                continue
+                        if is_json:
+                            def leaves(value: Any, path: Tuple[str, ...] = (), depth: int = 0) -> List[Tuple[Tuple[str, ...], Any]]:
+                                if depth >= 12:
+                                    return []
+                                if isinstance(value, dict):
+                                    return [item for key, child in value.items() for item in leaves(child, (*path, str(key)), depth + 1)]
+                                if isinstance(value, list):
+                                    return [item for index, child in enumerate(value[:100]) for item in leaves(child, (*path, str(index)), depth + 1)]
+                                return [(path, value)] if isinstance(value, (str, int, float, bool)) else []
+
+                            for json_path, value in leaves(body):
+                                if not json_path:
+                                    continue
+                                point = InjectionPoint(
+                                    url=endpoint, method=method, param=".".join(json_path), value=str(value),
+                                    source="json", page_url=url, json_body=dict(body),
+                                    content_type="application/json", extra={"json_path": list(json_path)},
+                                )
+                                candidates = self._browser_points.setdefault(endpoint, [])
+                                if all(existing.key() != point.key() for existing in candidates):
+                                    candidates.append(point)
+                        else:
+                            for parameter, value in body.items():
+                                if not isinstance(value, (str, int, float, bool)):
+                                    continue
+                                fields = {
+                                    str(name): FormField(name=str(name), value=str(field_value))
+                                    for name, field_value in body.items()
+                                }
+                                point = InjectionPoint(
+                                    url=endpoint, method=method, param=str(parameter), value=str(value),
+                                    source="form", page_url=url, fields=fields,
+                                    content_type=content_type or "application/x-www-form-urlencoded",
+                                )
+                                candidates = self._browser_points.setdefault(endpoint, [])
+                                if all(existing.key() != point.key() for existing in candidates):
+                                    candidates.append(point)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.console.debug(f"Browser route discovery failed for {truncate(url, 120)}: {exc}")
+        if discovered:
+            self.state.extra["browser_discovered_requests"] = discovered[:5000]
+            self.console.info(f"Browser observed {len(discovered)} in-scope route/API URL(s)", important=False)
+        return discovered
 
     async def recon_seeds(self) -> List[str]:
         """Run optional passive/active reconnaissance and return extra URLs."""
@@ -3485,7 +3574,7 @@ class XSSScanner:
                 for error in report.errors[:5]:
                     self.console.debug(f"Subdomain source error: {error}")
             except Exception as exc:
-                self.console.warn(f"Subdomain enumeration failed: {exc}")
+                self._record_recon_error("subdomain enumeration", exc)
 
         if passive_mode and PassiveURLCollector is not None:
             try:
@@ -3509,7 +3598,7 @@ class XSSScanner:
                 for error in report.errors[:5]:
                     self.console.debug(f"Passive URL source error: {error}")
             except Exception as exc:
-                self.console.warn(f"Passive URL collection failed: {exc}")
+                self._record_recon_error("passive URL collection", exc)
 
         if openapi_mode and OpenAPIFinder is not None:
             try:
@@ -3527,7 +3616,7 @@ class XSSScanner:
                         f"OpenAPI: {len(operations)} operation(s) discovered", important=False
                     )
             except Exception as exc:
-                self.console.warn(f"OpenAPI discovery failed: {exc}")
+                self._record_recon_error("OpenAPI discovery", exc)
 
         if fuzz_mode and DirFuzzer is not None:
             try:
@@ -3545,7 +3634,7 @@ class XSSScanner:
                     extra.append(fuzz_result.url)
                     self._record_endpoint(fuzz_result.url, "fuzz")
             except Exception as exc:
-                self.console.warn(f"Path fuzzing failed: {exc}")
+                self._record_recon_error("path fuzzing", exc)
 
         if mine_mode and ParameterMiner is not None:
             try:
@@ -3568,72 +3657,74 @@ class XSSScanner:
                     separator = "&" if "?" in item.url else "?"
                     extra.append(f"{item.url}{separator}{item.name}=1")
             except Exception as exc:
-                self.console.warn(f"Parameter mining failed: {exc}")
+                self._record_recon_error("parameter mining", exc)
 
         if external_mode and ExternalToolkit is not None:
-            try:
-                toolkit = ExternalToolkit(
-                    self.console,
-                    timeout=max(30.0, self.args.timeout * 6),
-                    max_results=max(100, self.args.max_urls * 2),
-                )
-                self.external_summary = toolkit.summary()
-                self.console.info(
-                    f"External recon tools: {self.external_summary}", important=False
-                )
-                hosts = await toolkit.subdomains(domain)
-                if hosts:
-                    live = await toolkit.live_hosts(hosts)
-                    discovered_hosts = live or [
-                        urlunsplit((scheme, hostname, "/", "", "")) for hostname in hosts
-                    ]
-                    for url in discovered_hosts:
-                        hostname = urlsplit(url).hostname or ""
-                        if hostname and hostname not in self.subdomains:
-                            self.subdomains.append(hostname)
-                    self.stats.subdomains = len(self.subdomains)
-                    self.state.extra["subdomains"] = self.subdomains[:5000]
-                    extra.extend(discovered_hosts)
-                urls = await toolkit.urls(domain)
-                extra.extend(urls)
-                crawl = await toolkit.crawl(
-                    self.target, depth=min(3, max(1, self.args.crawl_depth))
-                )
+            toolkit = ExternalToolkit(
+                self.console,
+                timeout=max(30.0, self.args.timeout * 6),
+                max_results=max(100, self.args.max_urls * 2),
+            )
+            self.external_summary = toolkit.summary()
+            self.console.info(
+                f"External recon tools: {self.external_summary}", important=False
+            )
+            hosts = await self._recon_call("external subdomain enumeration", toolkit.subdomains(domain), [])
+            if hosts:
+                live = await self._recon_call("external live-host probing", toolkit.live_hosts(hosts), [])
+                discovered_hosts = live or [
+                    urlunsplit((scheme, hostname, "/", "", "")) for hostname in hosts
+                ]
+                for url in discovered_hosts:
+                    hostname = urlsplit(url).hostname or ""
+                    if hostname and hostname not in self.subdomains:
+                        self.subdomains.append(hostname)
+                self.stats.subdomains = len(self.subdomains)
+                self.state.extra["subdomains"] = self.subdomains[:5000]
+                extra.extend(discovered_hosts)
+            urls = await self._recon_call("external URL collection", toolkit.urls(domain), [])
+            extra.extend(urls)
+            crawl = await self._recon_call(
+                "external browser-aware crawling",
+                toolkit.crawl(self.target, depth=min(3, max(1, self.args.crawl_depth))),
+                None,
+            )
+            if crawl is not None:
                 extra.extend(crawl.urls)
-                parameter_targets = list(dict.fromkeys(
-                    [self.target, *(url for url in self.passive_urls if self.scope.in_scope(url))]
-                ))[:20]
-                discovered_parameters = await toolkit.parameters(parameter_targets)
-                external_parameter_state: Dict[str, List[str]] = {}
-                for endpoint, names in discovered_parameters.items():
-                    if not self.scope.in_scope(endpoint):
-                        continue
-                    if HAS_PARAM_AUDIT and ParameterHarvester is not None:
-                        parameter_report = ParameterHarvester(
-                            self.http, self.console, limit=max(1, self.args.max_urls)
-                        ).from_names(endpoint, names, source="arjun/x8")
-                        names = [candidate.name for candidate in parameter_report.candidates]
-                    self._mined_params.setdefault(endpoint, []).extend(names)
-                    self._mined_params[endpoint] = list(dict.fromkeys(self._mined_params[endpoint]))
-                    for name in names:
-                        if name not in self.discovered_param_names:
-                            self.discovered_param_names.append(name)
-                    external_parameter_state[endpoint] = names
-                    extra.append(endpoint)
-                if external_parameter_state:
-                    self.stats.discovered_params += sum(
-                        len(names) for names in external_parameter_state.values()
-                    )
-                    self.state.extra["external_parameters"] = external_parameter_state
-                    self.console.info(
-                        f"External parameter discovery: "
-                        f"{sum(len(names) for names in external_parameter_state.values())} name(s) "
-                        f"across {len(external_parameter_state)} endpoint(s)",
-                        important=False,
-                    )
-                self.state.extra["external_tools"] = self.external_summary
-            except Exception as exc:
-                self.console.warn(f"External recon failed: {exc}")
+            parameter_targets = list(dict.fromkeys(
+                [self.target, *(url for url in self.passive_urls if self.scope.in_scope(url))]
+            ))[: max(1, int(getattr(self.args, "max_param_targets", 100)))]
+            discovered_parameters = await self._recon_call(
+                "external parameter discovery", toolkit.parameters(parameter_targets), {}
+            )
+            external_parameter_state: Dict[str, List[str]] = {}
+            for endpoint, names in discovered_parameters.items():
+                if not self.scope.in_scope(endpoint):
+                    continue
+                if HAS_PARAM_AUDIT and ParameterHarvester is not None:
+                    parameter_report = ParameterHarvester(
+                        self.http, self.console, limit=max(1, self.args.max_urls)
+                    ).from_names(endpoint, names, source="arjun/x8")
+                    names = [candidate.name for candidate in parameter_report.candidates]
+                self._mined_params.setdefault(endpoint, []).extend(names)
+                self._mined_params[endpoint] = list(dict.fromkeys(self._mined_params[endpoint]))
+                for name in names:
+                    if name not in self.discovered_param_names:
+                        self.discovered_param_names.append(name)
+                external_parameter_state[endpoint] = names
+                extra.append(endpoint)
+            if external_parameter_state:
+                self.stats.discovered_params += sum(
+                    len(names) for names in external_parameter_state.values()
+                )
+                self.state.extra["external_parameters"] = external_parameter_state
+                self.console.info(
+                    f"External parameter discovery: "
+                    f"{sum(len(names) for names in external_parameter_state.values())} name(s) "
+                    f"across {len(external_parameter_state)} endpoint(s)",
+                    important=False,
+                )
+            self.state.extra["external_tools"] = self.external_summary
 
         result: List[str] = []
         seen: Set[str] = set()
@@ -3654,6 +3745,22 @@ class XSSScanner:
                 f"Reconnaissance added {len(result)} URL(s)", important=False
             )
         return result[: max(1, self.args.max_urls)]
+
+    async def _recon_call(self, label: str, operation: Any, default: Any) -> Any:
+        """Isolate optional recon source failures so one tool cannot suppress others."""
+        try:
+            return await operation
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record_recon_error(label, exc)
+            return default
+
+    def _record_recon_error(self, label: str, error: Exception) -> None:
+        errors = self.state.extra.setdefault("recon_errors", [])
+        if isinstance(errors, list) and len(errors) < 100:
+            errors.append({"source": label, "error": str(error)[:1000]})
+        self.console.warn(f"{label} failed: {error}")
 
     async def discover_seeds(self) -> List[str]:
         """Collect extra crawl seeds from robots.txt, sitemaps and common paths."""
@@ -3718,6 +3825,17 @@ class XSSScanner:
             if response.error or not response.text:
                 continue
             text = response.text[:2_000_000]
+            if sitemap_url.lower().endswith(".gz") or response.raw.startswith(b"\x1f\x8b"):
+                try:
+                    with gzip.GzipFile(fileobj=io.BytesIO(response.raw)) as compressed:
+                        decoded = compressed.read(2_000_001)
+                    if len(decoded) > 2_000_000:
+                        self.console.debug(f"Ignoring oversized compressed sitemap: {sitemap_url}")
+                        continue
+                    text = decoded.decode("utf-8", "replace")
+                except (OSError, EOFError) as exc:
+                    self.console.debug(f"Could not decode compressed sitemap {sitemap_url}: {exc}")
+                    continue
             locations = [
                 html_lib.unescape(loc.strip())
                 for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", text, re.I)
@@ -3725,8 +3843,6 @@ class XSSScanner:
             locations = [urljoin(sitemap_url, location) for location in locations]
             if "<sitemapindex" in text.lower():
                 for location in locations:
-                    if location.lower().endswith(".gz"):
-                        continue
                     if location not in visited:
                         queue.append(location)
             else:
@@ -3788,6 +3904,7 @@ class XSSScanner:
             return
         if not looks_like_scan_target(normalized, fuzz_params=True):
             return
+        self.endpoint_sources.setdefault(normalized, set()).add(source)
         if normalized in self.endpoints:
             return
         self.endpoints.add(normalized)
@@ -4058,13 +4175,27 @@ class XSSScanner:
         return ordered
 
     async def _scan_urls(self, urls: Sequence[str]) -> None:
-        semaphore = asyncio.Semaphore(max(1, self.args.threads))
+        # A fixed worker count avoids allocating one asyncio task per URL for
+        # very large recon results. Workers also keep failures visible.
+        url_iterator = iter(urls)
 
-        async def worker(url: str) -> None:
-            async with semaphore:
-                await self.scan_url(url)
+        async def worker() -> None:
+            while True:
+                try:
+                    url = next(url_iterator)
+                except StopIteration:
+                    return
+                try:
+                    await self.scan_url(url)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.stats.urls_failed += 1
+                    self.state.mark_url_status(url, "failed", str(exc))
+                    self.state.save(force=True)
+                    self.console.warn(f"URL scan failed ({truncate(url, 120)}): {exc}")
 
-        await asyncio.gather(*(worker(url) for url in urls), return_exceptions=True)
+        await asyncio.gather(*(worker() for _ in range(min(max(1, self.args.threads), len(urls)))))
 
     async def scan_url(self, url: str) -> None:
         if self._stop.is_set():
@@ -4075,6 +4206,10 @@ class XSSScanner:
             return
 
         self.console.info(f"Scanning {url}")
+        completed = False
+        interrupted = False
+        error_message = ""
+        self.state.mark_url_status(url, "running")
         try:
             # Advanced: JSONP detection
             if HAS_ADVANCED and getattr(self.args, 'jsonp', False):
@@ -4107,14 +4242,27 @@ class XSSScanner:
                 await self.test_headers(url)
             if self.args.dom:
                 await self.test_dom(url)
+            completed = True
         except asyncio.CancelledError:
+            interrupted = True
+            self.state.mark_url_status(url, "interrupted", "scan cancelled")
             raise
         except Exception as exc:
-            self.console.debug(f"Error scanning {truncate(url, 120)}: {exc}")
+            error_message = str(exc)
+            self.console.warn(f"Error scanning {truncate(url, 120)}: {exc}")
         finally:
-            if not self._stop.is_set():
-                self.state.mark_scanned(url)
-                self.state.save()
+            if interrupted:
+                self.state.save(force=True)
+            elif self._stop.is_set() and not completed:
+                self.state.mark_url_status(url, "interrupted", "scan stopped before completion")
+                self.state.save(force=True)
+            elif not self._stop.is_set():
+                if completed:
+                    self.state.mark_scanned(url)
+                else:
+                    self.stats.urls_failed += 1
+                    self.state.mark_url_status(url, "failed", error_message or "scan did not complete")
+                self.state.save(force=True)
                 self.stats.urls_done += 1
 
     async def discover_points(self, url: str) -> List[InjectionPoint]:
@@ -4138,6 +4286,9 @@ class XSSScanner:
                     page_url=url,
                 )
             )
+
+        for point in self._browser_points.get(url, []):
+            add(point)
 
         # OpenAPI request bodies (JSON/form) become injection points too.
         for point in self._api_points(url):
@@ -4307,8 +4458,19 @@ class XSSScanner:
     async def send_point(self, point: InjectionPoint, payload: str) -> Optional[HttpResponse]:
         method = point.method.upper()
         if point.source == "json":
-            body = dict(point.json_body or {})
-            body[point.param] = payload
+            body = copy.deepcopy(point.json_body or {})
+            json_path = point.extra.get("json_path")
+            if isinstance(json_path, list) and json_path:
+                target: Any = body
+                for segment in json_path[:-1]:
+                    target = target[int(segment)] if isinstance(target, list) else target[segment]
+                final = json_path[-1]
+                if isinstance(target, list):
+                    target[int(final)] = payload
+                else:
+                    target[final] = payload
+            else:
+                body[point.param] = payload
             return await self.http.request(
                 method,
                 point.url,
@@ -4438,6 +4600,9 @@ class XSSScanner:
             self.console.debug(f"Not reflected: {location}")
             return
 
+        if getattr(self.args, "mutation_probes", False):
+            await self._probe_mutations(point)
+
         self.console.debug(f"Reflected ({info.detail}): {location}")
 
         # Use polyglot payloads if enabled
@@ -4458,7 +4623,10 @@ class XSSScanner:
                 )
                 # Confirm execution with the browser when one is available
                 if self.pool is not None and self.pool.engines and self.args.confirm != "http":
-                    finding = await self.confirm_in_browser(point, payload, token, polyglot_info)
+                    finding = await self.confirm_in_browser(
+                        point, payload, token, polyglot_info,
+                        result.header("content-type", ""),
+                    )
                     if finding:
                         self.add_finding(finding)
                         return
@@ -4492,7 +4660,23 @@ class XSSScanner:
             # so the injection point is never left untested.
 
         # Standard payload testing
-        for template in self.payloads.payloads_for(info.context, self.args.max_payloads):
+        templates = self.payloads.payloads_for(info.context, self.args.max_payloads)
+        if getattr(self.args, "adaptive_payloads", False):
+            probe_templates = list(templates)
+            base_key = self._mutation_key(point.url)
+            observations = self._mutation_observations.get(base_key, [])
+            if observations:
+                probe_templates.extend(
+                    apply_observed_normalization(template, observations)
+                    for template in templates
+                )
+            variants = assemble_variants(
+                probe_templates,
+                info.raw_specials,
+                limit=max(1, self.args.max_payloads * 2),
+            )
+            templates = list(dict.fromkeys([*templates, *variants]))
+        for template in templates:
             if self._stop.is_set():
                 return
             payload_token = unique_token()
@@ -4506,6 +4690,15 @@ class XSSScanner:
             payload_info = analyze_reflection(
                 result.text, payload_token, payload, result.header("content-type", "")
             )
+            normalized_payload = reverse_normalization(
+                payload, self._mutation_observations.get(self._mutation_key(point.url), [])
+            )
+            normalization_confirmed = normalized_payload != payload and normalized_payload in result.text
+            if normalization_confirmed:
+                payload_info = analyze_reflection(
+                    result.text, payload_token, normalized_payload,
+                    result.header("content-type", ""),
+                )
             if not payload_info.reflected:
                 continue
 
@@ -4536,7 +4729,10 @@ class XSSScanner:
                 continue
 
             if self.pool is not None and self.pool.engines and self.args.confirm != "http":
-                finding = await self.confirm_in_browser(point, payload, payload_token, info)
+                finding = await self.confirm_in_browser(
+                    point, payload, payload_token, payload_info,
+                    result.header("content-type", ""),
+                )
                 if finding:
                     self.add_finding(finding)
                     return
@@ -4545,7 +4741,10 @@ class XSSScanner:
             poc_url, poc_command = self.poc_for_point(point, payload)
             self.add_finding(
                 Finding(
-                    kind="Reflected XSS (HTTP evidence)",
+                    kind=(
+                        "Reflected XSS (normalization differential)"
+                        if normalization_confirmed else "Reflected XSS (HTTP evidence)"
+                    ),
                     url=point.url,
                     parameter=point.param,
                     method=point.method.upper(),
@@ -4553,12 +4752,66 @@ class XSSScanner:
                     evidence=f"payload reflected unescaped ({payload_info.detail})",
                     confidence=confidence,
                     context=info.context,
-                    detail="Browser verification unavailable or inconclusive",
+                    detail=(
+                        "Unicode delimiters normalized into executable syntax"
+                        if normalization_confirmed else "Browser verification unavailable or inconclusive"
+                    ),
                     poc_url=poc_url,
                     poc_command=poc_command,
                 )
             )
             return
+
+    @staticmethod
+    def _mutation_key(url: str) -> str:
+        parts = urlsplit(url)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", "", ""))
+
+    async def _probe_mutations(self, point: InjectionPoint) -> None:
+        """Record observed transformations without labeling them XSS by themselves."""
+        key = self._mutation_key(point.url)
+        if key in self._mutation_probed:
+            return
+        self._mutation_probed.add(key)
+        marker = unique_token("m", 10)
+        observations: List[MutationObservation] = []
+        for probe in build_probes(
+            marker, int(getattr(self.args, "mutation_probe_limit", 12) or 12)
+        ):
+            if self._stop.is_set():
+                break
+            try:
+                response = await self.send_point(point, probe.sent)
+            except Exception as exc:
+                self.console.debug(
+                    f"Mutation probe {probe.name} failed for {truncate(point.url, 100)}: "
+                    f"{str(exc)[:160]}"
+                )
+                continue
+            self.stats.payloads += 1
+            if response is None or response.error or not response.text:
+                continue
+            observation = observe(response.text, probe)
+            if observation is not None:
+                observations.append(observation)
+                self.mutation_findings.append(
+                    {
+                        "url": point.url,
+                        "parameter": point.param,
+                        "name": observation.name,
+                        "kind": observation.kind,
+                        "sent": observation.sent,
+                        "transformed": observation.transformed,
+                        "evidence": observation.evidence,
+                    }
+                )
+                self.console.warn(
+                    f"Input transformation observed ({observation.name}) at "
+                    f"{truncate(point.url, 100)}; this is a signal, not an XSS finding"
+                )
+        if observations:
+            self._mutation_observations[key] = observations
+            self.state.extra["transform_observations"] = self.mutation_findings[:1000]
 
     async def confirm_in_browser(
         self,
@@ -4566,8 +4819,9 @@ class XSSScanner:
         payload: str,
         token: str,
         info: ReflectionInfo,
+        content_type: str = "",
     ) -> Optional[Finding]:
-        if self.pool is None:
+        if self.pool is None or not browser_prequalified(info, content_type):
             return None
         try:
             async with self.pool.borrow() as browser:
@@ -4859,6 +5113,56 @@ class XSSScanner:
             except Exception as exc:
                 self.console.debug(f"DOM verification error: {exc}")
                 return
+
+        # Exercise non-URL sources that static analysis commonly sees in SPAs.
+        # These probes use unique per-run keys and stay within the existing
+        # browser-worker and same-origin scope controls.
+        if not getattr(self.args, "dom_source_probes", False):
+            return
+        marker = unique_token()
+        runtime_value = self.payloads.render('<img src=x onerror="{m}">', marker)
+        source_probes = (
+            ("localStorage", "(v) => { localStorage.setItem('xss', v); }", True),
+            ("sessionStorage", "(v) => { sessionStorage.setItem('xss', v); }", True),
+            ("window.name", "(v) => { window.name = v; }", True),
+            ("postMessage", "(v) => { window.postMessage(v, '*'); }", False),
+        )
+        for source_name, seed_script, reload_page in source_probes:
+            if self._stop.is_set():
+                return
+            try:
+                async with self.pool.borrow() as browser:
+                    await browser.navigate(url)
+                    await browser.evaluate(seed_script, runtime_value)
+                    if reload_page:
+                        await browser.navigate(url)
+                    hit = await browser.check_token(marker, timeout=1.0)
+                    if not hit:
+                        continue
+                    executed = hit.get("executed") == "yes"
+                    screenshot = ""
+                    if self.args.screenshot:
+                        screenshot = await browser.screenshot(
+                            str(self.screenshot_dir / f"dom-{source_name}-{marker}.png")
+                        )
+                    self.add_finding(
+                        Finding(
+                            kind="DOM XSS (runtime sink)" if executed else "DOM XSS (sink taint)",
+                            url=url,
+                            parameter=source_name,
+                            method="BROWSER",
+                            payload=runtime_value,
+                            evidence=hit.get("evidence", ""),
+                            confidence="confirmed" if executed else "low",
+                            context="dom/runtime-source",
+                            detail=f"Payload seeded through {source_name} reached an instrumented sink",
+                            screenshot=screenshot,
+                            poc_url=url,
+                        )
+                    )
+                    return
+            except Exception as exc:
+                self.console.debug(f"DOM {source_name} source verification error: {exc}")
 
     # -- stored XSS -------------------------------------------------------------------
     # -- Advanced feature methods (Phase 1 & 2) ----------------------------------------
@@ -5645,6 +5949,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use installed recon, parameter discovery (arjun/x8), and XSS verification tools",
     )
+    crawl.add_argument(
+        "--max-param-targets", type=int, default=100,
+        help="maximum in-scope endpoints sent to external hidden-parameter tools (default: 100)",
+    )
 
     injection = parser.add_argument_group("injection")
     injection.add_argument(
@@ -5704,6 +6012,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="encoder registry transform applied after --tamper (repeatable; see --list-encoders)",
     )
     injection.add_argument("--max-payloads", type=int, default=6, help="payloads per injection point (default: 6)")
+    injection.add_argument("--mutation-probes", action="store_true", help="probe one endpoint for bounded Unicode, decoding, byte-mask, and multibyte transformations")
+    injection.add_argument("--mutation-probe-limit", type=int, default=12, help="maximum transformation probes per endpoint (default: 12, hard cap: 14)")
+    injection.add_argument("--adaptive-payloads", action="store_true", help="add bounded whitespace/quote and empirically observed Unicode payload variants")
     injection.add_argument("--scan-headers", action="store_true", help="test header reflection")
     injection.add_argument("--header-list", nargs="+", help="custom header names to inject")
     injection.add_argument("--dom", dest="dom", action="store_true", default=True, help="DOM XSS analysis (default: on)")
@@ -5783,6 +6094,10 @@ def build_parser() -> argparse.ArgumentParser:
     browser.add_argument("--headless", action="store_true", help="run the browser headless")
     browser.add_argument("--no-browser", action="store_true", help="HTTP-only mode (no Selenium)")
     browser.add_argument("--browser-workers", type=int, default=1, help="parallel browser instances (default: 1)")
+    browser.add_argument("--browser-discovery", action="store_true", help="visit a bounded sample of crawled pages and scan same-scope XHR/fetch/navigation URLs")
+    browser.add_argument("--browser-discovery-pages", type=int, default=10, help="maximum pages visited for browser route discovery (default: 10, max: 25)")
+    browser.add_argument("--dom-source-probes", action="store_true", help="actively test storage, window.name, and postMessage DOM XSS sources (adds up to four browser reloads per candidate page)")
+    browser.add_argument("--auth-state", metavar="PATH", help="Playwright storage-state JSON for authenticated browser discovery and verification")
     browser.add_argument("--confirm", choices=["auto", "browser", "http"], default="auto", help="verification strategy")
     browser.add_argument("--screenshot", action="store_true", help="save a screenshot for confirmed findings")
     browser.add_argument("--binary", help="explicit browser binary path")
@@ -5791,6 +6106,7 @@ def build_parser() -> argparse.ArgumentParser:
     network = parser.add_argument_group("network")
     network.add_argument("--threads", type=int, default=10, help="parallel URL workers (default: 10)")
     network.add_argument("--concurrency", type=int, default=16, help="parallel HTTP requests (default: 16)")
+    network.add_argument("--per-host-concurrency", type=int, default=4, help="maximum simultaneous HTTP requests per host (default: 4)")
     network.add_argument("--timeout", type=float, default=20.0, help="request/browser timeout in seconds")
     network.add_argument("--retries", type=int, default=2, help="retries per request (default: 2)")
     network.add_argument("--rate-limit", type=float, default=0.0, help="requests per second (0 = unlimited)")
@@ -5854,6 +6170,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=10000,
         help="maximum parameter reflection checks per audit (default: 10000)",
+    )
+    params.add_argument(
+        "--param-batch-size", type=int, default=100,
+        help="GET parameter names per reflection request (default: 100, max: 100)",
     )
     params.add_argument(
         "--param-marker",
@@ -6317,6 +6637,7 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         console,
         marker=args.param_marker,
         concurrency=max(1, args.concurrency),
+        batch_size=min(100, max(1, int(getattr(args, "param_batch_size", 100)))),
     )
 
     seed_urls: List[str] = []

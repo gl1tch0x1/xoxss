@@ -60,6 +60,9 @@ SINK_PATTERNS: List[Tuple[str, str, str, bool]] = [
     ("jquery.after", r"\.\s*after\s*\(\s*([^)]{0,600})", "html", False),
     ("jquery.replaceWith", r"\.\s*replaceWith\s*\(\s*([^)]{0,600})", "html", False),
     ("createContextualFragment", r"\bcreateContextualFragment\s*\(\s*([^)]{0,600})", "html", False),
+    ("DOMParser.parseFromString", r"\bparseFromString\s*\(\s*([^,)]{0,600})", "html", False),
+    ("setHTMLUnsafe", r"\.\s*setHTMLUnsafe\s*\(\s*([^)]{0,600})", "html", False),
+    ("setHTML", r"\.\s*setHTML\s*\(\s*([^)]{0,600})", "html", False),
     ("createElement.script", r"createElement\s*\(\s*['\"]script['\"]\s*\)", "js", False),
 ]
 
@@ -187,22 +190,28 @@ def _tainted_variables(code: str, assignments: Dict[str, List[Tuple[str, int, in
                     tainted.setdefault(name, (source_name, line))
                     break
 
-    # Fixed point over aliases (bounded to avoid pathological bundles).
-    for _ in range(6):
-        changed = False
-        for name, entries in assignments.items():
-            if name in tainted:
+    # Propagate through an explicit dependency graph. Unlike a fixed number of
+    # passes, a work queue handles long alias chains in linear time.
+    dependencies: Dict[str, List[Tuple[str, int]]] = {}
+    assignment_names = set(assignments)
+    for target, entries in assignments.items():
+        for expr, line, _pos, _op in entries:
+            for identifier in set(re.findall(r"[A-Za-z_$][\w$]*", expr)):
+                if identifier in assignment_names and identifier != target:
+                    dependencies.setdefault(identifier, []).append((target, line))
+
+    pending = list(tainted)
+    visited = set(pending)
+    while pending:
+        source_var = pending.pop()
+        source_name, source_line = tainted[source_var]
+        for target, line in dependencies.get(source_var, ()):
+            if target in tainted:
                 continue
-            for expr, line, _pos, _op in entries:
-                for other, (source_name, src_line) in list(tainted.items()):
-                    if _word_in(other, expr):
-                        tainted[name] = (source_name, line or src_line)
-                        changed = True
-                        break
-                if name in tainted:
-                    break
-        if not changed:
-            break
+            tainted[target] = (source_name, line or source_line)
+            if target not in visited:
+                pending.append(target)
+                visited.add(target)
     return tainted
 
 

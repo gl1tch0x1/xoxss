@@ -23,6 +23,20 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
         coverage_notes.append("Browser execution verification was disabled by configuration")
     elif not browser_available:
         coverage_notes.append("Browser execution verification was requested but no browser worker started")
+    if not bool(getattr(args, "crawl", False)):
+        coverage_notes.append("Crawling was disabled; only the target and enabled recon seeds were scanned")
+    if not bool(getattr(args, "browser_discovery", False)):
+        coverage_notes.append("Runtime SPA route and XHR/fetch discovery was disabled")
+    if not bool(getattr(args, "stored", False)):
+        coverage_notes.append("Stored-XSS follow-up checks were disabled")
+    if not bool(getattr(args, "dom_source_probes", False)):
+        coverage_notes.append("Storage, window.name, and postMessage DOM source probes were disabled")
+    if not bool(getattr(args, "external_tools", False)):
+        coverage_notes.append("Optional external recon and verification tools were disabled")
+    if not getattr(args, "auth_state", None) and not (
+        getattr(args, "headers", None) or getattr(args, "cookies", None)
+    ):
+        coverage_notes.append("No authenticated session material was supplied; access-controlled routes may be missing")
     if scanner.stats.truncated_responses:
         coverage_notes.append(
             f"{scanner.stats.truncated_responses} response(s) were truncated at the configured byte limit"
@@ -31,6 +45,22 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
         coverage_notes.append(
             f"{scanner.stats.errors} HTTP request(s) failed; affected endpoints may have incomplete coverage"
         )
+    if scanner.stats.urls_failed:
+        coverage_notes.append(
+            f"{scanner.stats.urls_failed} URL(s) did not complete and remain retryable in the checkpoint"
+        )
+    if scanner.mutation_findings:
+        coverage_notes.append(
+            f"{len(scanner.mutation_findings)} response transformation(s) were observed; these are signals, not XSS findings"
+        )
+    recon_errors = scanner.state.extra.get("recon_errors", [])
+    if recon_errors:
+        coverage_notes.append(f"{len(recon_errors)} optional recon source(s) failed; successful sources continued")
+    statuses = getattr(scanner.state, "url_status", {})
+    status_counts: Dict[str, int] = {}
+    for status in statuses.values():
+        name = str(status.get("status", "unknown")) if isinstance(status, dict) else "unknown"
+        status_counts[name] = status_counts.get(name, 0) + 1
     return {
         "tool": APP_NAME,
         "version": VERSION,
@@ -45,6 +75,16 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
             "http_errors": scanner.stats.errors,
             "truncated_responses": scanner.stats.truncated_responses,
         },
+        "coverage": {
+            "url_status_counts": status_counts,
+            "failed_urls": [
+                {"url": url, **status}
+                for url, status in statuses.items()
+                if isinstance(status, dict) and status.get("status") == "failed"
+            ][:5000],
+            "recon_errors": recon_errors[:100] if isinstance(recon_errors, list) else [],
+            "browser_discovered_requests": scanner.state.extra.get("browser_discovered_requests", [])[:5000],
+        },
         "waf": scanner.waf.names,
         "waf_blocking": scanner.waf.blocking,
         "stats": asdict(scanner.stats),
@@ -58,6 +98,8 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
             ],
             "external_tools": scanner.external_summary,
             "js_intel": [intel.to_dict() for intel in scanner.js_intel[:25]],
+            "endpoint_sources": scanner.state.extra.get("endpoint_sources", {}),
+            "external_parameters": scanner.state.extra.get("external_parameters", {}),
         },
         "oob": scanner.oob.to_dict() if scanner.oob is not None else {},
         "external_findings": [item.to_dict() for item in scanner.external_findings],
@@ -83,6 +125,7 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
         "graphql": scanner.graphql_endpoints,
         "blind_markers": scanner.blind_markers,
         "findings": [finding.to_dict() for finding in scanner.findings],
+        "transformation_observations": scanner.mutation_findings[:1000],
     }
 
 

@@ -688,48 +688,68 @@ class ExternalToolkit:
             wordlist_handle.write("\n".join(names) + "\n")
         wordlist = wordlist_handle.name
         try:
-            for url in list(dict.fromkeys(urls))[: min(10, self.max_results)]:
-                if self.enabled("arjun"):
-                    handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-                    output_path = handle.name
-                    handle.close()
-                    try:
-                        result = await self.runner.run(
-                            "arjun",
-                            ["-u", url, "-m", "GET", "--disable-redirects", "-oJ", output_path],
-                            timeout=self.timeout,
-                        )
+            semaphore = asyncio.Semaphore(4)
+
+            async def inspect_url(url: str) -> Dict[str, Set[str]]:
+                found: Dict[str, Set[str]] = {}
+                async with semaphore:
+                    if self.enabled("arjun"):
+                        handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+                        output_path = handle.name
+                        handle.close()
                         try:
-                            exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
-                        except OSError:
-                            exported = ""
-                        for found_url, params in parse_arjun_json(exported or result.stdout).items():
-                            merged.setdefault(found_url, set()).update(params)
-                    finally:
+                            result = await self.runner.run(
+                                "arjun",
+                                ["-u", url, "-m", "GET", "--disable-redirects", "-oJ", output_path],
+                                timeout=self.timeout,
+                            )
+                            try:
+                                exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
+                            except OSError:
+                                exported = ""
+                            for found_url, params in parse_arjun_json(exported or result.stdout).items():
+                                found.setdefault(found_url, set()).update(params)
+                        except Exception as exc:
+                            self.console.debug(f"arjun failed for {url}: {exc}")
+                        finally:
+                            try:
+                                os.unlink(output_path)
+                            except OSError:
+                                pass
+                    if self.enabled("x8"):
+                        handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+                        output_path = handle.name
+                        handle.close()
                         try:
-                            os.unlink(output_path)
-                        except OSError:
-                            pass
-                if self.enabled("x8"):
-                    handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-                    output_path = handle.name
-                    handle.close()
-                    try:
-                        result = await self.runner.run(
-                            "x8", ["-u", url, "-w", wordlist, "-O", "json", "-o", output_path],
-                            timeout=self.timeout,
-                        )
-                        try:
-                            exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
-                        except OSError:
-                            exported = ""
-                        for found_url, params in parse_x8_json(exported or result.stdout, url).items():
-                            merged.setdefault(found_url, set()).update(params)
-                    finally:
-                        try:
-                            os.unlink(output_path)
-                        except OSError:
-                            pass
+                            result = await self.runner.run(
+                                "x8", ["-u", url, "-w", wordlist, "-O", "json", "-o", output_path],
+                                timeout=self.timeout,
+                            )
+                            try:
+                                exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
+                            except OSError:
+                                exported = ""
+                            for found_url, params in parse_x8_json(exported or result.stdout, url).items():
+                                found.setdefault(found_url, set()).update(params)
+                        except Exception as exc:
+                            self.console.debug(f"x8 failed for {url}: {exc}")
+                        finally:
+                            try:
+                                os.unlink(output_path)
+                            except OSError:
+                                pass
+                return found
+
+            results = await asyncio.gather(*(
+                inspect_url(url)
+                for url in list(dict.fromkeys(urls))[: min(100, self.max_results)]
+            ), return_exceptions=True)
+            for result in results:
+                if not isinstance(result, dict):
+                    self.console.debug(f"External parameter worker failed: {result}")
+                    continue
+                for found_url, params in result.items():
+                    merged.setdefault(found_url, set()).update(params)
         finally:
             try:
                 os.unlink(wordlist)

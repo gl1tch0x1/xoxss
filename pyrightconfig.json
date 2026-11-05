@@ -1,5 +1,13 @@
 {
-  "include": ["xoxss.py", "xoxss/core/config.py", "xoxss/reports/sarif.py"],
+  "include": [
+    "xoxss.py",
+    "xoxss/scanner.py",
+    "xoxss/core/config.py",
+    "xoxss/core/browser.py",
+    "xoxss/tools/external.py",
+    "xoxss/analysis/ast_taint.py",
+    "xoxss/reports"
+  ],
   "exclude": ["**/__pycache__", ".venv"],
   "venvPath": ".",
   "venv": ".venv"

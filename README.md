@@ -82,6 +82,9 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
   binary "vulnerable" label.
 - Runtime prototype pollution with marker proof, gadget fingerprinting and
   gadget-specific exploit URLs.
+- Optional, bounded input-transformation probes for Unicode normalization,
+  multi-pass decoding, byte-mask and multibyte behavior; observations can guide
+  constraint-driven payload variants without being reported as XSS by themselves.
 - Mutation XSS (mXSS) hints from sanitizer and version detection.
 - Vulnerable-JavaScript-library detection from URLs and bundle contents.
 
@@ -95,8 +98,8 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 - OpenAPI/Swagger discovery, including path parameters and JSON/form request bodies.
 - Passive subdomain enumeration (crt.sh, certspotter, HackerTarget, OTX, urlscan) and
   historic URL mining (Wayback, Common Crawl, urlscan, OTX).
-- Parameter audit combining collector-style Wayback harvesting with Gxss-style
-  one-parameter-at-a-time reflection probing, ranked by parameter risk and usage.
+- Parameter audit combining collector-style Wayback harvesting with bounded batches
+  of unique reflection markers, dynamic controls and response-delta bisection.
 - Internal path fuzzing with soft-404 detection, hidden-parameter mining, and parameter
   fuzzing on endpoints that expose no query string.
 - Optional orchestration of installed `subfinder`, `gau`, `waybackurls`, `katana`,
@@ -149,9 +152,10 @@ flowchart TD
     G --> H{"Executable reflection?"}
     H -->|no| I["Discard<br/>or low-confidence report (opt-in)"]
     H -->|yes| J["Context payloads<br/>Corpus, tamper, encoders"]
-    J --> K{"Browser available?"}
-    K -->|no| L["HTTP evidence<br/>high confidence"]
-    K -->|yes| M["Browser confirmation<br/>Markers, sinks, dialogs"]
+    J --> K{"Passes context, MIME<br/>and static dead-zone gate?"}
+    K -->|no| L["HTTP evidence<br/>or discard"]
+    K -->|yes, browser available| M["Browser confirmation<br/>Markers, sinks, dialogs"]
+    K -->|yes, unavailable| L
     M --> N{"Execution observed?"}
     N -->|yes| O["Confirmed finding"]
     N -->|no| L
@@ -169,13 +173,15 @@ flowchart TD
    with a method, parameter, page URL and optional JSON body.
 3. **Probe.** A unique token plus special characters is sent. The response is aligned
    with the sent payload to determine the context and whether `<`, `>`, quotes, `=` and
-   parentheses survived.
+   parentheses survived. Optional `--mutation-probes` measures bounded normalization
+   and decoding behavior; `--adaptive-payloads` adds variants from observed constraints.
 4. **Payload selection.** Context-specific templates are rendered with a second unique
    marker; a controlled share of slots comes from the remote corpus, local corpora fill
    the rest.
 5. **HTTP evidence.** If a payload is reflected unescaped, the finding is `high`
    confidence when browser verification is unavailable or inconclusive.
-6. **Browser confirmation.** GET points are navigated; forms are filled and submitted.
+6. **Browser confirmation.** Candidates must pass the context, MIME and static
+   dead-zone gate before browser work. GET points are navigated; forms are filled and submitted.
    The scanner checks `window.__xoxss_hits`, intercepted dialogs and instrumented
    sinks. Execution upgrades the finding to `confirmed`.
 7. **Persistence and reporting.** Findings are deduplicated by family, URL, parameter,
@@ -426,6 +432,9 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--proxy URL` / `--insecure` | HTTP(S) proxy / disable TLS verification (authorized targets only). |
 | `--max-response-bytes N` | Maximum response body size analyzed (default `5242880`). |
 | `--headers "Name: Value"` / `--cookies "a=b; c=d"` | Extra headers and cookies for HTTP probes. |
+| `--auth-state PATH` | Playwright storage-state JSON for browser discovery/verification and scoped HTTP cookies. |
+| `--mutation-probes` / `--mutation-probe-limit N` | Opt in to bounded Unicode, decoding, byte-mask and multibyte transformation probes. |
+| `--adaptive-payloads` | Add bounded syntax variants using observed delimiter constraints. |
 | `-o, --output PATH` | Mirror the console log to a file. |
 | `--report LIST` | `json`, `md`, `html`, `sarif`, combinations, `all`, or `none` (default `all`). |
 | `--report-dir DIR` / `--state-dir DIR` | Report root / checkpoint root (default `.xoxss`). |
@@ -436,8 +445,8 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--doctor` / `--list-payloads` / `--list-tampers` / `--list-encoders` / `--version` | Diagnostics and registry inspection. |
 
 > [!NOTE]
-> `--headers` and `--cookies` apply to HTTP requests. Browser verification does not
-> inherit them. Cross-origin redirects are stopped to keep credentials and scan traffic
+> `--headers` and `--cookies` apply to HTTP requests. Use `--auth-state` to provide
+> Playwright cookies to browser and HTTP sessions. Cross-origin redirects are stopped to keep credentials and scan traffic
 > on the original origin; redirects are still checked against the configured scope.
 
 ### Mass mode
@@ -472,7 +481,8 @@ browser, download payloads, or create a checkpoint.
 | `--param-subs` / `--param-limit N` | Include subdomains in harvesting (on) / maximum URLs (default `5000`). |
 | `--param-max-checks N` | Maximum parameter names to probe (default `10000`). |
 | `--param-marker STRING` | Alphanumeric marker prefix (default `XoxssReflect`). |
-| `--param-data BODY` | POST form body for Gxss-style checks, e.g. `user=test&pass=test`. |
+| `--param-batch-size N` | Unique markers per GET request (default `100`, maximum `100`). |
+| `--param-data BODY` | POST form body for reflection checks, e.g. `user=test&pass=test`. |
 | `--param-output PATH` / `--jsonl PATH` | JSON audit report / one candidate object per line. |
 
 The audit JSON contains `mode`, `targets`, `source`, `stats`, `errors` and a
@@ -483,10 +493,11 @@ The audit JSON contains `mode`, `targets`, `source`, `stats`, `errors` and a
 exits `2` when any parameter reflects.
 
 When Arjun or x8 is installed, the main discovery flow can also add their hidden query
-parameter names to the scanner's candidate set. Reflection probes compare two benign
-control responses first and record response drift as baseline evidence; a drifting
-baseline does not discard a candidate because that alone cannot establish whether a
-reflection is safe or exploitable.
+parameter names to the scanner's candidate set. GET reflection probes batch unique
+markers and compare against two benign controls. Response-delta bisection is used when
+a batch changes the response without reflecting any marker. Dynamic baselines are
+recorded so response drift does not become reflection evidence by itself. POST checks
+remain one parameter per request.
 
 ## Recipes
 
@@ -744,10 +755,43 @@ use collectors you control.
 
 ## Architecture
 
+The current codebase is split into focused analysis, recon, reporting and browser
+modules. `scanner.py` remains the CLI and orchestration hub and still owns the shared
+HTTP engine and scan coordinator.
+
+```mermaid
+flowchart LR
+    CLI["CLI and stdin"] --> SCAN["scanner.py<br/>scope, HTTP and coordinator"]
+    SCAN --> RECON["recon modules<br/>passive, JS, OpenAPI"]
+    SCAN --> PARAM["scan/parameters.py<br/>batch, controls, bisection"]
+    SCAN --> REFLECT["scan/reflection.py<br/>context and browser gate"]
+    SCAN --> ANALYSIS["analysis modules<br/>taint, mutation, DOM and protocol checks"]
+    SCAN --> BROWSER["core/browser.py<br/>Playwright and Selenium"]
+    SCAN --> REPORTS["reports modules<br/>JSON, HTML, Markdown and SARIF"]
+    SCAN --> STATE["checkpoint and events"]
+```
+
+The parameter-audit batching path is:
+
+```mermaid
+flowchart TD
+    C["Ranked parameter candidates"] --> B["Bounded GET batch<br/>unique marker per name"]
+    B --> CTRL["Two benign control responses"]
+    CTRL --> DYN{"Baseline dynamic?"}
+    DYN --> RESP["Compare batch response<br/>against controls"]
+    RESP --> HIT{"Unique marker reflected?"}
+    HIT -->|yes| ATTR["Attribute reflection to exact parameter"]
+    HIT -->|no| DELTA{"Stable response delta?"]
+    DELTA -->|yes| SPLIT["Bisect candidate batch"]
+    SPLIT --> B
+    DELTA -->|no| MISS["Mark candidates unreflected"]
+    DYN -. annotate evidence .-> ATTR
+```
+
 ```text
 xoxss.py                  compatibility entry point for `python xoxss.py`
 xoxss/
-  scanner.py              CLI, HTTP engine, scan coordinator, reporting
+  scanner.py              CLI, shared HTTP engine and scan coordinator
   core/
     browser.py            Selenium and Playwright backends
     config.py             typed configuration schema (CLI remains authoritative)
@@ -761,6 +805,8 @@ xoxss/
   analysis/
     ast_taint.py          JavaScript source-to-sink flow analysis
     proto_pollution.py    static hints, probes, gadgets, exploit URLs
+    mutation_probe.py     bounded response transformation observations
+    payload_grammar.py    constraint-driven payload variants
     jsonp.py csp.py cors.py mxss.py
     dom_clobbering.py trusted_types.py graphql.py
     websocket.py file_upload.py postmessage.py
@@ -776,7 +822,8 @@ xoxss/
     poller.py             HTTP and file pollers
   scan/
     fuzzer.py             path fuzzing, wordlists, parameter mining
-    parameters.py         collector-style harvest + Gxss-style reflection probe
+    parameters.py         harvest + batched reflection probe and controls
+    reflection.py         reflection context and browser prequalification gate
   tools/
     external.py           optional recon, parameter discovery and XSS tool adapters
   reports/
@@ -917,8 +964,8 @@ unconfirmed finding promoted to `confirmed` without evidence.
   are reported as `medium` by design.
 - **Stored XSS is persistence evidence**: re-fetched pages are checked over HTTP, but
   the stored payload is not re-executed in a second browser session.
-- **Browser verification does not inherit CLI cookies/headers**; use a proxy or an
-  unauthenticated flow.
+- **Browser verification does not inherit arbitrary CLI headers**. `--auth-state`
+  loads Playwright storage-state cookies into HTTP and browser sessions.
 - **Prototype-pollution gadgets are finite**; known gadgets are fingerprinted, but
   arbitrary chains are not synthesized.
 - **Advanced analyzers are heuristics** (mXSS, CSP, CORS, clobbering, Trusted Types,

@@ -1,16 +1,16 @@
 """
-Parameter intelligence: collector-style URL harvesting and Gxss-style
-per-parameter reflection probing.
+Parameter intelligence: collector-style URL harvesting and batched reflection
+probing with dynamic controls and response-delta bisection.
 
 Two upstream ideas are implemented here:
 
 * **collector** (thenurhabib/collector) – pull historic URLs for a domain from
   the Wayback CDX API (optionally including subdomains), then extract every GET
   parameter name and the URLs that use it.
-* **Gxss** (KathanP19/Gxss) – test parameters *one at a time* by substituting a
-  unique marker, requesting the URL without following redirects, and checking
-  whether the marker is reflected.  This avoids the classic "replace every
-  parameter at once" blind spot.
+* **Batched reflection probing** – group unique markers into bounded requests,
+  compare against two benign controls, and bisect only when a response changes
+  without revealing which candidate caused it. Directly reflected markers are
+  attributed exactly, while dynamic pages are flagged for cautious triage.
 
 The result is a ranked list of parameter candidates with reflection evidence
 that can be fed into the main scanner or triaged on its own.
@@ -385,7 +385,7 @@ class ParameterHarvester:
 
 
 class ReflectionProbe:
-    """Gxss-style one-parameter-at-a-time reflection checker."""
+    """Batch-first reflection checker with adaptive bisection for behavior deltas."""
 
     def __init__(
         self,
@@ -395,6 +395,7 @@ class ReflectionProbe:
         marker: str = "XoxssReflect",
         concurrency: int = 10,
         urls_per_param: int = 3,
+        batch_size: int = 100,
     ):
         self.http = http
         self.console = console
@@ -402,6 +403,7 @@ class ReflectionProbe:
         self.marker = "".join(char for char in raw_marker if char.isalnum()) or "XoxssReflect"
         self.concurrency = max(1, concurrency)
         self.urls_per_param = max(1, urls_per_param)
+        self.batch_size = min(100, max(1, int(batch_size)))
         self.detector = ContextDetector()
 
     def _new_marker(self) -> str:
@@ -460,6 +462,9 @@ class ReflectionProbe:
             if not post_pairs:
                 self.console.warn("POST reflection data could not be parsed; falling back to GET")
                 post_pairs = None
+
+        if post_pairs is None:
+            return await self._probe_get_batches(candidates)
 
         async def probe(candidate: ParameterCandidate) -> ParameterCandidate:
             async with semaphore:
@@ -561,6 +566,216 @@ class ReflectionProbe:
                 important=False,
             )
         return updated
+
+    @staticmethod
+    def _base_key(url: str) -> Tuple[str, str, str]:
+        parts = urlsplit(url)
+        return parts.scheme.lower(), parts.netloc.lower(), parts.path or "/"
+
+    @staticmethod
+    def _query_url(
+        base_url: str,
+        existing: Sequence[Tuple[str, str]],
+        values: Dict[str, str],
+    ) -> str:
+        replaced = [(key, value) for key, value in existing if key not in values]
+        replaced.extend(values.items())
+        parts = urlsplit(base_url)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", urlencode(replaced), parts.fragment))
+
+    @staticmethod
+    def _normalized_body(text: str, markers: Sequence[str]) -> str:
+        for marker in markers:
+            text = text.replace(marker, "<XOXSS_MARKER>")
+        return text[:50000]
+
+    def _response_changed(self, response: Any, baselines: Sequence[Any], markers: Sequence[str], dynamic: bool) -> bool:
+        if not baselines:
+            return False
+        status = int(getattr(response, "status", 0) or 0)
+        content_type = str(getattr(response, "headers", {}).get("content-type", "")).split(";", 1)[0].lower()
+        body = self._normalized_body(str(getattr(response, "text", "") or ""), markers)
+        threshold = 0.90 if dynamic else 0.965
+        changed_against: List[bool] = []
+        for baseline in baselines:
+            base_status = int(getattr(baseline, "status", 0) or 0)
+            base_type = str(getattr(baseline, "headers", {}).get("content-type", "")).split(";", 1)[0].lower()
+            base_body = self._normalized_body(str(getattr(baseline, "text", "") or ""), markers)
+            if status != base_status or (content_type and base_type and content_type != base_type):
+                changed_against.append(True)
+                continue
+            similarity = SequenceMatcher(None, body, base_body, autojunk=True).ratio()
+            changed = similarity < threshold
+            length_delta = abs(len(body) - len(base_body))
+            if length_delta > max(48, int(max(len(body), len(base_body), 1) * (0.12 if dynamic else 0.06))):
+                changed = True
+            changed_against.append(changed)
+        # Dynamic pages must differ from both controls before a noisy response
+        # is allowed to trigger a potentially expensive bisection tree.
+        return bool(changed_against) and all(changed_against)
+
+    async def _probe_get_batches(
+        self, candidates: Sequence[ParameterCandidate]
+    ) -> List[ParameterCandidate]:
+        """Probe up to 100 distinct names/request; bisect only buckets with a response delta."""
+        groups: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        candidate_groups: Dict[Tuple[str, str, str], Dict[str, ParameterCandidate]] = {}
+        for candidate in candidates:
+            candidate.reflected = False
+            urls = candidate.urls or ([candidate.sample_url] if candidate.sample_url else [])
+            for url in urls[: self.urls_per_param]:
+                try:
+                    parts = urlsplit(_clean_url(url))
+                except ValueError:
+                    continue
+                if not parts.scheme or not parts.netloc:
+                    continue
+                key = self._base_key(url)
+                entry = groups.setdefault(key, {"url": url, "pairs": []})
+                existing = entry["pairs"]
+                for pair in _query_pairs(url):
+                    if pair not in existing:
+                        existing.append(pair)
+                candidate_groups.setdefault(key, {})[candidate.name] = candidate
+
+        semaphore = asyncio.Semaphore(self.concurrency)
+
+        async def probe_group(key: Tuple[str, str, str]) -> None:
+            group = groups[key]
+            base_url = str(group["url"])
+            existing: List[Tuple[str, str]] = list(group["pairs"])
+            by_name = candidate_groups[key]
+            control_name = "__xoxss_control_" + uuid.uuid4().hex[:8]
+            baselines: List[Any] = []
+            control_markers = [self._new_marker(), self._new_marker()]
+            async with semaphore:
+                for marker in control_markers:
+                    control_url = self._query_url(base_url, existing, {control_name: marker})
+                    try:
+                        response = await self.http.get(control_url, allow_redirects=False, cache=False)
+                    except Exception:
+                        continue
+                    if not getattr(response, "error", None):
+                        baselines.append(response)
+                baseline_similarity: Optional[float] = None
+                baseline_dynamic = len(baselines) < 2
+                if len(baselines) == 2:
+                    first_body = self._normalized_body(str(getattr(baselines[0], "text", "") or ""), control_markers)
+                    second_body = self._normalized_body(str(getattr(baselines[1], "text", "") or ""), control_markers)
+                    baseline_similarity = SequenceMatcher(None, first_body, second_body, autojunk=True).ratio()
+                    baseline_dynamic = (
+                        getattr(baselines[0], "status", 0) != getattr(baselines[1], "status", 0)
+                        or baseline_similarity < 0.985
+                    )
+                for candidate in by_name.values():
+                    if candidate.baseline_similarity is None:
+                        candidate.baseline_similarity = baseline_similarity
+                    candidate.baseline_dynamic = baseline_dynamic
+
+                async def probe_bucket(bucket: Sequence[ParameterCandidate]) -> None:
+                    if not bucket:
+                        return
+                    markers = {item.name: self._new_marker() for item in bucket}
+                    probe_url = self._query_url(base_url, existing, markers)
+                    try:
+                        response = await self.http.get(probe_url, allow_redirects=False, cache=False)
+                    except Exception as exc:
+                        for item in bucket:
+                            item.evidence = f"batched request failed: {exc}"[:300]
+                        return
+                    if getattr(response, "error", None):
+                        for item in bucket:
+                            item.evidence = f"batched request failed: {response.error}"[:300]
+                        return
+                    text = str(getattr(response, "text", "") or "")
+                    remaining: List[ParameterCandidate] = []
+                    reflected_names: Set[str] = set()
+                    for item in bucket:
+                        marker = markers[item.name]
+                        item.method = "GET"
+                        item.probe_url = probe_url
+                        item.status = int(getattr(response, "status", 0) or 0)
+                        if marker in text:
+                            reflected_names.add(item.name)
+                            item.reflected = True
+                            index = text.find(marker)
+                            try:
+                                analysis = self.detector.detect_context(text, index, marker)
+                                item.context = analysis.context_type.name.lower()
+                                context_evidence = f", context {item.context}, confidence {analysis.confidence:.2f}"
+                            except Exception:
+                                context_evidence = ""
+                            item.evidence = f"unique batch marker reflected (HTTP {item.status}{context_evidence})"
+                        else:
+                            remaining.append(item)
+                    if not remaining:
+                        return
+                    if reflected_names:
+                        for item in remaining:
+                            item.evidence = (
+                                "no unique marker reflection in this batch; "
+                                "other parameters in the batch reflected"
+                            )
+                        return
+                    changed = self._response_changed(response, baselines, list(markers.values()), baseline_dynamic)
+                    if changed and len(remaining) > 1:
+                        midpoint = len(remaining) // 2
+                        await probe_bucket(remaining[:midpoint])
+                        await probe_bucket(remaining[midpoint:])
+                    elif changed:
+                        remaining[0].evidence = (
+                            f"parameter changed the batched response without reflecting its marker "
+                            f"(HTTP {remaining[0].status})"
+                        )
+                    else:
+                        for item in remaining:
+                            item.evidence = f"marker not reflected; no response delta (HTTP {item.status})"
+
+                ordered = sorted(by_name.values(), key=lambda item: (item.risk != "high", item.name))
+                buckets: List[List[ParameterCandidate]] = []
+                current: List[ParameterCandidate] = []
+                for item in ordered:
+                    candidate_bucket = [*current, item]
+                    marker_values = {
+                        candidate.name: "X" * 20 for candidate in candidate_bucket
+                    }
+                    candidate_url = self._query_url(base_url, existing, marker_values)
+                    if current and (
+                        len(candidate_bucket) > self.batch_size or len(candidate_url) > 6000
+                    ):
+                        buckets.append(current)
+                        current = [item]
+                    else:
+                        current = candidate_bucket
+                    if len(current) == 1:
+                        single_url = self._query_url(
+                            base_url, existing, {item.name: "X" * 20}
+                        )
+                        if len(single_url) > 6000:
+                            item.evidence = "candidate URL exceeds the 6000-character batch safety limit"
+                            current = []
+                if current:
+                    buckets.append(current)
+                for bucket in buckets:
+                    await probe_bucket(bucket)
+
+        group_results = await asyncio.gather(
+            *(probe_group(key) for key in groups), return_exceptions=True
+        )
+        for key, result in zip(groups, group_results):
+            if isinstance(result, Exception):
+                self.console.warn(
+                    f"Parameter batch failed for {groups[key]['url']}: {str(result)[:200]}"
+                )
+        result = list(candidates)
+        reflected = sum(1 for item in result if item.reflected)
+        if result:
+            self.console.info(
+                f"Batched reflection probe: {reflected}/{len(result)} reflecting parameter(s) "
+                f"(batch size {self.batch_size})",
+                important=False,
+            )
+        return result
 
 
 __all__ = [

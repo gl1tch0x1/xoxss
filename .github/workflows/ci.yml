@@ -31,7 +31,7 @@ jobs:
           python -m xoxss --version
           python -m xoxss --list-encoders >/dev/null
           python -m xoxss --list-tampers >/dev/null
-          python -m xoxss --doctor || true
+          python -m xoxss --doctor
 
       - name: Static type checks
         run: pyright

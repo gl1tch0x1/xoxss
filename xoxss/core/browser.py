@@ -39,6 +39,7 @@ HOOK_JS = r"""
     window.__xoxss_hits = window.__xoxss_hits || [];
     window.__xoxss_alerts = window.__xoxss_alerts || [];
     window.__xoxss_sinks = window.__xoxss_sinks || [];
+    window.__xoxss_requests = window.__xoxss_requests || [];
     window.__xoxss_errors = window.__xoxss_errors || [];
 
     var record = function (name, value) {
@@ -49,6 +50,42 @@ HOOK_JS = r"""
         window.__xoxss_sinks.push({ sink: name, value: text });
       } catch (e) {}
     };
+    var recordRequest = function (value) {
+      try {
+        var text = String(value || '');
+        if (!/^https?:\/\//i.test(text)) { text = new URL(text, location.href).href; }
+        if (window.__xoxss_requests.length < 5000 && window.__xoxss_requests.indexOf(text) < 0) {
+          window.__xoxss_requests.push(text);
+        }
+      } catch (e) {}
+    };
+
+    try {
+      var originalFetch = window.fetch;
+      if (originalFetch) {
+        window.fetch = function (input) {
+          recordRequest(input && input.url ? input.url : input);
+          return originalFetch.apply(this, arguments);
+        };
+      }
+      var originalOpen = XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open = function (method, url) {
+        recordRequest(url);
+        return originalOpen.apply(this, arguments);
+      };
+      var originalPushState = history.pushState;
+      history.pushState = function () {
+        var result = originalPushState.apply(this, arguments);
+        recordRequest(location.href);
+        return result;
+      };
+      var originalReplaceState = history.replaceState;
+      history.replaceState = function () {
+        var result = originalReplaceState.apply(this, arguments);
+        recordRequest(location.href);
+        return result;
+      };
+    } catch (e) {}
 
     window.alert = function (msg) {
       try { window.__xoxss_alerts.push(String(msg)); } catch (e) {}
@@ -128,6 +165,27 @@ HOOK_JS = r"""
         return originalInsert.apply(this, arguments);
       };
     } catch (e) {}
+
+    try {
+      var originalSetAttribute = Element.prototype.setAttribute;
+      Element.prototype.setAttribute = function (name, value) {
+        var attr = String(name || '').toLowerCase();
+        if (attr === 'srcdoc' || attr === 'style' || /^on[a-z]+$/.test(attr)) {
+          record('setAttribute:' + attr, value);
+        }
+        return originalSetAttribute.apply(this, arguments);
+      };
+      var originalFragment = Range.prototype.createContextualFragment;
+      Range.prototype.createContextualFragment = function (markup) {
+        record('createContextualFragment', markup);
+        return originalFragment.apply(this, arguments);
+      };
+      var originalParse = DOMParser.prototype.parseFromString;
+      DOMParser.prototype.parseFromString = function (source, type) {
+        record('DOMParser.parseFromString:' + type, source);
+        return originalParse.apply(this, arguments);
+      };
+    } catch (e) {}
   } catch (e) {}
 })();
 """
@@ -138,6 +196,7 @@ return {
   alerts: window.__xoxss_alerts || [],
   sinks: window.__xoxss_sinks || [],
   errors: window.__xoxss_errors || [],
+  requests: window.__xoxss_requests || [],
   href: String(location.href || ''),
   title: String(document.title || ''),
   ready: String(document.readyState || '')
@@ -211,6 +270,7 @@ class BrowserEngine:
         binary: Optional[str] = None,
         insecure: bool = False,
         url_allowed: Optional[Callable[[str], bool]] = None,
+        auth_state: Optional[str] = None,
     ):
         self.console = console
         self.kind = (kind or "firefox").lower()
@@ -221,6 +281,7 @@ class BrowserEngine:
         self.binary = binary
         self.insecure = insecure
         self.url_allowed = url_allowed
+        self.auth_state = auth_state
         self.driver: Any = None
         self.navigation_count = 0
         self._lock = asyncio.Lock()
@@ -391,6 +452,8 @@ class BrowserEngine:
         for key in ("hits", "alerts", "sinks", "errors"):
             if not isinstance(data.get(key), list):
                 data[key] = []
+        if not isinstance(data.get("requests"), list):
+            data["requests"] = []
         dialogs = data.get("dialogs")
         if not isinstance(dialogs, list):
             dialogs = []
@@ -529,6 +592,7 @@ class PlaywrightEngine:
         binary: Optional[str] = None,
         insecure: bool = False,
         url_allowed: Optional[Callable[[str], bool]] = None,
+        auth_state: Optional[str] = None,
     ):
         self.console = console
         self.kind = kind or "playwright"
@@ -539,6 +603,7 @@ class PlaywrightEngine:
         self.binary = binary
         self.insecure = insecure
         self.url_allowed = url_allowed
+        self.auth_state = auth_state
         self._lock = asyncio.Lock()
         self._pw: Any = None
         self._browser: Any = None
@@ -547,6 +612,8 @@ class PlaywrightEngine:
         self.navigation_count = 0
         self._dialogs: List[str] = []
         self._page_handler: Any = None
+        self.observed_requests: List[str] = []
+        self.observed_request_details: List[Dict[str, str]] = []
 
     async def _on_dialog(self, dialog: Any) -> None:
         try:
@@ -555,6 +622,25 @@ class PlaywrightEngine:
             pass
         try:
             await dialog.dismiss()
+        except Exception:
+            pass
+
+    def _on_request(self, request: Any) -> None:
+        """Keep a bounded list of app navigation and API request URLs."""
+        try:
+            if request.resource_type not in ("document", "xhr", "fetch"):
+                return
+            url = str(request.url)
+            if url.startswith(("http://", "https://")):
+                if url not in self.observed_requests and len(self.observed_requests) < 5000:
+                    self.observed_requests.append(url)
+                method = str(request.method or "GET").upper()
+                post_data = str(request.post_data or "")[:16000]
+                content_type = str(request.headers.get("content-type", ""))[:200]
+                if method not in ("GET", "HEAD") and len(self.observed_request_details) < 3000:
+                    detail = {"url": url, "method": method, "content_type": content_type, "post_data": post_data}
+                    if detail not in self.observed_request_details:
+                        self.observed_request_details.append(detail)
         except Exception:
             pass
 
@@ -605,6 +691,13 @@ class PlaywrightEngine:
             "ignore_https_errors": self.insecure,
             "viewport": {"width": 1366, "height": 900},
         }
+        if self.auth_state:
+            state_path = Path(self.auth_state).expanduser()
+            if not state_path.is_file():
+                self.console.error(f"Browser auth state does not exist: {state_path}")
+                await self.stop()
+                return False
+            context_options["storage_state"] = str(state_path)
         if self.user_agent:
             context_options["user_agent"] = self.user_agent
         if self.proxy:
@@ -615,6 +708,7 @@ class PlaywrightEngine:
             self.page = await self._context.new_page()
             self.page.set_default_timeout(self.page_timeout * 1000)
             self.page.on("dialog", lambda dialog: asyncio.create_task(self._on_dialog(dialog)))
+            self.page.on("request", self._on_request)
         except Exception as exc:
             self.console.error(f"Playwright context failed: {exc}")
             await self.stop()
@@ -718,6 +812,8 @@ class PlaywrightEngine:
             for key in ("hits", "alerts", "sinks", "errors"):
                 if not isinstance(data.get(key), list):
                     data[key] = []
+            if not isinstance(data.get("requests"), list):
+                data["requests"] = []
             # Playwright's evaluate() routes through window.eval in the page,
             # so our own instrumentation/collection scripts show up as sinks.
             data["sinks"] = [
@@ -729,6 +825,10 @@ class PlaywrightEngine:
                 )
             ]
             data["dialogs"] = list(self._dialogs)
+            data["requests"] = list(dict.fromkeys([
+                *data.get("requests", []), *self.observed_requests
+            ]))[:5000]
+            data["request_details"] = list(self.observed_request_details)
             try:
                 data["html"] = (await self.page.content())[:200000]
             except Exception:

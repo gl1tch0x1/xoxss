@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
 
 from xoxss.reports.common import APP_NAME, VERSION, fmt_duration, now_iso, truncate
+from xoxss.reports.json import report_payload
 
 if TYPE_CHECKING:
     from xoxss.scanner import XSSScanner
@@ -68,6 +69,7 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
         [
             _card("Duration", fmt_duration(scanner.stats.elapsed)),
             _card("URLs", f"{scanner.stats.urls_done}/{scanner.stats.urls_total}"),
+            _card("URLs failed", scanner.stats.urls_failed),
             _card("Endpoints", len(scanner.endpoints)),
             _card("Requests", scanner.stats.requests),
             _card("Payloads", scanner.stats.payloads),
@@ -87,6 +89,26 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
     )
 
     content_parts = []
+
+    coverage_notes = report_payload(scanner).get("coverage_notes", [])
+    if coverage_notes:
+        content_parts.append(
+            "<h2>Coverage notes</h2><ul>"
+            + "".join(f"<li>{html_lib.escape(str(note))}</li>" for note in coverage_notes)
+            + "</ul>"
+        )
+
+    if scanner.mutation_findings:
+        rows = "".join(
+            "<li><code>" + html_lib.escape(str(item.get("name", "")))
+            + "</code> on <code>" + html_lib.escape(str(item.get("parameter", "")))
+            + "</code>: " + html_lib.escape(str(item.get("evidence", ""))) + "</li>"
+            for item in scanner.mutation_findings[:100]
+        )
+        content_parts.append(
+            "<h2>Input transformation observations</h2><ul>" + rows + "</ul>"
+            "<p>These observations are not XSS findings by themselves.</p>"
+        )
 
     if scanner.vulnerable_libs:
         lib_rows = []

@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 HITS = []
+OOB_HITS = []
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -18,11 +19,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         HITS.append(self.path)
         parts = urlsplit(self.path)
+        if parts.path == "/hits":
+            body = json.dumps({"hits": list(OOB_HITS)}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parts.path == "/collect":
             self.send_response(204)
             self.end_headers()
             return
         q = parse_qs(parts.query).get("q", [""])[0]
+        # Model a stored-XSS execution by having the fixture app report the
+        # callback marker when it receives a blind payload. This exercises the
+        # scanner's real polling/correlation path; sending a probe alone must
+        # never count as a confirmed finding.
+        callback = re.search(r"/collect\?m=([A-Za-z0-9_-]{5,80})", q)
+        if callback:
+            OOB_HITS.append(
+                {"marker": callback.group(1), "protocol": "fixture", "raw": q}
+            )
         body = f"<html><body><div>{q}</div></body></html>".encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -48,6 +66,9 @@ def main():
         "--max-payloads", "1",
         "--timeout", "5",
         "--blind", f"http://127.0.0.1:{port}/collect",
+        "--oob-poll", f"http://127.0.0.1:{port}/hits",
+        "--oob-interval", "1",
+        "--oob-wait", "2",
         "--report", "json,sarif,md,html",
         "--report-dir", out,
         "--quiet",

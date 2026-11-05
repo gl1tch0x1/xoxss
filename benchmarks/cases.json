@@ -1,0 +1,21 @@
+{
+  "schema": 1,
+  "purpose": "repeatable authorized XSS coverage and false-positive benchmark",
+  "cases": [
+    {"id": "reflected-html-text", "class": "reflected", "context": "html-text", "expected": "confirmed-or-high"},
+    {"id": "reflected-html-attribute", "class": "reflected", "context": "quoted-attribute", "expected": "confirmed-or-high"},
+    {"id": "reflected-script-string", "class": "reflected", "context": "javascript-string", "expected": "confirmed-or-high"},
+    {"id": "reflected-json", "class": "reflected", "context": "json-script", "expected": "candidate-with-context-evidence"},
+    {"id": "dom-location-search", "class": "dom", "source": "location.search", "sink": "innerHTML", "expected": "runtime-sink-or-execution"},
+    {"id": "dom-location-hash", "class": "dom", "source": "location.hash", "sink": "insertAdjacentHTML", "expected": "runtime-sink-or-execution"},
+    {"id": "dom-local-storage", "class": "dom", "source": "localStorage", "sink": "innerHTML", "expected": "runtime-sink-or-execution"},
+    {"id": "dom-session-storage", "class": "dom", "source": "sessionStorage", "sink": "outerHTML", "expected": "runtime-sink-or-execution"},
+    {"id": "dom-window-name", "class": "dom", "source": "window.name", "sink": "document.write", "expected": "runtime-sink-or-execution"},
+    {"id": "dom-postmessage", "class": "dom", "source": "message.data", "sink": "DOMParser.parseFromString", "expected": "runtime-sink-or-execution"},
+    {"id": "stored-user-content", "class": "stored", "context": "admin-or-rendered-view", "expected": "confirmed-after-second-request"},
+    {"id": "authenticated-route", "class": "access-control", "context": "Playwright-storage-state", "expected": "route-discovered-and-scanned"},
+    {"id": "escaped-reflection-control", "class": "negative", "context": "html-escaped", "expected": "no-confirmed-xss"},
+    {"id": "sanitized-dom-control", "class": "negative", "context": "trusted-sanitizer", "expected": "no-confirmed-xss"},
+    {"id": "static-token-control", "class": "negative", "context": "non-executable-reflection", "expected": "no-confirmed-xss"}
+  ]
+}
