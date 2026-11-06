@@ -25,6 +25,8 @@ class ReflectionInfo:
     distortion: float = 0.0
     marker: str = ""
     static_dead_zone: bool = False
+    inert_reason: str = ""
+    encoded_specials: List[str] = field(default_factory=list)
 
 
 SPECIAL_CHARS = "<>\"'`()=/\\ \t\r\n"
@@ -33,7 +35,13 @@ SPECIAL_CHARS = "<>\"'`()=/\\ \t\r\n"
 def analyze_reflection(
     body: str, token: str, sent_payload: str, content_type: str = ""
 ) -> ReflectionInfo:
-    """Locate a marker and infer its response context and delimiter survival."""
+    """Locate a marker and infer its response context and delimiter survival.
+
+    Survival is position-aware: only characters that land at the corresponding
+    offset after the marker count.  Reflections inside ``<textarea>``/HTML
+    comments are inert unless the payload itself closes the region, and
+    entity-encoded output (``&lt;``) is never treated as executable.
+    """
     info = ReflectionInfo()
     if not body:
         return info
@@ -44,20 +52,29 @@ def analyze_reflection(
             return info
 
     after = body[index + len(token):]
-    marker_offset = sent_payload.find(token) if token in sent_payload else -1
-    context_index = index - marker_offset if marker_offset >= 0 else index
-    context_index = max(0, min(context_index, len(body) - 1))
+    # Classify the marker's *own* position.  Using the start of the reflected
+    # payload would misclassify breakout payloads: ``--><script>TOKEN`` begins
+    # inside a comment but the marker itself is already outside it.
+    context_index = max(0, min(index, len(body) - 1))
     context_before = body[:context_index]
     low_before = context_before.lower()
     context = "html"
     in_comment = low_before.rfind("<!--") > low_before.rfind("-->")
+    in_textarea = low_before.rfind("<textarea") > low_before.rfind("</textarea")
     in_script = low_before.rfind("<script") > low_before.rfind("</script")
     in_style = low_before.rfind("<style") > low_before.rfind("</style")
     last_lt, last_gt = context_before.rfind("<"), context_before.rfind(">")
     in_tag = last_lt > last_gt
 
-    if in_comment:
+    tail_sent = sent_payload[sent_payload.find(token) + len(token):] if token in sent_payload else ""
+    tail_recv = after[: max(1, len(tail_sent) + 8)]
+    comment_breakout = bool(in_comment and "-->" in tail_recv)
+    textarea_breakout = bool(in_textarea and "</textarea" in tail_recv.lower())
+
+    if in_comment and not comment_breakout:
         context = "comment"
+    elif in_textarea and not textarea_breakout:
+        context = "textarea"
     elif in_script:
         context = "script"
     elif in_style:
@@ -91,25 +108,40 @@ def analyze_reflection(
                 "JAVASCRIPT_STRING_SINGLE": "script", "JAVASCRIPT_TEMPLATE": "script",
                 "JAVASCRIPT_CODE": "script", "TEMPLATE_LITERAL": "script",
                 "JAVASCRIPT_COMMENT": "comment", "HTML_COMMENT": "comment",
-                "CSS_STRING": "style", "CSS_PROPERTY": "style", "JSON_STRING": "json",
-                "JSON_VALUE": "json", "URL_PATH": "url", "URL_QUERY": "url",
-                "URL_FRAGMENT": "url", "DATA_URI": "url",
+                "TEXTAREA": "textarea", "CSS_STRING": "style", "CSS_PROPERTY": "style",
+                "JSON_STRING": "json", "JSON_VALUE": "json", "URL_PATH": "url",
+                "URL_QUERY": "url", "URL_FRAGMENT": "url", "DATA_URI": "url",
             }.get(detailed.context_type.name, context)
         except Exception:
             pass
 
-    tail_sent = sent_payload[sent_payload.find(token) + len(token):] if token in sent_payload else ""
-    tail_recv = after[: max(1, len(tail_sent) + 8)]
-    raw_specials = [
-        char for offset, char in enumerate(tail_sent)
-        if char in SPECIAL_CHARS and offset < len(tail_recv) and tail_recv[offset] == char
-    ]
-    verbatim = bool(sent_payload) and sent_payload in body
-    raw = set(raw_specials)
+    # Position-aware delimiter survival: compare the sent tail with the
+    # received tail after decoding entities, remembering which characters were
+    # emitted raw and which were entity-encoded.
+    try:
+        from xoxss.detection.context import analyze_char_survival
+
+        raw_set, encoded_set = analyze_char_survival(body, index, token, sent_payload)
+    except Exception:
+        raw_set, encoded_set = set(), set()
+
+    # Fallback for payloads whose marker offset cannot be derived: retain the
+    # historical exact-offset comparison rather than dropping the evidence.
+    if not raw_set and not encoded_set and tail_sent:
+        for offset, char in enumerate(tail_sent):
+            if char in SPECIAL_CHARS and offset < len(tail_recv) and tail_recv[offset] == char:
+                raw_set.add(char)
+
+    raw = sorted(raw_set)
+    # Entity encoding is about delimiter characters, not incidental raw text:
+    # ``&lt;/script&gt;`` leaves a raw ``/`` but is still not executable.
+    critical = set("<>\"'`")
+    entity_encoded = bool(encoded_set & critical) and not (raw_set & critical)
+    verbatim = bool(sent_payload) and sent_payload in body and not entity_encoded
     payload_chars = set(sent_payload)
 
     def survived(chars: str) -> bool:
-        return any(char in raw for char in chars) or (
+        return any(char in raw_set for char in chars) or (
             verbatim and any(char in payload_chars for char in chars)
         )
 
@@ -120,23 +152,38 @@ def analyze_reflection(
         "attr_unquoted": survived(" >\"'`"),
         "script": survived("'\"`<"),
         "style": survived("<"),
-        "comment": survived(">-"),
+        "comment": comment_breakout and survived("<"),
+        "textarea": textarea_breakout and survived("<"),
         "json": survived('<"\\'),
         "url": True,
     }.get(context, False)
 
+    inert_reason = ""
+    if context == "comment":
+        inert_reason = "reflection inside an HTML comment (no --> breakout)"
+    elif context == "textarea":
+        inert_reason = "reflection inside <textarea> (no </textarea> breakout)"
+    elif entity_encoded:
+        inert_reason = "entity-encoded output (&lt;/&gt;), not a live delimiter"
+    elif in_template or in_cdata or in_meta:
+        inert_reason = "static dead zone (<template>/<![CDATA[/<meta>)"
+
     info.reflected = True
     info.marker = token
-    info.static_dead_zone = in_comment or in_template or in_cdata or in_meta
+    info.static_dead_zone = bool(inert_reason)
     info.context = context
-    info.executable = executable
-    info.raw_specials = raw_specials
+    info.executable = executable and not inert_reason
+    info.raw_specials = raw
+    info.encoded_specials = sorted(encoded_set)
+    info.inert_reason = inert_reason
     info.snippet = re.sub(r"\s+", " ", body[max(0, index - 90): index + len(token) + 90])
     info.efficiency, info.distortion = score_reflection(sent_payload, body, token)
     info.detail = (
         f"context={context}, raw={''.join(sorted(raw)) or 'none'}, "
-        f"verbatim={'yes' if verbatim else 'no'}, executable={'yes' if executable else 'no'}, "
+        f"encoded={''.join(info.encoded_specials) or 'none'}, "
+        f"verbatim={'yes' if verbatim else 'no'}, executable={'yes' if info.executable else 'no'}, "
         f"efficiency={info.efficiency:.1f}%"
+        + (f", inert={inert_reason}" if inert_reason else "")
     )
     return info
 
@@ -148,9 +195,9 @@ def browser_prequalified(info: ReflectionInfo, content_type: str) -> bool:
     mime = (content_type or "").split(";", 1)[0].strip().lower()
     if mime not in {"text/html", "application/xhtml+xml", "image/svg+xml"}:
         return False
-    if info.context in {"comment", "json", "style"}:
+    if info.context in {"comment", "textarea", "json", "style"}:
         return False
-    if info.static_dead_zone:
+    if info.static_dead_zone or info.inert_reason:
         return False
     snippet = info.snippet.lower()
     token_pos = snippet.find(info.marker.lower()) if info.marker else -1

@@ -312,6 +312,18 @@ xoxss --doctor
 xoxss --doctor --no-browser     # HTTP-only deployment
 ```
 
+`--doctor` also reports `DISPLAY`/`WAYLAND_DISPLAY` and whether a system
+Chromium/Chrome binary was autodetected. XOXSS checks `XOXSS_CHROMIUM`,
+`CHROME_BIN`, common Linux/macOS paths (`/usr/bin/chromium`,
+`/usr/bin/google-chrome`, snap paths, …) and the Windows install
+directories before asking Selenium Manager to download a driver. Headed mode
+needs a display; on a bare Linux host either pass `--headless` or wrap the
+command:
+
+```bash
+xvfb-run -a xoxss https://target.tld --show-browser --deep
+```
+
 Windows notes: `uvloop` is not installed there (standard asyncio is used); quote
 cookies/headers in PowerShell (`--cookies "session=abc; theme=dark"`); Selenium Manager
 normally downloads the correct driver, otherwise use `--binary` for the browser
@@ -425,9 +437,11 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | Option | Description |
 |---|---|
 | `--browser {firefox,chrome,chromium,edge,playwright}` | Backend (default `firefox`). |
-| `--headless` / `--browser-workers N` | Headless mode / parallel engine instances (default `1`). |
+| `--headless` | Force headless. When omitted, XOXSS runs headed on an interactive terminal and headless under CI, pipes or a missing display. |
+| `--show-browser` | Force a visible (headed) window; ignored if `--headless` is also given. |
+| `--browser-workers N` | Parallel engine instances (default `1`). |
 | `--confirm {auto,browser,http}` | Strategy (default `auto` — uses the browser when available). |
-| `--screenshot` / `--binary PATH` | Evidence screenshots / explicit browser executable. |
+| `--screenshot` / `--binary PATH` | Evidence screenshots / explicit browser executable. Browser-confirmed findings always save a screenshot, even without `--screenshot`. |
 | `--no-browser` | HTTP-only mode; sets `--confirm http`. |
 | `--user-agent STRING` | UA override for HTTP and browser sessions. |
 
@@ -453,6 +467,8 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--no-state` / `--no-resume` | Disable checkpoints / reset and start over. |
 | `--verbose` / `--quiet` / `--no-color` | Debug output / findings-only / disable ANSI colours. |
 | `--fail-on-findings` | Exit `2` when confirmed/high findings exist. |
+| `--replay FINDING_ID` | Re-run one finding from a previous JSON report: one request plus one browser check. |
+| `--replay-report PATH` | JSON report to load for `--replay` (default: newest `*.json` in `--report-dir`). |
 | `--doctor` / `--list-payloads` / `--list-tampers` / `--list-encoders` / `--version` | Diagnostics and registry inspection. |
 
 > [!NOTE]
@@ -668,10 +684,10 @@ Each requested format is written as:
 
 | Format | Ext | Contents |
 |---|---|---|
-| JSON | `.json` | Full payload: stats, recon, OOB, analyzer results, findings (each finding includes `poc_url` / `poc_command`). |
-| Markdown | `.md` | Human-readable summary, tables, per-finding details with a PoC line and a `curl` PoC block. |
-| HTML | `.html` | Self-contained dark-theme report with cards, tables, a PoC column and click-to-expand screenshot evidence. |
-| SARIF | `.sarif` | SARIF v2.1.0 for code-scanning platforms. Rules derive from findings (`xoxss/reflected-xss`, …); `confirmed`/`high` → `error`, `medium` → `warning`, `low` → `note`. Each result embeds `pocUrl` / `pocCommand` properties. |
+| JSON | `.json` | Full payload: stats, recon, OOB, analyzer results, findings. Each finding includes `finding_id`, the redacted `request`, `response_status`/`response_excerpt`, `sink`/`dom_path`, `oob` callback detail, `poc_url` and a copy-paste `poc_curl`. |
+| Markdown | `.md` | Human-readable summary, tables with finding IDs, per-finding request/response evidence, sink, OOB callbacks and a `curl` PoC block. |
+| HTML | `.html` | Self-contained dark-theme report with cards, tables, a PoC column, full request/response evidence and click-to-expand screenshot evidence. |
+| SARIF | `.sarif` | SARIF v2.1.0 for code-scanning platforms. Rules derive from findings (`xoxss/reflected-xss`, …); `confirmed`/`high` → `error`, `medium` → `warning`, `low` → `note`. Each result embeds `findingId`, `request`, `sink`, `pocUrl`, `pocCurl` and `oob` properties. |
 
 Screenshots go to `<state-dir>/screenshots/` (`<token>.png`, `dom-<token>.png`) and are
 linked from findings. The HTML report renders each one as a thumbnail that opens in a
@@ -704,6 +720,7 @@ intelligence, OpenAPI operations, OOB registrations and every analyzer list):
   "proto_pollution_sources": [], "blind_markers": [],
   "findings": [
     {
+      "finding_id": "1a2b3c4d5e6f7890",
       "kind": "Reflected XSS (HTTP evidence)",
       "url": "https://target.tld/search?q=...",
       "parameter": "q",
@@ -711,8 +728,23 @@ intelligence, OpenAPI operations, OOB registrations and every analyzer list):
       "payload": "<script>...</script>",
       "evidence": "marker reflected unescaped",
       "confidence": "high",
+      "confidence_rationale": "The payload's delimiters survived verbatim in an executable context; browser verification was disabled.",
       "context": "html",
+      "source": "query",
+      "request": {
+        "method": "GET",
+        "url": "https://target.tld/search?q=...",
+        "headers": {"Cookie": "[REDACTED]", "User-Agent": "..."},
+        "body": "",
+        "redacted": true
+      },
+      "response_status": 200,
+      "response_excerpt": "...100 chars before<script>...100 chars after...",
+      "sink": "",
+      "dom_path": "",
+      "oob": {},
       "poc_url": "https://target.tld/search?q=<script>...</script>",
+      "poc_curl": "curl -sk 'https://target.tld/search?q=%3Cscript%3E...'",
       "poc_command": "",
       "timestamp": "2026-11-03T10:00:00+00:00"
     }
@@ -720,10 +752,28 @@ intelligence, OpenAPI operations, OOB registrations and every analyzer list):
 }
 ```
 
-`poc_url` is present on GET injection points as a one-click reproduction link
-that executes the payload; POST / header / cookie findings instead carry
-`poc_command`, a `curl` one-liner. Both contain only the injected parameter --
-no cookies, tokens or session data.
+Every finding carries a reproduction. `poc_url` is present on GET injection
+points as a one-click link; `poc_curl` is always populated as a copy-paste
+command for GET, POST, JSON, header and cookie points. Requests are redacted —
+cookies, `Authorization` and sensitive form/JSON keys become `[REDACTED]` so a
+report can be shared, while the injected parameter is preserved.
+
+### Replaying a finding
+
+```bash
+# newest report in --report-dir, match a finding id (prefix is enough)
+xoxss --replay 1a2b3c4d --replay-report .xoxss/reports/xoxss-target-latest.json
+
+# or point at the report directory and add a fresh session
+xoxss --replay 1a2b3c4d --cookies "session=abc"
+```
+
+`--replay` issues exactly one request rebuilt from the finding's stored
+`request` (falling back to `poc_curl`), then performs one browser check when a
+browser is available. It prints a JSON result (`reflected`, `executable`,
+`browser_executed`, `reproduced`) and exits `0` when the finding reproduces.
+Redacted credentials are never replayed literally; supply your own session with
+`--headers`/`--cookies`.
 
 | Exit code | Meaning |
 |---|---|

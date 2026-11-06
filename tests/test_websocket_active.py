@@ -89,7 +89,9 @@ def test_active_probe_records_reflection():
     assert marker in hit.response
     assert hit.url == url
     assert "reflected" in hit.evidence.lower()
-    assert hit.context in ("html", "json", "unknown")
+    # The echo wraps the marker in ``<script>`` inside a JSON body, so the
+    # marker is genuinely in script context.
+    assert hit.context in ("html", "json", "script", "unknown")
 
 
 def test_active_probe_does_not_claim_reflection_without_echo():

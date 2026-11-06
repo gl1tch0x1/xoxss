@@ -2,10 +2,114 @@
 Context detection module for precise XSS context identification.
 """
 
+import html as html_lib
 import re
 from typing import Dict, List, Optional, Set, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+
+
+# Characters whose survival determines whether markup can break out of a
+# context.  ``&`` and ``-`` matter for comment/entity breakouts.
+SPECIAL_CHARS = set("<>\"'`()=/\\ \t\r\n&-")
+
+# One HTML entity reference (named, decimal or hexadecimal).
+ENTITY_RE = re.compile(r"&(?:#[xX][0-9a-fA-F]+|#[0-9]+|[a-zA-Z][a-zA-Z0-9]+);")
+
+
+def decode_with_origin(text: str) -> List[Tuple[str, bool]]:
+    """Decode entities while remembering whether each character was raw.
+
+    Returns ``[(character, was_raw), ...]``.  ``was_raw`` is ``False`` when the
+    character came from ``&lt;``-style output, which is the signal that the
+    server encoded the payload instead of reflecting it verbatim.
+    """
+    value = str(text or "")
+    decoded: List[Tuple[str, bool]] = []
+    position = 0
+    for match in ENTITY_RE.finditer(value):
+        for char in value[position:match.start()]:
+            decoded.append((char, True))
+        unescaped = html_lib.unescape(match.group(0))
+        for char in unescaped:
+            decoded.append((char, False))
+        position = match.end()
+    for char in value[position:]:
+        decoded.append((char, True))
+    return decoded
+
+
+def analyze_char_survival(
+    response: str,
+    position: int,
+    token: str,
+    sent_payload: str,
+) -> Tuple[Set[str], Set[str]]:
+    """Position-aware character survival for the tail after ``token``.
+
+    Only characters that appear at the corresponding offset *after* the marker
+    count.  A raw presence elsewhere in the document (a legitimate ``<`` in
+    surrounding markup, for example) never marks the payload executable.
+    """
+    body = str(response or "")
+    marker = str(token or "")
+    payload = str(sent_payload or "")
+    survived: Set[str] = set()
+    encoded: Set[str] = set()
+    if not body or not marker or marker not in payload:
+        return survived, encoded
+    marker_offset = payload.find(marker)
+    sent_tail = payload[marker_offset + len(marker):]
+    if not sent_tail:
+        return survived, encoded
+    start = max(0, min(int(position), len(body))) + len(marker)
+    # Bound the window so a pathological page cannot make this quadratic.
+    received = body[start:start + max(256, len(sent_tail) * 16 + 64)]
+    decoded = decode_with_origin(received)
+    for offset, char in enumerate(sent_tail):
+        if offset >= len(decoded):
+            break
+        received_char, was_raw = decoded[offset]
+        if received_char != char:
+            continue
+        if char in SPECIAL_CHARS:
+            (survived if was_raw else encoded).add(char)
+    return survived, encoded
+
+
+def inert_zone(response: str, position: int, token: str = "") -> Tuple[str, bool]:
+    """Classify the reflection as inert and report whether a breakout is present.
+
+    Returns ``(reason, breakout)``.  ``reason`` is one of ``html_comment``,
+    ``textarea`` or ``""``.  ``breakout`` is true when the reflected payload
+    itself closes the inert region (``-->`` / ``</textarea>``), which is the
+    only way a reflection inside it becomes executable.
+    """
+    body = str(response or "")
+    marker = str(token or "")
+    index = max(0, min(int(position), len(body)))
+    before = body[:index]
+    low_before = before.lower()
+    if low_before.rfind("<!--") > low_before.rfind("-->"):
+        tail = body[index:]
+        return "html_comment", "-->" in tail[:2000]
+    if low_before.rfind("<textarea") > low_before.rfind("</textarea"):
+        tail = body[index:].lower()
+        return "textarea", "</textarea" in tail[:2000]
+    return "", False
+
+
+def strip_inert_regions(snippet: str) -> str:
+    """Remove comments, textarea bodies and entity references from a snippet.
+
+    Used by context character accounting so a ``<`` inside a comment or
+    ``&lt;`` output is not counted as a surviving delimiter.
+    """
+    text = str(snippet or "")
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    text = re.sub(r"<textarea\b[^>]*>.*?</textarea\s*>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = ENTITY_RE.sub("", text)
+    return text
 
 
 class ContextType(Enum):
@@ -22,6 +126,7 @@ class ContextType(Enum):
     CSS_STRING = "css_string"
     CSS_PROPERTY = "css_property"
     HTML_COMMENT = "html_comment"
+    TEXTAREA = "textarea"
     JAVASCRIPT_COMMENT = "js_comment"
     JSON_STRING = "json_string"
     JSON_VALUE = "json_value"
@@ -47,6 +152,9 @@ class ContextAnalysis:
     special_chars_allowed: Set[str]
     special_chars_blocked: Set[str]
     suggested_payloads: List[str]
+    escaped_chars: Set[str] = field(default_factory=set)
+    entity_encoded: bool = False
+    inert_reason: str = ""
 
 
 class ContextDetector:
@@ -219,6 +327,15 @@ class ContextDetector:
             snippet, context_type, probe_chars
         )
 
+        # Position-aware inert-zone and entity encoding flags.  These stop a
+        # raw character elsewhere in the document from being mistaken for a
+        # surviving delimiter inside a comment/textarea/entity output.
+        inert_reason, _breakout = inert_zone(response, position, marker or "")
+        vicinity = response[max(0, position - 64): position + len(marker or "") + 320]
+        entity_encoded = bool(ENTITY_RE.search(vicinity)) and not any(
+            char in strip_inert_regions(vicinity) for char in "<>\"'`"
+        )
+
         # Generate suggested payloads
         suggested_payloads = self._generate_payloads(context_type, special_chars_allowed)
 
@@ -232,7 +349,9 @@ class ContextDetector:
             encoding_method=encoding_method,
             special_chars_allowed=special_chars_allowed,
             special_chars_blocked=special_chars_blocked,
-            suggested_payloads=suggested_payloads
+            suggested_payloads=suggested_payloads,
+            entity_encoded=entity_encoded,
+            inert_reason=inert_reason,
         )
 
     def _detect_context_type(
@@ -259,6 +378,10 @@ class ContextDetector:
         # Comments win over everything else.
         if low.rfind("<!--") > low.rfind("-->"):
             return ContextType.HTML_COMMENT
+
+        # Textarea content is inert unless the payload closes the element.
+        if low.rfind("<textarea") > low.rfind("</textarea"):
+            return ContextType.TEXTAREA
 
         # <script> ... </script>
         script_open = low.rfind("<script")
@@ -319,6 +442,7 @@ class ContextDetector:
         """Confidence for the parsed context (parsing beats pattern voting)."""
         confidence = {
             ContextType.HTML_COMMENT: 0.95,
+            ContextType.TEXTAREA: 0.4,
             ContextType.ATTR_DOUBLE_QUOTED: 0.9,
             ContextType.ATTR_SINGLE_QUOTED: 0.9,
             ContextType.ATTR_UNQUOTED: 0.85,
@@ -390,8 +514,11 @@ class ContextDetector:
         allowed = set()
         blocked = set()
 
+        # Only raw, non-entity characters in markup outside comments and
+        # textarea bodies count as surviving delimiters.
+        visible = strip_inert_regions(snippet)
         for char in probe_chars:
-            if char in snippet:
+            if char in visible:
                 allowed.add(char)
             else:
                 blocked.add(char)
@@ -423,6 +550,9 @@ class ContextDetector:
         elif context_type == ContextType.ATTR_UNQUOTED:
             payloads.append(" onerror=alert(1) ")
             payloads.append("><script>alert(1)</script>")
+
+        elif context_type == ContextType.TEXTAREA:
+            payloads.append("</textarea><script>alert(1)</script>")
 
         elif context_type in (ContextType.JAVASCRIPT_STRING_DOUBLE, ContextType.JAVASCRIPT_STRING_SINGLE):
             payloads.append('";alert(1);//')

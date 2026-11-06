@@ -183,6 +183,15 @@ from xoxss.reports.html import write_html_report
 from xoxss.reports.json import report_payload, write_json_report
 from xoxss.reports.markdown import write_markdown_report
 from xoxss.scan.reflection import ReflectionInfo, analyze_reflection, browser_prequalified
+from xoxss.core.evidence import (
+    build_curl,
+    canonical_finding_url,
+    finding_id as make_finding_id,
+    finding_curl,
+    parse_curl_request,
+    parse_oob_context,
+    response_excerpt,
+)
 from xoxss.core.http import HttpEngine, HttpResponse, RateLimiter, USER_AGENT
 from xoxss.core.state import StateStore
 from xoxss.cli import EXAMPLES, build_parser as _build_cli_parser
@@ -819,6 +828,58 @@ def banner(console: Optional[Console] = None) -> None:
 # --------------------------------------------------------------------------------------
 
 
+def reflection_confidence(
+    info: ReflectionInfo,
+    *,
+    requested: bool,
+    available: bool,
+    content_type: str = "",
+) -> Tuple[str, str, str]:
+    """Classify an HTTP-reflection finding as ``(confidence, rationale, detail)``.
+
+    The distinction that matters is *why* a browser did not confirm execution:
+    verification disabled, no browser worker available, the candidate failed
+    the prequalification gate, or a browser ran and found nothing.  Collapsing
+    those into one bucket either overstates or understates the evidence.
+    """
+    prequalified = browser_prequalified(info, content_type)
+    if not info.executable:
+        return (
+            "low",
+            f"Reflection was observed but is inert: "
+            f"{info.inert_reason or info.context}.",
+            "Reflection is not executable in this context",
+        )
+    if not requested:
+        return (
+            "high",
+            "The payload's delimiters survived verbatim in an executable "
+            "context; browser verification was disabled.",
+            "HTTP evidence only (browser verification disabled)",
+        )
+    if available and prequalified:
+        return (
+            "medium",
+            "A browser was available and this candidate passed the execution "
+            "gate, but the browser did not observe execution.",
+            "Browser verification attempted but did not confirm execution",
+        )
+    if available:
+        return (
+            "medium",
+            "A browser was available but the candidate did not pass the "
+            "browser prequalification gate (MIME/context/static dead zone).",
+            "Browser verification did not run for this candidate",
+        )
+    return (
+        "high",
+        "Browser verification was requested but no browser worker was "
+        "available; the payload's delimiters survived verbatim in an "
+        "executable context.",
+        "Browser verification unavailable",
+    )
+
+
 @dataclass
 class Finding:
     kind: str
@@ -837,21 +898,59 @@ class Finding:
     # built from the injection only - no cookies or session data are included.
     poc_url: str = ""
     poc_command: str = ""
+    # Complete evidence.  `request` holds the redacted method/URL/headers/body
+    # that produced the response, `response_excerpt` shows ±100 chars around
+    # the marker, and `poc_curl` is always populated so every finding is
+    # copy-paste reproducible regardless of method.
+    request: Dict[str, Any] = field(default_factory=dict)
+    response_status: int = 0
+    response_excerpt: str = ""
+    poc_curl: str = ""
+    # Browser-confirmed sink detail.
+    sink: str = ""
+    dom_path: str = ""
+    # Blind/OOB callback detail (cookies, page URL, timestamp, raw callback).
+    oob: Dict[str, Any] = field(default_factory=dict)
+    # Identity: `source` disambiguates query/form/header/cookie points that
+    # share a URL and parameter; `finding_id` is the stable --replay handle.
+    source: str = ""
+    finding_id: str = ""
     subkey: str = ""
     tags: List[str] = field(default_factory=list)
     timestamp: str = field(default_factory=now_iso)
+
+    def __post_init__(self) -> None:
+        # Old checkpoints may not carry the new identity/evidence fields.
+        if not isinstance(self.request, dict):
+            self.request = {}
+        if not isinstance(self.oob, dict):
+            self.oob = {}
+        if not self.subkey:
+            self.subkey = ""
+        if not self.finding_id:
+            self.finding_id = make_finding_id(self.key())
+        if not self.poc_curl:
+            self.poc_curl = finding_curl(self)
 
     def key(self) -> str:
         # Family-level key: "Reflected XSS (HTTP evidence)" and "Reflected XSS" collapse,
         # and payload variants on the same injection point are de-duplicated.  Some
         # findings (secrets, static DOM flows) legitimately share a URL/parameter, so
-        # they can opt into an extra subkey.
+        # they can opt into an extra subkey.  The canonical URL strips the query for
+        # query/form/JSON points (the parameter already identifies the point), which
+        # prevents a payload-bearing URL from duplicating an existing finding while
+        # still keeping distinct sources (query vs header vs DOM) apart.
         family = self.kind.split(" (")[0]
-        raw = "|".join([family, self.url, self.parameter, self.method, self.subkey])
+        url = canonical_finding_url(self.url, self.source)
+        raw = "|".join([family, url, self.parameter, self.method, self.source, self.subkey])
         return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
 
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
+        if not result["finding_id"]:
+            result["finding_id"] = make_finding_id(self.key())
+        if not result["poc_curl"]:
+            result["poc_curl"] = finding_curl(self)
         if not result["confidence_rationale"]:
             result["confidence_rationale"] = {
                 "confirmed": "Direct confirmation evidence was recorded for this finding.",
@@ -2087,6 +2186,7 @@ class XSSScanner(CrawlerMixin):
         self._status_task: Optional[asyncio.Task] = None
         self.screenshot_dir = Path(args.state_dir) / "screenshots"
         self._stored_checked: Set[str] = set()
+        self._stored_hit_response: Optional[HttpResponse] = None
         self.mutation_findings: List[Dict[str, str]] = []
         self._mutation_probed: Set[str] = set()
         self._mutation_observations: Dict[str, List[MutationObservation]] = {}
@@ -2235,6 +2335,8 @@ class XSSScanner(CrawlerMixin):
                         tags=["prototype-pollution"],
                         subkey=probe.parameter,
                         poc_url=probe_url,
+                        source="proto",
+                        sink=f"Object.prototype.{PROTO_MARKER_KEY}",
                     )
                 )
                 if added:
@@ -2289,6 +2391,9 @@ class XSSScanner(CrawlerMixin):
                         tags=["prototype-pollution", "xss"],
                         subkey=f"gadget:{name}",
                         poc_url=exploit_url,
+                        source="proto",
+                        sink=str(hit.get("sink") or "gadget"),
+                        dom_path=str(hit.get("dom_path") or ""),
                     )
                 )
                 self.console.ok(f"Prototype pollution gadget fired: {name}")
@@ -2315,6 +2420,7 @@ class XSSScanner(CrawlerMixin):
                     tags=["prototype-pollution"],
                     subkey=f"candidate:{name}",
                     poc_url=exploit_url,
+                    source="proto",
                 )
             )
 
@@ -2410,9 +2516,10 @@ class XSSScanner(CrawlerMixin):
         return self.findings
 
     def _load_state(self) -> None:
+        fields = set(Finding.__dataclass_fields__)
         for raw in self.state.findings:
             try:
-                finding = Finding(**{k: raw.get(k, "") for k in Finding.__dataclass_fields__})
+                finding = Finding(**{key: value for key, value in raw.items() if key in fields})
             except Exception:
                 continue
             if finding.key() in self._finding_keys:
@@ -2501,20 +2608,49 @@ class XSSScanner(CrawlerMixin):
             return
         self.stats.oob_hits += 1
         self.state.extra["oob_hits"] = self.stats.oob_hits
+        callback_context = parse_oob_context(hit.raw)
+        cookies = callback_context.get("cookies") or []
+        page_url = str(callback_context.get("page_url") or "")
+        timestamp = str(hit.timestamp or "")
         evidence = (
             f"out-of-band callback observed via {hit.protocol or self.oob.source.name}"
             f" from {hit.remote_address or 'unknown'}"
+            f"; page={page_url or 'n/a'}"
+            f"; cookies={'; '.join(cookies) if cookies else 'none'}"
+            + (f"; at {timestamp}" if timestamp else "")
         )
         detail = f"marker {hit.marker}; raw: {truncate(hit.raw, 300)}"
+        oob_detail = {
+            "marker": hit.marker,
+            "protocol": hit.protocol,
+            "callback": registration.callback,
+            "remote_address": hit.remote_address,
+            "timestamp": timestamp,
+            "full_id": hit.full_id,
+            "source": hit.source or getattr(self.oob.source, "name", ""),
+            "page_url": page_url,
+            "cookies": cookies,
+            "user_agent": callback_context.get("user_agent", ""),
+            "referer": callback_context.get("referer", ""),
+            "method": callback_context.get("method", ""),
+            "raw": str(hit.raw or "")[:4000],
+        }
         subkey = f"oob:{hit.marker}"
         for finding in self.findings:
             if finding.subkey != subkey:
                 continue
             finding.kind = "Blind XSS (callback confirmed)"
             finding.confidence = "confirmed"
+            finding.confidence_rationale = (
+                "The injected payload caused a real out-of-band callback carrying this "
+                "run's marker; the callback context is recorded in the finding."
+            )
             finding.evidence = evidence
             finding.detail = detail
             finding.payload = registration.payload or finding.payload
+            finding.oob = oob_detail
+            finding.sink = finding.sink or "oob-callback"
+            finding.response_excerpt = finding.response_excerpt or str(hit.raw or "")[:400]
             finding.tags = list(dict.fromkeys([*finding.tags, "oob", "confirmed"]))
             self.state.findings = [item.to_dict() for item in self.findings]
             self.state.save(force=True)
@@ -2537,12 +2673,20 @@ class XSSScanner(CrawlerMixin):
                 payload=registration.payload,
                 evidence=evidence,
                 confidence="confirmed",
+                confidence_rationale=(
+                    "The injected payload caused a real out-of-band callback carrying this "
+                    "run's marker; the callback context is recorded in the finding."
+                ),
                 context="blind",
                 detail=detail,
                 subkey=subkey,
                 tags=["blind", "oob", "confirmed"],
                 poc_url=blind_poc_url,
                 poc_command=blind_poc_command,
+                source="blind",
+                sink="oob-callback",
+                oob=oob_detail,
+                response_excerpt=str(hit.raw or "")[:400],
             )
         )
 
@@ -2629,6 +2773,7 @@ class XSSScanner(CrawlerMixin):
                 subkey=f"external:{getattr(item, 'tool', 'tool')}:{digest}",
                 tags=[getattr(item, "tool", "external"), "external", severity, "unverified"],
                 poc_url=str(getattr(item, "url", "") or ""),
+                source="external",
             )
         )
 
@@ -3097,6 +3242,7 @@ class XSSScanner(CrawlerMixin):
                 detail="Credential-like value in a client-side bundle; verify it is live and scoped.",
                 subkey=f"secret:{getattr(secret, 'kind', 'secret')}:{digest}",
                 tags=["secret", severity],
+                source="secret",
             )
         )
 
@@ -3140,6 +3286,15 @@ class XSSScanner(CrawlerMixin):
                 ),
                 subkey=f"ast:{getattr(flow, 'line', 0)}:{getattr(flow, 'sink', '')}:{digest}",
                 tags=["dom", "ast"],
+                source="ast",
+                sink=str(getattr(flow, "sink", "") or ""),
+                dom_path=str(getattr(flow, "context", "") or ""),
+                confidence_rationale=(
+                    "A static taint path connects an attacker-controlled source to this "
+                    "DOM sink; runtime execution was not confirmed."
+                    if not sanitized
+                    else "A sanitizer was detected on the path; this flow needs manual review."
+                ),
             )
         )
 
@@ -3419,6 +3574,49 @@ class XSSScanner(CrawlerMixin):
         """Reproduction proof for this point (module-level :func:`build_poc`)."""
         return build_poc(point, payload)
 
+    @staticmethod
+    def evidence_from_response(
+        response: Optional[HttpResponse], token: str, parameter: str = ""
+    ) -> Dict[str, Any]:
+        """Evidence fields shared by every HTTP-backed finding."""
+        if response is None:
+            return {}
+        request: Dict[str, Any] = {}
+        request_builder = getattr(response, "request_dict", None)
+        if callable(request_builder):
+            request = request_builder(parameter)
+        else:
+            # Test doubles and third-party response objects may not implement
+            # request_dict(); keep the evidence useful without inventing headers.
+            url = str(
+                getattr(response, "request_url", "")
+                or getattr(response, "url", "")
+                or ""
+            )
+            if url:
+                request = {
+                    "method": str(getattr(response, "request_method", "GET") or "GET"),
+                    "url": url,
+                    "headers": dict(getattr(response, "request_headers", {}) or {}),
+                    "body": str(getattr(response, "request_body", "") or ""),
+                    "redacted": True,
+                }
+        return {
+            "request": request,
+            "response_status": int(getattr(response, "status", 0) or 0),
+            "response_excerpt": response_excerpt(
+                str(getattr(response, "text", "") or ""), token
+            ),
+        }
+
+    def _browser_state(self) -> Tuple[bool, bool]:
+        """Return ``(requested, available)`` for confidence rationales."""
+        requested = not bool(getattr(self.args, "no_browser", False)) and (
+            getattr(self.args, "confirm", "auto") != "http"
+        )
+        available = bool(self.pool is not None and self.pool.engines)
+        return requested, available
+
     def build_post_data(self, point: InjectionPoint, payload: str) -> Dict[str, str]:
         values = {name: spec.value for name, spec in point.fields.items()}
         values[point.param] = payload
@@ -3543,7 +3741,12 @@ class XSSScanner(CrawlerMixin):
             probe = probe_engine.generate_probe_string(token)
             response = await self.send_point(point, probe)
             if response is None or response.error or not response.text:
-                self.console.debug(f"No response for {location}")
+                reason = (
+                    response.error
+                    if response is not None and response.error
+                    else "empty response body"
+                )
+                self.console.debug(f"Rejected candidate (no analyzable response: {reason}): {location}")
                 return
             
             # Analyze with per-character probe
@@ -3558,7 +3761,12 @@ class XSSScanner(CrawlerMixin):
             probe = self.payloads.probe(token)
             response = await self.send_point(point, probe)
             if response is None or response.error or not response.text:
-                self.console.debug(f"No response for {location}")
+                reason = (
+                    response.error
+                    if response is not None and response.error
+                    else "empty response body"
+                )
+                self.console.debug(f"Rejected candidate (no analyzable response: {reason}): {location}")
                 return
 
             info = analyze_reflection(
@@ -3566,7 +3774,7 @@ class XSSScanner(CrawlerMixin):
             )
         
         if not info.reflected:
-            self.console.debug(f"Not reflected: {location}")
+            self.console.debug(f"Rejected candidate (marker not reflected): {location}")
             return
 
         if getattr(self.args, "mutation_probes", False):
@@ -3604,6 +3812,7 @@ class XSSScanner(CrawlerMixin):
                     finding = await self.confirm_in_browser(
                         point, payload, token, polyglot_info,
                         result.header("content-type", ""),
+                        response=result,
                     )
                     if finding:
                         self.add_finding(finding)
@@ -3611,7 +3820,8 @@ class XSSScanner(CrawlerMixin):
                 if polyglot_info.reflected:
                     if not polyglot_info.executable:
                         self.console.debug(
-                            f"Polyglot reflected but not executable ({polyglot_info.context}): {location}"
+                            f"Rejected polyglot candidate "
+                            f"({polyglot_info.inert_reason or polyglot_info.context}): {location}"
                         )
                         continue
                     poc_url, poc_command = self.poc_for_point(point, payload)
@@ -3625,10 +3835,16 @@ class XSSScanner(CrawlerMixin):
                             evidence=f"polyglot payload reflected unescaped and executable "
                             f"({polyglot_info.detail})",
                             confidence="high",
+                            confidence_rationale=(
+                                "The payload's delimiters survived verbatim in an executable context; "
+                                "browser execution was not confirmed."
+                            ),
                             context=info.context,
                             detail="Polyglot payload used for efficiency",
                             poc_url=poc_url,
                             poc_command=poc_command,
+                            source=point.source,
+                            **self.evidence_from_response(result, token, point.param),
                         )
                     )
                     return
@@ -3685,6 +3901,13 @@ class XSSScanner(CrawlerMixin):
                 stored_page = await self.check_stored(point, payload_token, payload)
                 if stored_page:
                     _, stored_poc_command = self.poc_for_point(point, payload)
+                    stored_response = getattr(self, "_stored_hit_response", None)
+                    evidence_fields = self.evidence_from_response(result, token, point.param)
+                    if stored_response is not None:
+                        evidence_fields["response_status"] = int(stored_response.status or 0)
+                        evidence_fields["response_excerpt"] = response_excerpt(
+                            stored_response.text, payload_token
+                        )
                     self.add_finding(
                         Finding(
                             kind="Stored XSS (payload persisted)",
@@ -3694,28 +3917,62 @@ class XSSScanner(CrawlerMixin):
                             payload=payload,
                             evidence=f"payload persisted and re-rendered on {stored_page}",
                             confidence="high",
+                            confidence_rationale=(
+                                "Persistence was verified over HTTP; browser execution of the "
+                                "stored payload was not re-confirmed."
+                            ),
                             context=payload_info.context,
                             detail="Persistence verified over HTTP; execution not re-confirmed",
                             poc_url=stored_page,
                             poc_command=stored_poc_command,
+                            source="stored",
+                            **evidence_fields,
                         )
                     )
                     return
 
+            content_type = result.header("content-type", "")
             if not payload_info.executable and not self.args.report_reflections:
-                self.console.debug(f"Reflected but not executable ({payload_info.context}): {location}")
+                reason = payload_info.inert_reason or (
+                    f"context={payload_info.context} has no surviving breakout delimiter"
+                )
+                self.console.debug(
+                    f"Rejected candidate ({reason}): {location}; "
+                    f"raw={''.join(payload_info.raw_specials) or 'none'} "
+                    f"encoded={''.join(payload_info.encoded_specials) or 'none'}"
+                )
                 continue
 
             if self.pool is not None and self.pool.engines and self.args.confirm != "http":
                 finding = await self.confirm_in_browser(
                     point, payload, payload_token, payload_info,
-                    result.header("content-type", ""),
+                    content_type,
+                    response=result,
                 )
                 if finding:
                     self.add_finding(finding)
                     return
+                self.console.debug(
+                    f"Browser attempted but did not confirm execution: {location}"
+                )
 
-            confidence = "high" if payload_info.executable else "low"
+            # Confidence must distinguish "no browser was available" from
+            # "a browser ran and did not confirm".  The former keeps the
+            # strong HTTP signal at `high`; the latter is downgraded so an
+            # unconfirmed reflection never masquerades as execution.
+            requested, available = self._browser_state()
+            confidence, rationale, detail = reflection_confidence(
+                payload_info,
+                requested=requested,
+                available=available,
+                content_type=content_type,
+            )
+            if normalization_confirmed:
+                detail = "Unicode delimiters normalized into executable syntax"
+                rationale = (
+                    "A normalization differential turned encoded delimiters into "
+                    "executable syntax; " + rationale
+                )
             poc_url, poc_command = self.poc_for_point(point, payload)
             self.add_finding(
                 Finding(
@@ -3729,13 +3986,13 @@ class XSSScanner(CrawlerMixin):
                     payload=payload,
                     evidence=f"payload reflected unescaped ({payload_info.detail})",
                     confidence=confidence,
-                    context=info.context,
-                    detail=(
-                        "Unicode delimiters normalized into executable syntax"
-                        if normalization_confirmed else "Browser verification unavailable or inconclusive"
-                    ),
+                    confidence_rationale=rationale,
+                    context=payload_info.context,
+                    detail=detail,
                     poc_url=poc_url,
                     poc_command=poc_command,
+                    source=point.source,
+                    **self.evidence_from_response(result, payload_token, point.param),
                 )
             )
             return
@@ -3798,6 +4055,7 @@ class XSSScanner(CrawlerMixin):
         token: str,
         info: ReflectionInfo,
         content_type: str = "",
+        response: Optional[HttpResponse] = None,
     ) -> Optional[Finding]:
         if self.pool is None or not browser_prequalified(info, content_type):
             return None
@@ -3817,27 +4075,49 @@ class XSSScanner(CrawlerMixin):
 
                 hit = await browser.check_token(token, timeout=2.5)
                 if not hit or hit.get("executed") != "yes":
+                    self.console.debug(
+                        f"Browser did not confirm execution for token {token} "
+                        f"({info.context}); keeping HTTP evidence only"
+                    )
                     return None
 
-                screenshot = ""
-                if self.args.screenshot:
-                    target_path = self.screenshot_dir / f"{token}.png"
-                    screenshot = await browser.screenshot(str(target_path))
+                # Browser-confirmed findings always carry a screenshot, even
+                # when --screenshot was not passed: the image is the strongest
+                # possible proof and the state directory is a safe location.
+                target_path = self.screenshot_dir / f"{token}.png"
+                screenshot = await browser.screenshot(str(target_path))
 
                 poc_url, poc_command = self.poc_for_point(point, payload)
+                evidence = hit.get("evidence", "")
+                sink = str(hit.get("sink") or "")
+                dom_path = str(hit.get("dom_path") or "")
+                if sink:
+                    evidence = f"sink={sink}" + (
+                        f" at {dom_path}" if dom_path else ""
+                    ) + (f"; {evidence}" if evidence else "")
+                detail = "JavaScript execution confirmed in browser"
+                if sink:
+                    detail += f" via {sink}"
                 return Finding(
                     kind="Reflected XSS",
                     url=self.build_get_url(point, payload) if point.method.upper() == "GET" else point.url,
                     parameter=point.param,
                     method=point.method.upper(),
                     payload=payload,
-                    evidence=hit.get("evidence", ""),
+                    evidence=evidence,
                     confidence="confirmed",
+                    confidence_rationale=(
+                        "The marker reached an instrumented execution sink in a real browser."
+                    ),
                     context=info.context,
-                    detail="JavaScript execution confirmed in browser",
+                    detail=detail,
                     screenshot=screenshot,
                     poc_url=poc_url,
                     poc_command=poc_command,
+                    source=point.source,
+                    sink=sink,
+                    dom_path=dom_path,
+                    **self.evidence_from_response(response, token, point.param),
                 )
         except Exception as exc:
             self.console.debug(f"Browser confirmation error: {exc}")
@@ -3944,6 +4224,8 @@ class XSSScanner(CrawlerMixin):
                         detail="Header reflections cannot be browser-verified without a proxy",
                         poc_url=poc_url,
                         poc_command=poc_command,
+                        source="header",
+                        **self.evidence_from_response(response, token, header),
                     )
                 )
 
@@ -4021,6 +4303,8 @@ class XSSScanner(CrawlerMixin):
                         ),
                         poc_url=endpoint,
                         poc_command=poc_command,
+                        source="websocket",
+                        sink="frame-reflection",
                     )
                 )
                 return
@@ -4163,6 +4447,12 @@ class XSSScanner(CrawlerMixin):
                             confidence="low",
                             context="dom",
                             detail=f"script: {candidate.get('script', '')}",
+                            source="dom",
+                            sink=str(candidate.get("sink", "") or ""),
+                            confidence_rationale=(
+                                "A static source/sink pair exists in page scripts; no runtime "
+                                "execution was observed."
+                            ),
                         )
                     )
 
@@ -4184,11 +4474,14 @@ class XSSScanner(CrawlerMixin):
                     if not hit:
                         continue
                     executed = hit.get("executed") == "yes"
+                    # Browser-confirmed execution always carries a screenshot.
                     screenshot = ""
-                    if self.args.screenshot:
+                    if executed or self.args.screenshot:
                         screenshot = await browser.screenshot(
                             str(self.screenshot_dir / f"dom-{token}.png")
                         )
+                    sink = str(hit.get("sink") or "")
+                    dom_path = str(hit.get("dom_path") or "")
                     self.add_finding(
                         Finding(
                             kind="DOM XSS (runtime sink)" if executed else "DOM XSS (sink taint)",
@@ -4196,16 +4489,32 @@ class XSSScanner(CrawlerMixin):
                             parameter="fragment" if kind == "js" else "query/fragment",
                             method="GET",
                             payload=payload_for_kind(kind),
-                            evidence=hit.get("evidence", ""),
+                            evidence=(
+                                (f"sink={sink}" + (f" at {dom_path}" if dom_path else "") + "; ")
+                                if sink else ""
+                            ) + hit.get("evidence", ""),
                             confidence="confirmed" if executed else "low",
+                            confidence_rationale=(
+                                "Attacker-controlled data reached an instrumented execution sink "
+                                "in a real browser."
+                                if executed
+                                else "Attacker-controlled data reached a DOM sink, but the "
+                                "instrumented sink did not confirm execution."
+                            ),
                             context=f"dom/{kind}",
                             detail=(
-                                "Attacker-controlled data reached an instrumented DOM sink and executed"
-                                if executed
-                                else "Attacker-controlled data reached a DOM sink; execution not confirmed"
+                                f"Executed via {sink}" if executed and sink else
+                                (
+                                    "Attacker-controlled data reached an instrumented DOM sink and executed"
+                                    if executed
+                                    else "Attacker-controlled data reached a DOM sink; execution not confirmed"
+                                )
                             ),
                             screenshot=screenshot,
                             poc_url=vector,
+                            source="dom",
+                            sink=sink,
+                            dom_path=dom_path,
                         )
                     )
                     return
@@ -4240,10 +4549,12 @@ class XSSScanner(CrawlerMixin):
                         continue
                     executed = hit.get("executed") == "yes"
                     screenshot = ""
-                    if self.args.screenshot:
+                    if executed or self.args.screenshot:
                         screenshot = await browser.screenshot(
                             str(self.screenshot_dir / f"dom-{source_name}-{marker}.png")
                         )
+                    sink = str(hit.get("sink") or "")
+                    dom_path = str(hit.get("dom_path") or "")
                     self.add_finding(
                         Finding(
                             kind="DOM XSS (runtime sink)" if executed else "DOM XSS (sink taint)",
@@ -4251,12 +4562,25 @@ class XSSScanner(CrawlerMixin):
                             parameter=source_name,
                             method="BROWSER",
                             payload=runtime_value,
-                            evidence=hit.get("evidence", ""),
+                            evidence=(
+                                (f"sink={sink}" + (f" at {dom_path}" if dom_path else "") + "; ")
+                                if sink else ""
+                            ) + hit.get("evidence", ""),
                             confidence="confirmed" if executed else "low",
+                            confidence_rationale=(
+                                f"A payload seeded through {source_name} reached an instrumented "
+                                "execution sink in a real browser."
+                                if executed
+                                else f"A payload seeded through {source_name} reached a DOM sink "
+                                "but execution was not confirmed."
+                            ),
                             context="dom/runtime-source",
                             detail=f"Payload seeded through {source_name} reached an instrumented sink",
                             screenshot=screenshot,
                             poc_url=url,
+                            source="dom",
+                            sink=sink,
+                            dom_path=dom_path,
                         )
                     )
                     return
@@ -4503,6 +4827,7 @@ class XSSScanner(CrawlerMixin):
             if response.error or not response.text:
                 continue
             if token in response.text or payload in response.text:
+                self._stored_hit_response = response
                 return page
         return None
 
@@ -5067,6 +5392,41 @@ def run_doctor(console: Console, args: argparse.Namespace) -> int:
             else:
                 report("ok", "browser", f"selenium/{backend}")
 
+    # Headed-mode diagnostics: a visible browser needs a display.
+    if os.name == "nt":
+        report("ok", "display", "Windows session (headed mode available)")
+    elif sys.platform == "darwin":
+        report("ok", "display", "macOS session (headed mode available)")
+    else:
+        display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or ""
+        if display:
+            report("ok", "display", f"{display}")
+        else:
+            report(
+                "warn",
+                "display",
+                "no DISPLAY/WAYLAND_DISPLAY; use --headless or `xvfb-run -a xoxss ...`",
+            )
+
+    # Chromium autodetection (used before Selenium Manager downloads a driver).
+    try:
+        from xoxss.core.browser import detect_chromium_binary, chromium_candidates
+
+        detected = detect_chromium_binary()
+    except Exception as exc:  # pragma: no cover - defensive
+        report("warn", "chromium", f"autodetection unavailable ({exc})")
+    else:
+        if detected:
+            report("ok", "chromium", detected)
+        else:
+            checked = ", ".join(chromium_candidates()[:4])
+            report(
+                "warn",
+                "chromium",
+                "no system Chromium found; Selenium Manager/Playwright will download one "
+                f"(checked: {checked}, ...)",
+            )
+
     console.raw("")
     if problems:
         console.error(f"{problems} required component(s) missing, {warnings} warning(s)")
@@ -5265,10 +5625,19 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
                     payload=payload,
                     evidence=f"marker reflected unescaped ({info.detail})",
                     confidence="high",
+                    confidence_rationale=(
+                        "Delimiters survived verbatim in an executable context; mass mode "
+                        "does not attempt browser confirmation."
+                    ),
                     context=info.context,
                     detail="mass mode: browser confirmation not attempted",
                     tags=["mass"],
                     subkey=param,
+                    source="query",
+                    poc_url=probe_url,
+                    request=response.request_dict(param),
+                    response_status=int(response.status or 0),
+                    response_excerpt=response_excerpt(response.text, token),
                 )
                 async with lock:
                     console.finding(finding)
@@ -5601,6 +5970,317 @@ async def run_targets(args: argparse.Namespace, console: Console) -> Tuple[int, 
     return 0, actionable
 
 
+# --------------------------------------------------------------------------------------
+# Replay: re-run one finding from a prior JSON report
+# --------------------------------------------------------------------------------------
+
+_REPLAY_TOKEN_RE = re.compile(r"[a-z][a-z0-9]{8,}")
+
+
+def resolve_headless(args: argparse.Namespace, explicit_flags: Set[str]) -> None:
+    """Pick headless vs headed unless the operator was explicit.
+
+    Headed is the friendly default on an interactive terminal; CI and
+    non-interactive runs (pipes, cron, containers) stay headless so they never
+    block on a display that does not exist.
+    """
+    if getattr(args, "no_browser", False):
+        args.headless = True
+        return
+    if "--headless" in explicit_flags:
+        args.headless = True
+        if "--show-browser" in explicit_flags:
+            args.show_browser = False
+        return
+    if "--show-browser" in explicit_flags or getattr(args, "show_browser", False):
+        args.headless = False
+        return
+    # A preset (god mode) may have pinned headless internally; keep it unless
+    # the operator asked for a visible window.
+    if getattr(args, "headless", False):
+        args.headless = True
+        return
+    ci = any(
+        os.environ.get(name)
+        for name in (
+            "CI",
+            "GITHUB_ACTIONS",
+            "GITLAB_CI",
+            "JENKINS_URL",
+            "BUILDKITE",
+            "TF_BUILD",
+            "CIRCLECI",
+            "TRAVIS",
+            "TEAMCITY_VERSION",
+        )
+    )
+    has_display = (
+        os.name == "nt"
+        or sys.platform == "darwin"
+        or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    )
+    args.headless = not (sys.stdout.isatty() and not ci and has_display)
+
+
+def _replay_report_path(args: argparse.Namespace) -> Optional[Path]:
+    explicit = getattr(args, "replay_report", None)
+    if explicit:
+        return Path(explicit)
+    report_dir = Path(getattr(args, "report_dir", os.path.join(DEFAULT_STATE_DIR, "reports")))
+    if not report_dir.is_dir():
+        return None
+
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    candidates = sorted(report_dir.glob("*.json"), key=_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def load_replay_finding(
+    args: argparse.Namespace,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Path], str]:
+    """Return ``(finding, report_path, error)`` for ``--replay``."""
+    path = _replay_report_path(args)
+    if path is None:
+        return None, None, (
+            "no JSON report found; pass --replay-report PATH or write a report with --report json"
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        return None, path, f"cannot read {path}: {exc}"
+    except json.JSONDecodeError as exc:
+        return None, path, f"{path} is not valid JSON: {exc}"
+    findings = data.get("findings")
+    if not isinstance(findings, list) or not findings:
+        return None, path, f"{path} contains no findings"
+    wanted = str(getattr(args, "replay", "") or "").strip().lower()
+    if not wanted:
+        return None, path, "--replay requires a finding id (see the report's finding_id column)"
+    for item in findings:
+        if not isinstance(item, dict):
+            continue
+        identity = str(item.get("finding_id") or "").lower()
+        if identity and (identity == wanted or identity.startswith(wanted)):
+            return item, path, ""
+    return None, path, f"no finding matches '{wanted}' in {path.name}"
+
+
+def _replay_request_args(
+    item: Dict[str, Any],
+) -> Tuple[str, str, Dict[str, str], str]:
+    """Recover ``(method, url, headers, body)`` from a report finding."""
+    request = item.get("request") if isinstance(item.get("request"), dict) else {}
+    url = str(request.get("url") or "")
+    method = str(request.get("method") or item.get("method") or "GET").upper()
+    headers = {
+        str(name): str(value)
+        for name, value in (request.get("headers") or {}).items()
+    }
+    body = str(request.get("body") or "")
+    if not url:
+        parsed = parse_curl_request(
+            str(item.get("poc_curl") or item.get("poc_command") or "")
+        )
+        if parsed:
+            url = str(parsed.get("url") or "")
+            method = str(parsed.get("method") or method).upper()
+            headers = dict(parsed.get("headers") or {})
+            body = str(parsed.get("body") or "")
+    if not url:
+        url = str(item.get("poc_url") or item.get("url") or "")
+    # Redacted values are placeholders, not credentials: drop them so the
+    # request is not replayed with the literal string "[REDACTED]".
+    headers = {
+        name: value
+        for name, value in headers.items()
+        if value and value != "[REDACTED]"
+    }
+    return method, url, headers, body
+
+
+def _replay_token(payload: str) -> str:
+    """Pick the strongest marker embedded in a payload for browser matching."""
+    candidates = _REPLAY_TOKEN_RE.findall(payload or "")
+    if candidates:
+        return max(candidates, key=len)
+    return payload or ""
+
+
+def _make_replay_browser(args: argparse.Namespace, console: Console) -> Any:
+    use_playwright = (getattr(args, "browser", "") or "").lower() == "playwright" or bool(
+        getattr(args, "auth_state", None)
+    )
+    engine_class = PlaywrightEngine if use_playwright else BrowserEngine
+    return engine_class(
+        console,
+        kind="playwright" if use_playwright else getattr(args, "browser", "firefox"),
+        headless=getattr(args, "headless", True),
+        page_timeout=max(10.0, getattr(args, "timeout", 20.0)),
+        user_agent=getattr(args, "user_agent", None),
+        proxy=getattr(args, "proxy", None),
+        binary=getattr(args, "binary", None),
+        insecure=getattr(args, "insecure", False),
+        auth_state=getattr(args, "auth_state", None),
+    )
+
+
+async def run_replay(args: argparse.Namespace, console: Console) -> int:
+    """Re-run exactly one reported finding: one request + one browser check."""
+    item, report_path, error = load_replay_finding(args)
+    if item is None:
+        console.error(error)
+        return 1
+    method, url, headers, body = _replay_request_args(item)
+    if not url:
+        console.error("The selected finding has no reproducible URL or curl PoC")
+        return 1
+
+    payload = str(item.get("payload") or "")
+    token = _replay_token(payload)
+    user_headers = XSSScanner._parse_headers(getattr(args, "headers", None))
+    user_cookies = XSSScanner._parse_cookies(getattr(args, "cookies", None))
+    headers.update(user_headers)
+
+    console.rule("replay")
+    console.info(f"Report: {report_path}")
+    console.info(f"Finding: {item.get('finding_id', '?')}  {item.get('kind', '')}")
+    console.info(f"Request: {method} {truncate(url, 160)}")
+    if body:
+        console.info(f"Body: {truncate(body, 200)}", important=False)
+
+    stats = ScanStats(urls_total=1)
+    http = HttpEngine(
+        console,
+        stats,
+        headers=user_headers,
+        cookies=user_cookies,
+        timeout=getattr(args, "timeout", 20.0),
+        retries=0,
+        rate=0.0,
+        concurrency=1,
+        proxy=getattr(args, "proxy", None),
+        insecure=getattr(args, "insecure", False),
+        max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
+        http2=getattr(args, "http2", False),
+        impersonate=getattr(args, "impersonate", None),
+    )
+
+    response: Optional[HttpResponse] = None
+    try:
+        await http.start()
+        data: Any = None
+        json_body: Optional[Dict[str, Any]] = None
+        if method not in ("GET", "HEAD") and body:
+            stripped = body.lstrip()
+            if stripped[:1] in ("{", "["):
+                try:
+                    json_body = json.loads(body)
+                except json.JSONDecodeError:
+                    data = body
+            elif "=" in stripped:
+                data = body
+            else:
+                data = body
+        response = await http.request(
+            method,
+            url,
+            headers=headers or None,
+            data=data,
+            json_body=json_body,
+            allow_redirects=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        console.error(f"Replay request failed: {exc}")
+        return 1
+    finally:
+        await http.close()
+
+    if response is None:
+        console.error("Replay produced no response")
+        return 1
+    if response.error:
+        console.error(f"Replay request error: {response.error}")
+        return 1
+
+    reflected = bool(payload) and payload in (response.text or "")
+    info = None
+    if reflected:
+        info = analyze_reflection(
+            response.text, payload, payload, response.header("content-type", "")
+        )
+    executable = bool(info and info.executable)
+
+    browser_executed = False
+    browser_evidence = ""
+    browser_attempted = False
+    if not getattr(args, "no_browser", False) and getattr(args, "confirm", "auto") != "http":
+        browser_attempted = True
+        engine = _make_replay_browser(args, console)
+        try:
+            if await engine.start():
+                try:
+                    if method in ("GET", "HEAD"):
+                        await engine.navigate(url)
+                    else:
+                        await engine.navigate(str(item.get("url") or url))
+                        await engine.submit_form(0, str(item.get("parameter") or ""), payload)
+                    hit = await engine.check_token(token, timeout=3.0)
+                    if hit:
+                        browser_executed = hit.get("executed") == "yes"
+                        browser_evidence = str(hit.get("evidence") or "")
+                        if hit.get("sink"):
+                            browser_evidence = (
+                                f"sink={hit.get('sink')}"
+                                + (f" at {hit.get('dom_path')}" if hit.get("dom_path") else "")
+                                + (f"; {browser_evidence}" if browser_evidence else "")
+                            )
+                finally:
+                    await engine.stop()
+        except Exception as exc:
+            console.debug(f"Replay browser check failed: {exc}")
+    else:
+        console.warn("Browser check skipped (--no-browser/--confirm http); HTTP evidence only")
+
+    confirmed = browser_executed or executable
+    status = {
+        "finding_id": item.get("finding_id", ""),
+        "kind": item.get("kind", ""),
+        "report": str(report_path),
+        "request": {"method": method, "url": url},
+        "response_status": int(response.status or 0),
+        "reflected": reflected,
+        "executable": executable,
+        "browser_attempted": browser_attempted,
+        "browser_executed": browser_executed,
+        "browser_evidence": browser_evidence,
+        "context": info.context if info else "",
+        "reproduced": confirmed,
+        "confidence": "confirmed" if browser_executed else ("high" if executable else "low"),
+    }
+    console.event("replay_result", **status)
+    console.raw("")
+    console.raw(json.dumps(status, indent=2, ensure_ascii=False))
+    console.raw("")
+    if browser_executed:
+        console.ok("Replay confirmed: the payload executed in the browser")
+        return 0
+    if executable:
+        console.ok("Replay reproduced HTTP-level execution evidence (browser not confirmed)")
+        return 0
+    if reflected:
+        console.warn("Replay reflected the payload, but it is not executable in this context")
+        return 1
+    console.error("Replay did not reproduce the finding")
+    return 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -5746,6 +6426,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.discover = True
         args.discover_paths = True
         args.fuzz_params = True
+
+    # Headed vs headless is resolved from the terminal/CI context unless the
+    # operator pinned it with --headless or --show-browser.
+    resolve_headless(args, explicit_flags)
+
+    if getattr(args, "replay", None):
+        install_uvloop()
+        try:
+            return asyncio.run(run_replay(args, console))
+        except KeyboardInterrupt:
+            console.warn("Interrupted")
+            return 130
+        except Exception as exc:
+            console.error(f"Replay failed: {exc}")
+            if args.verbose:
+                console.raw(traceback.format_exc())
+            return 1
 
     if args.mass and getattr(args, "param_audit", False):
         console.error("--mass and --param-audit are separate modes; choose one")

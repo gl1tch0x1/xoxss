@@ -161,31 +161,68 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
         lines += [
             "## XSS Findings",
             "",
-            "| # | Severity | Type | Method | Parameter | URL |",
-            "|---|----------|------|--------|-----------|-----|",
+            "| # | ID | Severity | Type | Method | Parameter | URL |",
+            "|---|----|----------|------|--------|-----------|-----|",
         ]
         for index, finding in enumerate(scanner.findings, 1):
             url = finding.url.replace("|", "%7C")
             lines.append(
-                f"| {index} | {finding.confidence} | {finding.kind} | {finding.method} | "
-                f"`{finding.parameter}` | {url} |"
+                f"| {index} | `{finding.finding_id}` | {finding.confidence} | {finding.kind} | "
+                f"{finding.method} | `{finding.parameter}` | {url} |"
             )
         lines += ["", "## Details", ""]
         for index, finding in enumerate(scanner.findings, 1):
             lines += [
                 f"### {index}. {finding.kind} ({finding.confidence})",
                 "",
+                f"- **Finding ID:** `{finding.finding_id}`",
                 f"- **URL:** {finding.url}",
                 f"- **Parameter:** `{finding.parameter}` ({finding.method})",
+                f"- **Source:** {finding.source or 'n/a'}",
                 f"- **Context:** {finding.context or 'n/a'}",
                 f"- **Evidence:** {finding.evidence or 'n/a'}",
+                f"- **Confidence:** {finding.confidence_rationale or 'n/a'}",
                 f"- **Detail:** {finding.detail or 'n/a'}",
             ]
+            if finding.sink:
+                lines.append(
+                    f"- **Sink:** `{finding.sink}`"
+                    + (f" at `{finding.dom_path}`" if finding.dom_path else "")
+                )
+            if finding.request:
+                request = finding.request
+                lines.append(
+                    f"- **Request:** `{request.get('method', finding.method)} "
+                    f"{request.get('url', finding.url)}`"
+                )
+                request_headers = request.get("headers") or {}
+                if request_headers:
+                    rendered = "; ".join(
+                        f"{name}: {value}" for name, value in request_headers.items()
+                    )
+                    lines.append(f"- **Request headers:** `{rendered}`")
+                if request.get("body"):
+                    lines += ["", "```http", str(request["body"]), "```", ""]
+            if finding.response_status:
+                lines.append(f"- **Response status:** {finding.response_status}")
+            if finding.response_excerpt:
+                lines += ["", "**Response excerpt** (around the marker):", "", "```html", finding.response_excerpt, "```", ""]
+            if finding.oob:
+                oob = finding.oob
+                lines.append(f"- **OOB callback:** {oob.get('callback', 'n/a')}")
+                if oob.get("page_url"):
+                    lines.append(f"- **Callback page URL:** {oob['page_url']}")
+                if oob.get("cookies"):
+                    lines.append(f"- **Callback cookies:** {'; '.join(oob['cookies'])}")
+                if oob.get("timestamp"):
+                    lines.append(f"- **Callback time:** {oob['timestamp']}")
             if finding.poc_url:
                 lines.append(f"- **PoC URL:** {finding.poc_url}")
             else:
                 lines.append("- **PoC URL:** n/a")
-            if finding.poc_command:
+            if finding.poc_curl:
+                lines += ["", "```bash", finding.poc_curl, "```", ""]
+            elif finding.poc_command:
                 lines += ["", "```bash", finding.poc_command, "```", ""]
             lines += [
                 f"- **Screenshot:** {finding.screenshot or 'n/a'}",

@@ -17,6 +17,8 @@ examples:
   xoxss https://target.tld --no-browser --report-reflections --report json
   xoxss https://target.tld --tamper all --max-payloads 12 --scan-headers
   xoxss https://target.tld --stored --stored-pages 20 --screenshot
+  xoxss https://target.tld --show-browser          # visible Chromium/Selenium window
+  xoxss --replay 1a2b3c4d5e6f7890 --replay-report .xoxss/reports/latest.json
 """
 
 
@@ -265,7 +267,8 @@ def build_parser(
         default="firefox",
         help="browser backend for verification: selenium firefox/chrome/edge or playwright (default: firefox)",
     )
-    browser.add_argument("--headless", action="store_true", help="run the browser headless")
+    browser.add_argument("--headless", action="store_true", help="run the browser headless (default: headless in CI/non-TTY, headed in a terminal)")
+    browser.add_argument("--show-browser", action="store_true", help="force a visible (headed) browser window; implies --headless is off")
     browser.add_argument("--no-browser", action="store_true", help="HTTP-only mode (no Selenium)")
     browser.add_argument("--browser-workers", type=int, default=1, help="parallel browser instances (default: 1)")
     browser.add_argument("--browser-discovery", action="store_true", help="visit a bounded sample of crawled pages and scan same-scope XHR/fetch/navigation URLs")
@@ -398,6 +401,16 @@ def build_parser(
     output.add_argument("--quiet", action="store_true", help="only print findings and errors")
     output.add_argument("--no-color", action="store_true", help="disable ANSI colours")
     output.add_argument("--fail-on-findings", action="store_true", help="exit with status 2 when findings exist")
+    output.add_argument(
+        "--replay",
+        metavar="FINDING_ID",
+        help="re-run one finding from a previous JSON report (one request + one browser check)",
+    )
+    output.add_argument(
+        "--replay-report",
+        metavar="PATH",
+        help="JSON report to load for --replay (default: newest *.json in --report-dir)",
+    )
 
     persistence = parser.add_argument_group("persistence")
     persistence.add_argument("--state-dir", default=default_state_dir, help="state/report root (default: .xoxss)")

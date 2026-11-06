@@ -101,13 +101,22 @@ def build_sarif_document(
         url = str(getattr(finding, "url", target))
         poc_url = str(getattr(finding, "poc_url", "") or "")
         poc_command = str(getattr(finding, "poc_command", "") or "")
+        poc_curl = str(getattr(finding, "poc_curl", "") or "")
+        sink = str(getattr(finding, "sink", "") or "")
+        dom_path = str(getattr(finding, "dom_path", "") or "")
 
         message_text = (
             f"{kind} via {method} parameter '{parameter}': "
             f"{_truncate(evidence or 'reflected payload')}"
         )
+        if sink:
+            message_text += f" | sink: {_truncate(sink, 120)}"
+            if dom_path:
+                message_text += f" at {_truncate(dom_path, 200)}"
         if poc_url:
             message_text += f" | PoC: {_truncate(poc_url, 400)}"
+        if poc_curl:
+            message_text += f" | curl: {_truncate(poc_curl, 600)}"
         if poc_command:
             message_text += f" | PoC command: {_truncate(poc_command, 400)}"
 
@@ -131,6 +140,8 @@ def build_sarif_document(
                     }
                 ],
                 "properties": {
+                    "findingId": getattr(finding, "finding_id", ""),
+                    "source": getattr(finding, "source", ""),
                     "parameter": parameter,
                     "method": method,
                     "confidence": confidence,
@@ -144,9 +155,16 @@ def build_sarif_document(
                     "payload": getattr(finding, "payload", ""),
                     "evidence": getattr(finding, "evidence", ""),
                     "detail": getattr(finding, "detail", ""),
+                    "sink": sink,
+                    "domPath": dom_path,
+                    "request": getattr(finding, "request", {}) or {},
+                    "responseStatus": getattr(finding, "response_status", 0) or 0,
+                    "responseExcerpt": getattr(finding, "response_excerpt", ""),
+                    "oob": getattr(finding, "oob", {}) or {},
                     "screenshot": getattr(finding, "screenshot", ""),
                     "pocUrl": poc_url,
                     "pocCommand": poc_command,
+                    "pocCurl": poc_curl,
                     "timestamp": getattr(finding, "timestamp", ""),
                 },
                 "partialFingerprints": {"xoxssFinding/v1": _finding_key(finding)},

@@ -321,10 +321,11 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
             poc_cell = (
                 html_lib.escape(truncate(finding.poc_url, 300))
                 if finding.poc_url
-                else html_lib.escape(truncate(finding.poc_command, 160))
+                else html_lib.escape(truncate(finding.poc_curl or finding.poc_command, 160))
             )
             rows.append(
                 "<tr>"
+                f'<td><code>{html_lib.escape(finding.finding_id)}</code></td>'
                 f'<td><span class="badge {html_lib.escape(finding.confidence)}">'
                 f"{html_lib.escape(finding.confidence)}</span></td>"
                 f"<td>{html_lib.escape(finding.kind)}</td>"
@@ -338,35 +339,88 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
             )
         content_parts.append(
             "<h2>XSS Findings</h2>"
-            "<table><thead><tr><th>Severity</th><th>Type</th><th>Method</th>"
+            "<table><thead><tr><th>ID</th><th>Severity</th><th>Type</th><th>Method</th>"
             "<th>Parameter</th><th>URL</th><th>Payload</th><th>PoC</th><th>Evidence</th></tr></thead>"
             "<tbody>" + "".join(rows) + "</tbody></table>"
         )
 
         details: List[str] = [
             "<h2>Proof of Concept</h2>",
-            "<p>Each block reproduces the finding: open the PoC URL (GET points) "
-            "or run the command (POST / header / cookie points). PoCs embed only "
-            "the injected parameter - no cookies or session data.</p>",
+            "<p>Each block reproduces the finding: run the <code>curl</code> command "
+            "or open the PoC URL. Requests are redacted so reports stay shareable; "
+            "supply your own session with <code>--headers</code>/<code>--cookies</code> "
+            "when replaying a finding with <code>--replay</code>.</p>",
             "",
         ]
         for index, finding in enumerate(scanner.findings, 1):
             detail_rows = [
+                f"<tr><th>Finding ID</th><td><code>{html_lib.escape(finding.finding_id)}</code></td></tr>",
                 f"<tr><th>Type</th><td>{html_lib.escape(finding.kind)} "
                 f'<span class="badge {html_lib.escape(finding.confidence)}">'
                 f"{html_lib.escape(finding.confidence)}</span></td></tr>",
                 f"<tr><th>Target</th><td><code>{html_lib.escape(finding.url)}</code></td></tr>",
                 f"<tr><th>Parameter</th><td><code>{html_lib.escape(finding.parameter)}</code>"
-                f" ({html_lib.escape(finding.method)}, context: {html_lib.escape(finding.context or 'n/a')})</td></tr>",
+                f" ({html_lib.escape(finding.method)}, source: {html_lib.escape(finding.source or 'n/a')}, "
+                f"context: {html_lib.escape(finding.context or 'n/a')})</td></tr>",
+                f"<tr><th>Confidence</th><td>{html_lib.escape(finding.confidence_rationale or 'n/a')}</td></tr>",
                 f"<tr><th>Evidence</th><td>{html_lib.escape(truncate(finding.evidence or finding.detail, 500))}</td></tr>",
                 f"<tr><th>Payload</th><td><code>{html_lib.escape(truncate(finding.payload, 400))}</code></td></tr>",
             ]
+            if finding.sink:
+                sink_text = f"<code>{html_lib.escape(finding.sink)}</code>"
+                if finding.dom_path:
+                    sink_text += f" at <code>{html_lib.escape(finding.dom_path)}</code>"
+                detail_rows.append(f"<tr><th>Sink</th><td>{sink_text}</td></tr>")
+            if finding.request:
+                request = finding.request
+                request_line = (
+                    f"{request.get('method', finding.method)} {request.get('url', finding.url)}"
+                )
+                detail_rows.append(
+                    f"<tr><th>Request</th><td><code>{html_lib.escape(request_line)}</code></td></tr>"
+                )
+                request_headers = request.get("headers") or {}
+                if request_headers:
+                    rendered = "\n".join(
+                        f"{name}: {value}" for name, value in request_headers.items()
+                    )
+                    detail_rows.append(
+                        f"<tr><th>Request headers</th><td><pre>{html_lib.escape(rendered)}</pre></td></tr>"
+                    )
+                if request.get("body"):
+                    detail_rows.append(
+                        f"<tr><th>Request body</th><td><pre>{html_lib.escape(str(request['body']))}</pre></td></tr>"
+                    )
+            if finding.response_status:
+                detail_rows.append(
+                    f"<tr><th>Response status</th><td>{finding.response_status}</td></tr>"
+                )
+            if finding.response_excerpt:
+                detail_rows.append(
+                    f"<tr><th>Response excerpt</th><td><pre>{html_lib.escape(finding.response_excerpt)}</pre></td></tr>"
+                )
+            if finding.oob:
+                oob = finding.oob
+                oob_lines = [f"callback: {oob.get('callback', 'n/a')}"]
+                if oob.get("page_url"):
+                    oob_lines.append(f"page: {oob['page_url']}")
+                if oob.get("cookies"):
+                    oob_lines.append(f"cookies: {'; '.join(oob['cookies'])}")
+                if oob.get("timestamp"):
+                    oob_lines.append(f"time: {oob['timestamp']}")
+                detail_rows.append(
+                    f"<tr><th>OOB callback</th><td><pre>{html_lib.escape(chr(10).join(oob_lines))}</pre></td></tr>"
+                )
             if finding.poc_url:
                 detail_rows.append(
                     f'<tr><th>PoC URL</th><td><a href="{html_lib.escape(finding.poc_url, quote=True)}">'
                     f"<code>{html_lib.escape(finding.poc_url)}</code></a></td></tr>"
                 )
-            if finding.poc_command:
+            if finding.poc_curl:
+                detail_rows.append(
+                    f"<tr><th>curl PoC</th><td><pre>{html_lib.escape(finding.poc_curl)}</pre></td></tr>"
+                )
+            elif finding.poc_command:
                 detail_rows.append(
                     f"<tr><th>PoC command</th><td><code>{html_lib.escape(finding.poc_command)}</code></td></tr>"
                 )

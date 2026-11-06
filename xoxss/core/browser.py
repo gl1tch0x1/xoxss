@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -42,13 +44,47 @@ HOOK_JS = r"""
     window.__xoxss_requests = window.__xoxss_requests || [];
     window.__xoxss_errors = window.__xoxss_errors || [];
 
-    var record = function (name, value) {
+    var record = function (name, value, target) {
       try {
         if (window.__xoxss_sinks.length > 250) { return; }
         var text = String(value);
         if (text.length > 600) { text = text.slice(0, 600); }
-        window.__xoxss_sinks.push({ sink: name, value: text });
+        window.__xoxss_sinks.push({
+          sink: name,
+          value: text,
+          dom_path: describeNode(target)
+        });
       } catch (e) {}
+    };
+    var describeNode = function (node) {
+      try {
+        if (!node) { return ''; }
+        if (node.nodeType === 9) { return 'document'; }
+        if (!node.tagName && node.parentNode) { node = node.parentNode; }
+        if (!node || !node.tagName) { return ''; }
+        var parts = [];
+        var current = node;
+        var depth = 0;
+        while (current && current.nodeType === 1 && depth < 6) {
+          var part = current.tagName.toLowerCase();
+          if (current.id) {
+            var safeId = String(current.id).replace(/[^A-Za-z0-9_-]/g, '');
+            if (safeId) { part += '#' + safeId; parts.unshift(part); break; }
+          }
+          var parent = current.parentNode;
+          if (parent && parent.children && parent.children.length > 1) {
+            var index = 0;
+            for (var i = 0; i < parent.children.length; i++) {
+              if (parent.children[i] === current) { index = i + 1; break; }
+            }
+            if (index) { part += ':nth-child(' + index + ')'; }
+          }
+          parts.unshift(part);
+          current = parent;
+          depth++;
+        }
+        return parts.join(' > ');
+      } catch (e) { return ''; }
     };
     var recordRequest = function (value) {
       try {
@@ -108,7 +144,7 @@ HOOK_JS = r"""
         Object.defineProperty(Element.prototype, 'innerHTML', {
           configurable: true,
           get: function () { return innerDesc.get.call(this); },
-          set: function (value) { record('innerHTML', value); return innerDesc.set.call(this, value); }
+          set: function (value) { record('innerHTML', value, this); return innerDesc.set.call(this, value); }
         });
       }
     } catch (e) {}
@@ -119,7 +155,7 @@ HOOK_JS = r"""
         Object.defineProperty(Element.prototype, 'outerHTML', {
           configurable: true,
           get: function () { return outerDesc.get.call(this); },
-          set: function (value) { record('outerHTML', value); return outerDesc.set.call(this, value); }
+          set: function (value) { record('outerHTML', value, this); return outerDesc.set.call(this, value); }
         });
       }
     } catch (e) {}
@@ -127,12 +163,12 @@ HOOK_JS = r"""
     try {
       var originalWrite = document.write;
       document.write = function () {
-        record('document.write', Array.prototype.join.call(arguments, ''));
+        record('document.write', Array.prototype.join.call(arguments, ''), document);
         return originalWrite.apply(document, arguments);
       };
       var originalWriteln = document.writeln;
       document.writeln = function () {
-        record('document.writeln', Array.prototype.join.call(arguments, ''));
+        record('document.writeln', Array.prototype.join.call(arguments, ''), document);
         return originalWriteln.apply(document, arguments);
       };
     } catch (e) {}
@@ -161,7 +197,7 @@ HOOK_JS = r"""
     try {
       var originalInsert = Element.prototype.insertAdjacentHTML;
       Element.prototype.insertAdjacentHTML = function (position, markup) {
-        record('insertAdjacentHTML', markup);
+        record('insertAdjacentHTML', markup, this);
         return originalInsert.apply(this, arguments);
       };
     } catch (e) {}
@@ -171,13 +207,13 @@ HOOK_JS = r"""
       Element.prototype.setAttribute = function (name, value) {
         var attr = String(name || '').toLowerCase();
         if (attr === 'srcdoc' || attr === 'style' || /^on[a-z]+$/.test(attr)) {
-          record('setAttribute:' + attr, value);
+          record('setAttribute:' + attr, value, this);
         }
         return originalSetAttribute.apply(this, arguments);
       };
       var originalFragment = Range.prototype.createContextualFragment;
       Range.prototype.createContextualFragment = function (markup) {
-        record('createContextualFragment', markup);
+        record('createContextualFragment', markup, this.startContainer || null);
         return originalFragment.apply(this, arguments);
       };
       var originalParse = DOMParser.prototype.parseFromString;
@@ -255,6 +291,72 @@ CHROME_ARGS = [
     "--window-size=1366,900",
 ]
 
+# Well-known Chromium/Chrome locations.  Selenium Manager downloads a driver
+# (and sometimes a browser) on demand; when a system Chromium already exists we
+# point Selenium at it instead, which works offline and in hardened CI images.
+CHROMIUM_CANDIDATES = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/snap/bin/chromium",
+    "/usr/local/bin/chromium",
+    "/usr/local/bin/chromium-browser",
+    "/usr/local/bin/google-chrome",
+    "/opt/google/chrome/chrome",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+]
+
+_WINDOWS_CHROMIUM = [
+    r"ProgramFiles\Google\Chrome\Application\chrome.exe",
+    r"ProgramFiles(x86)\Google\Chrome\Application\chrome.exe",
+    r"LocalAppData\Chromium\Application\chrome.exe",
+]
+
+
+def chromium_candidates() -> List[str]:
+    """Return candidate Chromium binaries in priority order."""
+    candidates: List[str] = []
+    for env_name in ("XOXSS_CHROMIUM", "CHROME_BIN", "CHROMIUM_BIN"):
+        value = os.environ.get(env_name)
+        if value:
+            candidates.append(value)
+    candidates.extend(CHROMIUM_CANDIDATES)
+    if os.name == "nt":
+        for relative in _WINDOWS_CHROMIUM:
+            root = os.environ.get(relative.split("\\", 1)[0], "")
+            if root:
+                candidates.append(str(Path(root) / relative.split("\\", 1)[1]))
+    for executable in ("chromium", "chromium-browser", "google-chrome", "chrome"):
+        found = shutil.which(executable)
+        if found:
+            candidates.append(found)
+    return list(dict.fromkeys(candidates))
+
+
+def detect_chromium_binary() -> Optional[str]:
+    """Locate a system Chromium/Chrome executable, if one is installed."""
+    for candidate in chromium_candidates():
+        try:
+            if candidate and Path(candidate).is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
+def headed_diagnostic() -> str:
+    """Explain why headed mode may fail on a headless Linux host."""
+    if os.name == "nt":
+        return ""
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return ""
+    return (
+        "headed mode needs an X/Wayland display and none is set (DISPLAY is empty); "
+        "use --headless, or wrap the command with `xvfb-run -a xoxss ...`"
+    )
+
 
 class BrowserEngine:
     """Single Selenium driver guarded by an asyncio lock."""
@@ -303,6 +405,9 @@ class BrowserEngine:
             driver = self._create_driver()
         except Exception as exc:
             self.console.error(f"Could not start {self.kind}: {exc}")
+            hint = headed_diagnostic() if not self.headless else ""
+            if hint:
+                self.console.warn(hint)
             return False
 
         self.driver = driver
@@ -340,10 +445,17 @@ class BrowserEngine:
                 options.add_argument(f"--proxy-server={self.proxy}")
             if self.binary:
                 options.binary_location = self.binary
+            else:
+                detected = detect_chromium_binary()
+                if detected:
+                    options.binary_location = detected
+                    self.console.debug(f"Using detected Chromium binary: {detected}")
             if self.insecure:
                 options.add_argument("--ignore-certificate-errors")
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option("useAutomationExtension", False)
+            if not self.headless:
+                options.add_argument("--start-maximized")
             try:
                 return webdriver.Chrome(options=options)
             except Exception as first:
@@ -505,6 +617,8 @@ class BrowserEngine:
     def _match(data: Dict[str, Any], token: str) -> Optional[Dict[str, str]]:
         channels: List[str] = []
         executed = False
+        sink_name = ""
+        dom_path = ""
         for key, label in (
             ("hits", "js-executed"),
             ("alerts", "alert"),
@@ -514,16 +628,29 @@ class BrowserEngine:
         ):
             for item in data.get(key) or []:
                 blob = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
-                if token in blob:
-                    channels.append(f"{label}: {_truncate(blob, 200)}")
-                    if key in ("hits", "alerts", "dialogs"):
-                        executed = True
+                if token not in blob:
+                    continue
+                channels.append(f"{label}: {_truncate(blob, 200)}")
+                if key in ("hits", "alerts", "dialogs"):
+                    executed = True
+                if key == "sinks" and isinstance(item, dict):
+                    if not sink_name and item.get("sink"):
+                        sink_name = str(item["sink"])
+                    if not dom_path and item.get("dom_path"):
+                        dom_path = str(item["dom_path"])
         if not channels:
             return None
+        in_dom = "yes" if token in (data.get("html") or "") else "no"
+        if not dom_path and in_dom == "yes":
+            # The value is in the serialized DOM even if the instrumented sink
+            # that wrote it could not describe its node (e.g. document.write).
+            dom_path = ""
         return {
             "evidence": " | ".join(channels[:4]),
             "executed": "yes" if executed else "no",
-            "in_dom": "yes" if token in (data.get("html") or "") else "no",
+            "in_dom": in_dom,
+            "sink": sink_name,
+            "dom_path": dom_path,
         }
 
     async def submit_form(self, form_index: int, field_name: str, value: str) -> Dict[str, str]:
@@ -672,6 +799,9 @@ class PlaywrightEngine:
             # Branded builds are opportunistic fallbacks; with --binary the
             # operator pinned the executable and channels are irrelevant.
             attempts += [dict(launch, channel="chrome"), dict(launch, channel="msedge")]
+            detected = detect_chromium_binary()
+            if detected:
+                attempts.append(dict(launch, executable_path=detected))
         last_error: Optional[Exception] = None
         first_error: Optional[Exception] = None
         for attempt in attempts:
@@ -760,6 +890,9 @@ class PlaywrightEngine:
             base = text.splitlines()[0] if text else "unknown error"
             self.console.error(f"Could not start Playwright Chromium: {base}")
             self.console.debug(f"playwright launch error: {text}")
+        hint = headed_diagnostic() if not self.headless else ""
+        if hint:
+            self.console.warn(hint)
 
     async def stop(self) -> None:
         for resource in (self._context, self._browser):

@@ -13,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urlencode, urljoin, urlsplit
 
 try:
     import aiohttp
@@ -53,6 +53,13 @@ class HttpResponse:
     from_cache: bool = False
     truncated: bool = False
     raw: bytes = field(default=b"", repr=False)
+    # The request that produced this response.  Kept alongside the body so a
+    # finding can carry a complete, reproducible request instead of only the
+    # parameter that was mutated.
+    request_method: str = "GET"
+    request_url: str = ""
+    request_headers: Dict[str, str] = field(default_factory=dict)
+    request_body: str = ""
 
     @property
     def ok(self) -> bool:
@@ -60,6 +67,18 @@ class HttpResponse:
 
     def header(self, name: str, default: str = "") -> str:
         return self.headers.get(name.lower(), default)
+
+    def request_dict(self, injected_parameter: str = "") -> Dict[str, object]:
+        """Redacted request evidence for reports and ``--replay``."""
+        from xoxss.core.evidence import request_to_dict
+
+        return request_to_dict(
+            self.request_method,
+            self.request_url or self.url,
+            headers=self.request_headers,
+            body=self.request_body,
+            injected_parameter=injected_parameter,
+        )
 
 
 class RateLimiter:
@@ -364,7 +383,7 @@ class HttpEngine:
         self,
         url: str,
         *,
-        data: Optional[Dict[str, str]] = None,
+        data: Optional[Any] = None,
         json_body: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         allow_redirects: bool = True,
@@ -384,7 +403,7 @@ class HttpEngine:
         url: str,
         *,
         headers: Optional[Dict[str, str]] = None,
-        data: Optional[Dict[str, str]] = None,
+        data: Optional[Any] = None,
         json_body: Optional[Dict[str, Any]] = None,
         allow_redirects: bool = True,
         cache: bool = False,
@@ -430,8 +449,13 @@ class HttpEngine:
                     current_data, current_json = data, json_body
                     response: Optional[ClientResponse] = None
                     started = time.monotonic()
+                    sent_headers: Dict[str, str] = {}
+                    sent_body = ""
                     for redirect_count in range(11):
                         await self._apply_rate_limit(urlsplit(current_url).hostname or "")
+                        sent_headers, sent_body = self._sent_request(
+                            headers, current_data, current_json
+                        )
                         response = await self.session.request(
                             current_method,
                             current_url,
@@ -495,6 +519,10 @@ class HttpEngine:
                             raw=bytes(raw),
                             elapsed=elapsed,
                             truncated=truncated,
+                            request_method=current_method,
+                            request_url=current_url,
+                            request_headers=sent_headers,
+                            request_body=sent_body,
                         )
                         if truncated:
                             self.stats.truncated_responses += 1
@@ -572,13 +600,32 @@ class HttpEngine:
         return HttpResponse(url=url, error=last_error)
 
     # -- internals --------------------------------------------------------------------
+    def _sent_request(
+        self,
+        headers: Optional[Dict[str, str]],
+        data: Optional[Any],
+        json_body: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, str], str]:
+        """Materialise the headers/body actually sent for evidence capture."""
+        merged: Dict[str, str] = dict(self.base_headers)
+        if headers:
+            merged.update({str(key): str(value) for key, value in headers.items()})
+        if self.cookies and not any(name.lower() == "cookie" for name in merged):
+            merged["Cookie"] = "; ".join(f"{name}={value}" for name, value in self.cookies.items())
+        body = ""
+        if data:
+            body = urlencode(data, doseq=True) if isinstance(data, dict) else str(data)
+        elif json_body is not None:
+            body = json.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
+        return merged, body
+
     async def _request_curl(
         self,
         method: str,
         url: str,
         *,
         headers: Optional[Dict[str, str]] = None,
-        data: Optional[Dict[str, str]] = None,
+        data: Optional[Any] = None,
         json_body: Optional[Dict[str, Any]] = None,
         allow_redirects: bool = True,
         cache: bool = False,
@@ -591,9 +638,6 @@ class HttpEngine:
         """
         delay = 0.0
         last_error = "request failed after retries"
-        request_headers: Optional[Dict[str, str]] = None
-        if headers:
-            request_headers = {**self.base_headers, **headers}
         for attempt in range(self.retries + 1):
             if delay:
                 await asyncio.sleep(delay)
@@ -608,8 +652,14 @@ class HttpEngine:
                     current_data, current_json = data, json_body
                     response: Any = None
                     started = time.monotonic()
+                    sent_headers: Dict[str, str] = {}
+                    sent_body = ""
                     for redirect_count in range(11):
                         await self._apply_rate_limit(urlsplit(current_url).hostname or "")
+                        request_headers, sent_body = self._sent_request(
+                            headers, current_data, current_json
+                        )
+                        sent_headers = request_headers
                         options: Dict[str, Any] = {
                             "headers": request_headers,
                             "data": current_data,
@@ -687,6 +737,10 @@ class HttpEngine:
                             raw=raw,
                             elapsed=elapsed,
                             truncated=truncated,
+                            request_method=current_method,
+                            request_url=current_url,
+                            request_headers=sent_headers,
+                            request_body=sent_body,
                         )
                         if truncated:
                             self.stats.truncated_responses += 1
@@ -773,7 +827,7 @@ class HttpEngine:
         method: str,
         url: str,
         headers: Optional[Dict[str, str]],
-        data: Optional[Dict[str, str]],
+        data: Optional[Any],
         json_body: Optional[Dict[str, Any]] = None,
     ) -> str:
         raw = json.dumps(
