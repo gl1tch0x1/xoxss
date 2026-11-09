@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import sys
 from typing import Collection
+
+try:  # stdlib-only UI helpers; safe to import before the package is installed
+    from xoxss.utils import ui as _ui
+except Exception:  # pragma: no cover - standalone checkout edge case
+    _ui = None
 
 
 EXAMPLES = """
@@ -19,7 +26,80 @@ examples:
   xoxss https://target.tld --stored --stored-pages 20 --screenshot
   xoxss https://target.tld --show-browser          # visible Chromium/Selenium window
   xoxss --replay 1a2b3c4d5e6f7890 --replay-report .xoxss/reports/latest.json
+
+evidence policy:
+  default findings require a reflected payload whose breakout delimiters survive
+  in an executable context.  Inert reflections and static DOM candidates are
+  opt-in leads via --report-reflections; blind findings require a real callback.
 """
+
+_HEADING_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 &/_-]{1,40}):$")
+_OPTION_RE = re.compile(r"^(  )(-\S.*?)(\s{2,})(\S.*)$")
+_POSITIONAL_RE = re.compile(r"^(  )([A-Za-z][\w.-]*)(\s{2,})(\S.*)$")
+_LONE_OPTION_RE = re.compile(r"^(  )(-\S.*)$")
+_EXAMPLE_RE = re.compile(r"^(  )(xoxss)(\s+)(.*)$")
+
+
+def _styled_help(text: str) -> str:
+    """Colour an aligned argparse help block without breaking its columns."""
+    if _ui is None or not _ui.enabled():
+        return text
+
+    out = []
+    for line in text.splitlines():
+        stripped = line.strip()
+
+        if line.startswith("usage:"):
+            line = _ui.paint("usage:", _ui.BRAND, _ui.BOLD) + line[len("usage:"):]
+        elif _HEADING_RE.match(line):
+            arrow = _ui.glyphs().get("arrow", "->")
+            line = (
+                _ui.paint(f"{arrow} ", _ui.BRAND, _ui.BOLD)
+                + _ui.paint(line, _ui.WHITE, _ui.BOLD)
+            )
+        else:
+            example = _EXAMPLE_RE.match(line)
+            option = _OPTION_RE.match(line)
+            positional = _POSITIONAL_RE.match(line)
+            if example:
+                indent, prog, gap, rest = example.groups()
+                comment = ""
+                match = re.match(r"^(.*?)(\s+#.*)$", rest)
+                if match:
+                    rest, comment = match.groups()
+                styled = _ui.paint(prog, _ui.BRAND, _ui.BOLD)
+                styled += gap + _ui.paint(rest, _ui.WHITE)
+                if comment:
+                    styled += _ui.paint(comment, _ui.GREY)
+                line = indent + styled
+            elif option:
+                indent, invocation, gap, body = option.groups()
+                line = (
+                    indent
+                    + _ui.paint(invocation, _ui.WHITE, _ui.BOLD)
+                    + gap
+                    + body
+                )
+            elif _LONE_OPTION_RE.match(line):
+                line = line[:2] + _ui.paint(line[2:], _ui.WHITE, _ui.BOLD)
+            elif positional:
+                indent, name, gap, body = positional.groups()
+                line = (
+                    indent
+                    + _ui.paint(name, _ui.BRAND_BRIGHT)
+                    + gap
+                    + body
+                )
+
+        out.append(line)
+    return "\n".join(out)
+
+
+class XoxssHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Raw argparse help with a restrained red-team palette on a TTY."""
+
+    def format_help(self) -> str:  # noqa: D102 - argparse hook
+        return _styled_help(super().format_help())
 
 
 def build_parser(
@@ -31,8 +111,11 @@ def build_parser(
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="xoxss",
-        description=f"{app_name} v{version} - advanced, persistent, context-aware XSS scanner",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            f"{app_name} v{version} - evidence-first, context-aware XSS scanner\n"
+            "authorised offensive testing only; every finding ships with a PoC"
+        ),
+        formatter_class=XoxssHelpFormatter,
         epilog=EXAMPLES,
     )
     parser.add_argument("target", nargs="*", help="target URL(s); http:// is assumed when missing")
@@ -43,14 +126,14 @@ def build_parser(
         help="scan preset: quick (HTTP-only, local payloads), balanced (default), or deep",
     )
 
-    crawl = parser.add_argument_group("discovery")
+    crawl = parser.add_argument_group("discovery", "map the attack surface before injecting")
     crawl.add_argument("--crawl", action="store_true", help="crawl the target before scanning")
     crawl.add_argument(
         "--deep",
         action="store_true",
         help="deep crawl preset: depth 5, 1500 URLs, robots/sitemap/JS + path discovery, parameter fuzzing",
     )
-    godmode = parser.add_argument_group("god mode")
+    godmode = parser.add_argument_group("god mode", "one flag for the full offensive workflow")
     godmode.add_argument(
         "--god",
         "--yolo",
@@ -126,7 +209,7 @@ def build_parser(
         help="maximum in-scope endpoints sent to external hidden-parameter tools (default: 100)",
     )
 
-    injection = parser.add_argument_group("injection")
+    injection = parser.add_argument_group("injection", "payload corpus, evasion and injection points")
     injection.add_argument(
         "--payload-file",
         help="custom payloads or JSON lists ('context|payload' supported; repeat with ':').",
@@ -250,7 +333,7 @@ def build_parser(
         "injects out-of-band probes into every parameter and form",
     )
 
-    oob = parser.add_argument_group("out-of-band")
+    oob = parser.add_argument_group("out-of-band", "confirm blind XSS through real callbacks")
     oob.add_argument(
         "--interactsh",
         nargs="?",
@@ -277,7 +360,7 @@ def build_parser(
     )
 
     # Advanced features (Phase 1 & 2)
-    advanced = parser.add_argument_group("advanced")
+    advanced = parser.add_argument_group("advanced", "specialised XSS and browser-side analyses")
     advanced.add_argument("--polyglot", action="store_true", help="use polyglot payloads for faster scanning")
     advanced.add_argument("--per-char-probe", action="store_true", help="use per-character probing for precise context detection")
     advanced.add_argument("--jsonp", action="store_true", help="detect and test JSONP endpoints for XSS")
@@ -297,7 +380,7 @@ def build_parser(
     advanced.add_argument("--file-upload", action="store_true", help="detect file upload XSS vulnerabilities")
     advanced.add_argument("--postmessage", action="store_true", help="detect postMessage XSS vulnerabilities")
 
-    ai_group = parser.add_argument_group("ai fallback")
+    ai_group = parser.add_argument_group("ai fallback", "LLM candidates, still evidence-gated")
     ai_group.add_argument(
         "--ai",
         action="store_true",
@@ -322,7 +405,7 @@ def build_parser(
         "--ai-timeout", type=float, default=60.0, help="AI request timeout in seconds (default: 60)"
     )
 
-    browser = parser.add_argument_group("browser")
+    browser = parser.add_argument_group("browser", "execution verification and authenticated browsing")
     browser.add_argument(
         "--browser",
         choices=["firefox", "chrome", "chromium", "edge", "playwright"],
@@ -342,7 +425,7 @@ def build_parser(
     browser.add_argument("--binary", help="explicit browser binary path")
     browser.add_argument("--user-agent", default=user_agent, help="User-Agent override")
 
-    network = parser.add_argument_group("network")
+    network = parser.add_argument_group("network", "transport, pacing and concurrency")
     network.add_argument("--threads", type=int, default=10, help="parallel URL workers (default: 10)")
     network.add_argument("--concurrency", type=int, default=16, help="parallel HTTP requests (default: 16)")
     network.add_argument("--per-host-concurrency", type=int, default=4, help="maximum simultaneous HTTP requests per host (default: 4)")
@@ -375,7 +458,7 @@ def build_parser(
         help="cookie file (JSON, Playwright storage state, Netscape cookies.txt, or name=value lines)",
     )
 
-    mass = parser.add_argument_group("mass mode")
+    mass = parser.add_argument_group("mass mode", "stateless high-volume sweep")
     mass.add_argument(
         "--mass",
         action="store_true",
@@ -399,7 +482,7 @@ def build_parser(
         help="append one JSON finding per line (mass mode or --param-audit)",
     )
 
-    params = parser.add_argument_group("parameter audit")
+    params = parser.add_argument_group("parameter audit", "harvest and reflection-check parameters")
     params.add_argument(
         "--param-audit",
         action="store_true",
@@ -460,7 +543,7 @@ def build_parser(
         help="only harvest the exact host, not its subdomains",
     )
 
-    output = parser.add_argument_group("output")
+    output = parser.add_argument_group("output", "reports, logs and CI signals")
     output.add_argument("-o", "--output", help="write the full text log to this file")
     output.add_argument("--report", default="all", help="json, md, html, sarif, all or none (default: all)")
     output.add_argument("--report-dir", default=os.path.join(default_state_dir, "reports"), help="report directory")
@@ -483,12 +566,12 @@ def build_parser(
         help="JSON report to load for --replay (default: newest *.json in --report-dir)",
     )
 
-    persistence = parser.add_argument_group("persistence")
+    persistence = parser.add_argument_group("persistence", "resume checkpoints and scan state")
     persistence.add_argument("--state-dir", default=default_state_dir, help="state/report root (default: .xoxss)")
     persistence.add_argument("--no-state", action="store_true", help="disable checkpoints")
     persistence.add_argument("--no-resume", action="store_true", help="ignore and reset the existing checkpoint")
 
-    misc = parser.add_argument_group("misc")
+    misc = parser.add_argument_group("misc", "utilities and diagnostics")
     misc.add_argument("--list-payloads", action="store_true", help="print built-in payloads and exit")
     misc.add_argument("--doctor", action="store_true", help="check the installation and exit")
     misc.add_argument("--list-tampers", action="store_true", help="print available tampers and exit")

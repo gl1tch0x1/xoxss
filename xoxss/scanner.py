@@ -601,6 +601,7 @@ class Console:
         self._log_path: Optional[Path] = None
         self._events_path: Optional[Path] = Path(events_file) if events_file else None
         self._events_error_reported = False
+        self._width_cache: Tuple[float, int] = (0.0, 100)
         if log_file:
             self._log_path = Path(log_file)
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -650,12 +651,14 @@ class Console:
             self._status_text = text
 
     def _status_loop(self) -> None:
+        last_drawn = ""
         while not self._status_stop.wait(0.5):
             with self._lock:
                 try:
-                    if self._status_text:
+                    if self._status_text and self._status_text != last_drawn:
                         sys.stdout.write("\r\033[K" + self._status_text)
                         sys.stdout.flush()
+                        last_drawn = self._status_text
                 except Exception:
                     pass
 
@@ -669,10 +672,16 @@ class Console:
 
     # -- printing ---------------------------------------------------------------------
     def _width(self) -> int:
+        now = time.monotonic()
+        cached_at, cached = self._width_cache
+        if now - cached_at < 1.0:
+            return cached
         try:
-            return max(60, shutil.get_terminal_size((110, 30)).columns)
+            width = max(60, shutil.get_terminal_size((110, 30)).columns)
         except Exception:
-            return 100
+            width = 100
+        self._width_cache = (now, width)
+        return width
 
     @staticmethod
     def _prefix(level: str) -> str:
@@ -784,15 +793,16 @@ class Console:
         self._emit("raw", message, important=True)
 
     def finding(self, finding: "Finding") -> None:
+        confidence = str(finding.confidence or "low")
         confidence_style = {
             "confirmed": f"{bcolors.FAIL}{bcolors.BOLD}",
             "high": f"{bcolors.WARNING}{bcolors.BOLD}",
             "medium": f"{bcolors.WARNING}",
             "low": f"{bcolors.GREY}",
-        }.get(finding.confidence, bcolors.ENDC)
+        }.get(confidence, bcolors.ENDC)
         lines = [
             f"{bcolors.BOLD}{finding.kind}{bcolors.ENDC}  "
-            f"{confidence_style}[{finding.confidence}]{bcolors.ENDC}",
+            f"{confidence_style}[{confidence.upper()}]{bcolors.ENDC}",
             f"{bcolors.GREY}URL        :{bcolors.ENDC} {finding.url}",
             f"{bcolors.GREY}Parameter  :{bcolors.ENDC} {finding.parameter} ({finding.method})",
             f"{bcolors.GREY}Payload    :{bcolors.ENDC} {finding.payload}",
@@ -803,6 +813,10 @@ class Console:
             lines.append(f"{bcolors.GREY}Evidence   :{bcolors.ENDC} {truncate(finding.evidence, 240)}")
         if finding.detail:
             lines.append(f"{bcolors.GREY}Detail     :{bcolors.ENDC} {finding.detail}")
+        if self.verbose and finding.confidence_rationale:
+            lines.append(
+                f"{bcolors.GREY}Rationale  :{bcolors.ENDC} {finding.confidence_rationale}"
+            )
         if finding.screenshot:
             lines.append(f"{bcolors.GREY}Screenshot :{bcolors.ENDC} {finding.screenshot}")
         if finding.poc_url:
@@ -812,6 +826,10 @@ class Console:
         if finding.poc_command:
             lines.append(
                 f"{bcolors.GREY}PoC command:{bcolors.ENDC} {finding.poc_command}"
+            )
+        if finding.finding_id:
+            lines.append(
+                f"{bcolors.GREY}Id         :{bcolors.ENDC} {finding.finding_id}"
             )
         self._emit("ok", "\n".join(lines), important=True)
 
@@ -872,6 +890,74 @@ def banner(console: Optional[Console] = None) -> None:
         console.raw(text)
     else:
         print(text)
+
+
+def briefing_rows(args: argparse.Namespace, target: str) -> List[Tuple[str, str]]:
+    """Return the compact rows shown in the pre-scan operation briefing."""
+    profile = str(getattr(args, "profile", "balanced") or "balanced")
+    if getattr(args, "no_browser", False):
+        mode = "http-only"
+    else:
+        browser = str(getattr(args, "browser", "firefox") or "firefox")
+        visibility = "headless" if getattr(args, "headless", False) else "headed"
+        mode = f"{browser} ({visibility})"
+
+    pacing = []
+    if getattr(args, "threads", None):
+        pacing.append(f"{getattr(args, 'threads')} workers")
+    if getattr(args, "concurrency", None):
+        pacing.append(f"{getattr(args, 'concurrency')} req")
+    if pacing:
+        mode += " / " + " / ".join(str(item) for item in pacing)
+
+    vectors = ["query/form"]
+    vector_flags = (
+        ("crawl", "crawl"),
+        ("deep", "deep"),
+        ("discover", "discover"),
+        ("fuzz_params", "param-fuzz"),
+        ("scan_headers", "headers"),
+        ("stored", "stored"),
+        ("path_xss", "path"),
+        ("fragment_xss", "fragment"),
+        ("dom", "dom"),
+        ("websocket", "websocket"),
+        ("external_tools", "external"),
+    )
+    for flag, label in vector_flags:
+        if getattr(args, flag, False) and label not in vectors:
+            vectors.append(label)
+    if getattr(args, "blind", None) or getattr(args, "interactsh", None):
+        vectors.append("blind-xss")
+
+    shown = vectors[:6]
+    vector_text = ", ".join(shown)
+    if len(vectors) > len(shown):
+        vector_text += f" +{len(vectors) - len(shown)}"
+
+    if getattr(args, "report_reflections", False):
+        evidence = "executable + inert reflections (opt-in leads)"
+    else:
+        evidence = "executable evidence only (inert reflections skipped)"
+
+    reports = str(getattr(args, "report", "all") or "all")
+    if reports.lower() in ("none", ""):
+        artifacts = "console only"
+    else:
+        report_dir = getattr(args, "report_dir", os.path.join(DEFAULT_STATE_DIR, "reports"))
+        artifacts = f"{reports} -> {report_dir}"
+
+    rows = [
+        ("TARGET", target),
+        ("PROFILE", f"{profile} / {mode}"),
+        ("VECTORS", vector_text),
+        ("EVIDENCE", evidence),
+        ("ARTIFACTS", artifacts),
+    ]
+    oob = getattr(args, "blind", None) or getattr(args, "interactsh", None)
+    if oob:
+        rows.append(("OOB", str(oob)))
+    return rows
 
 # --------------------------------------------------------------------------------------
 # Data models
@@ -1015,6 +1101,50 @@ class Finding:
                 "low": "A heuristic signal needs manual validation.",
             }.get(self.confidence, "Confidence was not classified; review the evidence manually.")
         return result
+
+
+CONFIDENCE_LEVELS = ("confirmed", "high", "medium", "low")
+
+
+def enforce_finding_policy(finding: Finding) -> bool:
+    """Normalise confidence and reject claims that are not evidence-backed.
+
+    The scanner intentionally produces a small number of graded findings rather
+    than a long reflection list.  This gate is the last line of defence: an
+    invalid or empty finding is dropped, and a ``confirmed``/``high`` claim
+    without any recorded evidence is downgraded instead of being printed as
+    fact.  It mutates ``finding`` in place and returns False only when the
+    finding is unusable.
+    """
+    if not str(finding.kind or "").strip() or not str(finding.url or "").strip():
+        return False
+
+    confidence = str(finding.confidence or "").strip().lower()
+    if confidence not in CONFIDENCE_LEVELS:
+        confidence = "low"
+
+    has_evidence = any(
+        (
+            str(finding.evidence or "").strip(),
+            str(finding.response_excerpt or "").strip(),
+            str(finding.screenshot or "").strip(),
+            bool(finding.oob),
+            bool(finding.request),
+        )
+    )
+    if confidence == "confirmed" and not has_evidence:
+        confidence = "high"
+        finding.confidence_rationale = (
+            "Downgraded from confirmed: no execution evidence was recorded."
+        )
+    elif confidence == "high" and not has_evidence:
+        confidence = "medium"
+        finding.confidence_rationale = (
+            "Downgraded from high: no request or response evidence was recorded."
+        )
+
+    finding.confidence = confidence
+    return True
 
 
 @dataclass
@@ -2652,7 +2782,8 @@ class XSSScanner(CrawlerMixin):
             elif self.args.no_resume:
                 self.state.reset()
 
-            self.console.info(f"Target: {self.target}")
+            if not self._print_briefing():
+                self.console.info(f"Target: {self.target}")
             if self.state.scanned:
                 self.console.info(
                     f"Resume checkpoint: {len(self.state.scanned)} URL(s), "
@@ -2738,6 +2869,8 @@ class XSSScanner(CrawlerMixin):
             try:
                 finding = Finding(**{key: value for key, value in raw.items() if key in fields})
             except Exception:
+                continue
+            if not enforce_finding_policy(finding):
                 continue
             if finding.key() in self._finding_keys:
                 continue
@@ -4552,6 +4685,11 @@ class XSSScanner(CrawlerMixin):
             return None
 
     def add_finding(self, finding: Finding) -> bool:
+        if not enforce_finding_policy(finding):
+            self.console.debug(
+                f"Dropped malformed finding: kind={finding.kind!r} url={finding.url!r}"
+            )
+            return False
         key = finding.key()
         if key in self._finding_keys:
             return False
@@ -5421,16 +5559,62 @@ class XSSScanner(CrawlerMixin):
         return None
 
     # -- summary ----------------------------------------------------------------------
+    def _print_briefing(self) -> bool:
+        """Render the operation briefing; returns False when output is plain."""
+        if self.console.quiet or _ui is None or not _ui.enabled():
+            return False
+        rows = briefing_rows(self.args, self.target)
+        if not rows:
+            return False
+        label_width = max(len(label) for label, _ in rows)
+        body = [
+            _ui.paint(label.ljust(label_width), _ui.BRAND, _ui.BOLD) + "  " + value
+            for label, value in rows
+        ]
+        width = min(96, max(64, self.console._width() - 6))
+        self.console.raw("")
+        self.console.raw(_ui.panel("operation briefing", body, width=width))
+        self.console.raw("")
+        return True
+
     def print_summary(self) -> None:
         if self.console.quiet:
             return
         stats = self.stats
-        self.console.raw("")
-        self.console.rule("scan summary")
-        self.console.raw("")
+        console = self.console
+        console.raw("")
+        console.rule("scan summary")
+        console.raw("")
+
+        confidence_counts = Counter(
+            str(finding.confidence or "low") for finding in self.findings
+        )
+        total = len(self.findings)
+        tally = " / ".join(
+            f"{confidence_counts[level]} {level}"
+            for level in CONFIDENCE_LEVELS
+            if confidence_counts[level]
+        )
+        finding_style = f"{bcolors.FAIL}{bcolors.BOLD}" if total else bcolors.GREY
+        header = [
+            ("TARGET", self.target, ""),
+            ("DURATION", fmt_duration(stats.elapsed), ""),
+            (
+                "FINDINGS",
+                f"{total}" + (f"  [{tally}]" if tally else ""),
+                finding_style,
+            ),
+        ]
+        header_width = max(len(label) for label, _, _ in header)
+        for label, value, style in header:
+            reset = bcolors.ENDC if style else ""
+            console.raw(
+                f"  {bcolors.DIM}{label.rjust(header_width)}{bcolors.ENDC}  "
+                f"{style}{value}{reset}"
+            )
+        console.raw("")
+
         rows = [
-            ("Target", self.target),
-            ("Duration", fmt_duration(stats.elapsed)),
             ("URLs scanned", f"{stats.urls_done}/{stats.urls_total}"),
             ("Endpoints", str(len(self.endpoints))),
             ("Subdomains", str(stats.subdomains)),
@@ -5456,139 +5640,178 @@ class XSSScanner(CrawlerMixin):
             ("WebSocket sinks", str(len(self.websocket_findings))),
             ("File upload forms", str(len(self.file_upload_findings))),
             ("GraphQL endpoints", str(len(self.graphql_endpoints))),
-            ("Findings", str(len(self.findings))),
             ("State file", str(self.state.path) if self.state.enabled else "disabled"),
         ]
-        width = max(len(label) for label, _ in rows)
-        waf_label = self.waf.label().lower()
-        for label, value in rows:
-            value_style = ""
-            if label == "Findings":
-                value_style = f"{bcolors.FAIL}{bcolors.BOLD}" if self.findings else bcolors.GREY
-            elif label == "WAF" and waf_label not in ("none", "not detected"):
-                value_style = bcolors.WARNING
-            elif label == "Duration":
-                value_style = bcolors.ENDC
-            self.console.raw(
-                f"  {bcolors.DIM}{label.rjust(width)}{bcolors.ENDC}  "
-                f"{value_style}{value}{bcolors.ENDC}"
+        label_width = max(len(label) for label, _ in rows)
+        waf_label = self.waf.label().strip().lower()
+        waf_clear = waf_label in ("", "none", "none detected", "not detected")
+
+        def value_style(label: str, value: str) -> str:
+            if label == "WAF" and not waf_clear:
+                return bcolors.WARNING
+            if label in ("HTTP errors", "Truncated responses") and value not in ("0", ""):
+                return bcolors.WARNING
+            if (
+                label in ("Vulnerable libs", "External findings", "JSONP findings")
+                and value not in ("0", "")
+            ):
+                return bcolors.WARNING
+            if label == "State file" and value == "disabled":
+                return bcolors.GREY
+            return ""
+
+        def render_row(label: str, value: str) -> str:
+            style = value_style(label, value)
+            reset = bcolors.ENDC if style else ""
+            return (
+                f"  {bcolors.DIM}{label.rjust(label_width)}{bcolors.ENDC}  "
+                f"{style}{value}{reset}"
+            )
+
+        rendered = [render_row(label, value) for label, value in rows]
+        visible = [strip_ansi(item) for item in rendered]
+        half = (len(rendered) + 1) // 2
+        left, right = rendered[:half], rendered[half:]
+        left_visible, right_visible = visible[:half], visible[half:]
+        column_width = max((len(item) for item in left_visible), default=0) + 4
+        right_width = max((len(item) for item in right_visible), default=0)
+        if console._width() >= column_width + right_width + 2:
+            for index, row in enumerate(left):
+                gap = " " * max(1, column_width - len(left_visible[index]))
+                other = right[index] if index < len(right) else ""
+                console.raw(row + gap + other)
+        else:
+            for row in rendered:
+                console.raw(row)
+
+        console.raw("")
+        glyph = _ui.glyphs()["tick"] if _ui is not None else "ok"
+        if total:
+            console.raw(
+                f"  {bcolors.FAIL}{bcolors.BOLD}{glyph} {total} evidence-backed "
+                f"finding(s){bcolors.ENDC}  "
+                f"{bcolors.DIM}replay: xoxss --replay <finding-id>{bcolors.ENDC}"
+            )
+        else:
+            console.raw(
+                f"  {bcolors.OKGREEN}{glyph} no findings in this pass{bcolors.ENDC}"
+            )
+            console.raw(
+                f"  {bcolors.GREY}add --blind/--interactsh for out-of-band coverage; "
+                f"--report-reflections surfaces inert leads{bcolors.ENDC}"
             )
 
         if self.findings:
-            self.console.raw(
-                f"  {bcolors.FAIL}{bcolors.BOLD}\u00bb {len(self.findings)} XSS finding(s) - "
-                f"triage the JSON/SARIF reports for full evidence{bcolors.ENDC}"
-            )
-        else:
-            self.console.raw(
-                f"  {bcolors.GREY}\u00bb no confirmed XSS findings in this pass "
-                f"(consider blind-XSS coverage){bcolors.ENDC}"
-            )
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}XSS findings{bcolors.ENDC}")
+            ordered = {"confirmed": 0, "high": 1, "medium": 2, "low": 3}
+            for finding in sorted(
+                self.findings, key=lambda item: ordered.get(item.confidence, 9)
+            ):
+                colour = {
+                    "confirmed": bcolors.FAIL,
+                    "high": bcolors.OKGREEN,
+                    "medium": bcolors.WARNING,
+                    "low": bcolors.GREY,
+                }.get(finding.confidence, bcolors.ENDC)
+                console.raw(
+                    f"  {colour}[{finding.confidence.upper()}]{bcolors.ENDC} "
+                    f"{finding.kind} - {finding.parameter} ({finding.method})"
+                )
+                console.raw(
+                    f"      {truncate(finding.url, 150)}  "
+                    f"{bcolors.DIM}id={finding.finding_id}{bcolors.ENDC}"
+                )
 
         if self.vulnerable_libs:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}Vulnerable JavaScript libraries{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}Vulnerable JavaScript libraries{bcolors.ENDC}")
             for vuln in self.vulnerable_libs:
                 colour = {
                     "high": bcolors.FAIL,
                     "medium": bcolors.WARNING,
                     "low": bcolors.GREY,
                 }.get(vuln.severity, bcolors.ENDC)
-                self.console.raw(
-                    f"  {colour}[{vuln.severity}]{bcolors.ENDC} {vuln.name} {vuln.version} - {vuln.cve}"
+                console.raw(
+                    f"  {colour}[{vuln.severity}]{bcolors.ENDC} "
+                    f"{vuln.name} {vuln.version} - {vuln.cve}"
                 )
-                self.console.raw(f"      {truncate(vuln.url, 160)}")
+                console.raw(f"      {truncate(vuln.url, 160)}")
 
         if self.jsonp_findings:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}JSONP XSS findings{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}JSONP XSS findings{bcolors.ENDC}")
             for finding in self.jsonp_findings[:5]:
-                self.console.raw(f"  URL: {truncate(finding['url'], 120)}")
-                self.console.raw(f"  Callback: {finding['callback_param']}")
+                console.raw(f"  URL: {truncate(finding['url'], 120)}")
+                console.raw(f"  Callback: {finding['callback_param']}")
 
         if self.csp_issues:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}CSP bypass opportunities{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}CSP bypass opportunities{bcolors.ENDC}")
             for issue in self.csp_issues[:5]:
-                self.console.raw(f"  URL: {truncate(issue['url'], 120)}")
-                for sub_issue in issue['issues'][:2]:
-                    self.console.raw(f"    - {sub_issue}")
+                console.raw(f"  URL: {truncate(issue['url'], 120)}")
+                for sub_issue in issue["issues"][:2]:
+                    console.raw(f"    - {sub_issue}")
 
         if self.cors_issues:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}CORS misconfigurations{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}CORS misconfigurations{bcolors.ENDC}")
             for issue in self.cors_issues[:5]:
-                self.console.raw(f"  URL: {truncate(issue['url'], 120)}")
-                for sub_issue in issue['issues'][:2]:
-                    self.console.raw(f"    - {sub_issue}")
+                console.raw(f"  URL: {truncate(issue['url'], 120)}")
+                for sub_issue in issue["issues"][:2]:
+                    console.raw(f"    - {sub_issue}")
 
         if self.trusted_types_issues:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}Trusted Types issues{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}Trusted Types issues{bcolors.ENDC}")
             for item in self.trusted_types_issues[:5]:
-                self.console.raw(f"  URL: {truncate(item['url'], 120)}")
-                for sub_issue in item['issues'][:2]:
-                    self.console.raw(f"    - {sub_issue}")
+                console.raw(f"  URL: {truncate(item['url'], 120)}")
+                for sub_issue in item["issues"][:2]:
+                    console.raw(f"    - {sub_issue}")
 
         if self.dom_clobber_findings:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}DOM clobbering{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}DOM clobbering{bcolors.ENDC}")
             for item in self.dom_clobber_findings[:5]:
-                self.console.raw(
-                    f"  [{item['severity']}]{bcolors.ENDC} {item['type']} "
+                console.raw(
+                    f"  [{item['severity']}] {item['type']} "
                     f"-> {item['property']}  ({truncate(item['url'], 110)})"
                 )
 
         if self.postmessage_findings:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}postMessage sinks{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}postMessage sinks{bcolors.ENDC}")
             for item in self.postmessage_findings[:5]:
-                validated = "origin validated" if item['origin_validated'] else "NO origin check"
-                self.console.raw(
+                validated = (
+                    "origin validated" if item["origin_validated"] else "NO origin check"
+                )
+                console.raw(
                     f"  {item['sink']} ({validated}) - {truncate(item['url'], 110)}"
                 )
 
         if self.websocket_findings:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}WebSocket sinks{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}WebSocket sinks{bcolors.ENDC}")
             for item in self.websocket_findings[:5]:
-                self.console.raw(
-                    f"  {item['sink']} - {truncate(item['url'], 110)}"
-                )
-                self.console.raw(f"      {truncate(item['location'], 140)}")
+                console.raw(f"  {item['sink']} - {truncate(item['url'], 110)}")
+                console.raw(f"      {truncate(item['location'], 140)}")
 
         if self.file_upload_findings:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}File upload forms{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}File upload forms{bcolors.ENDC}")
             for item in self.file_upload_findings[:5]:
-                self.console.raw(f"  {truncate(item['url'], 120)}")
+                console.raw(f"  {truncate(item['url'], 120)}")
 
         if self.graphql_endpoints:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}GraphQL endpoints{bcolors.ENDC}")
+            console.raw("")
+            console.raw(f"{bcolors.BOLD}GraphQL endpoints{bcolors.ENDC}")
             for item in self.graphql_endpoints[:5]:
-                flag = "introspection ENABLED" if item['introspection'] else "introspection off"
-                self.console.raw(f"  {flag} - {truncate(item['url'], 120)}")
-
-        if self.findings:
-            self.console.raw("")
-            self.console.raw(f"{bcolors.BOLD}XSS Findings{bcolors.ENDC}")
-            ordered = {"confirmed": 0, "high": 1, "medium": 2, "low": 3}
-            for finding in sorted(self.findings, key=lambda f: ordered.get(f.confidence, 9)):
-                colour = {
-                    "confirmed": bcolors.OKGREEN,
-                    "high": bcolors.OKGREEN,
-                    "medium": bcolors.WARNING,
-                    "low": bcolors.GREY,
-                }.get(finding.confidence, bcolors.ENDC)
-                self.console.raw(
-                    f"  {colour}[{finding.confidence}]{bcolors.ENDC} {finding.kind} - "
-                    f"{finding.parameter} ({finding.method})"
+                flag = (
+                    "introspection ENABLED"
+                    if item["introspection"]
+                    else "introspection off"
                 )
-                self.console.raw(f"      {truncate(finding.url, 160)}")
-        else:
-            self.console.raw("")
-            self.console.raw(f"  {bcolors.WARNING}No XSS findings were confirmed.{bcolors.ENDC}")
+                console.raw(f"  {flag} - {truncate(item['url'], 120)}")
 
     # -- reports ----------------------------------------------------------------------
     def write_reports(self) -> None:
@@ -6917,9 +7140,15 @@ async def run_replay(args: argparse.Namespace, console: Console) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
+    # Decide about colour before argparse renders --help, so `--no-color --help`
+    # is plain even on a TTY.
+    if "--no-color" in raw_args or os.environ.get("NO_COLOR"):
+        bcolors.disable()
+        if _ui is not None:
+            _ui.disable()
     parser = build_parser()
     args = parser.parse_args(argv)
-    raw_args = list(argv) if argv is not None else sys.argv[1:]
     explicit_flags = {token.split("=", 1)[0] for token in raw_args if token.startswith("--")}
     god_mode_requested = "--god" in explicit_flags or "--yolo" in explicit_flags
     if args.ai_only:
