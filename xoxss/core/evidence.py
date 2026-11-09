@@ -17,8 +17,8 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 REDACTED = "[REDACTED]"
 
@@ -90,6 +90,25 @@ def redact_cookie_header(value: str) -> str:
     return "; ".join(parts)
 
 
+def _form_pairs(text: str) -> Optional[List[Tuple[str, str]]]:
+    """Return decoded form pairs when ``text`` looks like a form body.
+
+    The round-trip matters: re-encoding preserves the wire format (``%26`` in a
+    value must not become a new pair separator) while still letting us swap
+    session values for ``[REDACTED]``.
+    """
+    if "=" not in text:
+        return None
+    for chunk in text.split("&"):
+        if "=" not in chunk:
+            return None
+        name = chunk.split("=", 1)[0]
+        if not name or any(char.isspace() for char in name):
+            return None
+    pairs = parse_qsl(text, keep_blank_values=True)
+    return pairs or None
+
+
 def redact_body(body: str, *, injected_parameter: str = "") -> str:
     """Redact session-bound values in a JSON or form body.
 
@@ -110,19 +129,19 @@ def redact_body(body: str, *, injected_parameter: str = "") -> str:
             separators=(",", ":"),
             ensure_ascii=False,
         )
-    if "=" in text and " " not in text.split("=", 1)[0]:
-        pairs = parse_qsl(text, keep_blank_values=True)
-        if pairs:
-            def _form_value(name: str, value: str) -> str:
-                if injected_parameter:
-                    # The injected parameter is the proof; everything else in
-                    # the form may carry session material.
-                    return value if name == injected_parameter else REDACTED
-                return REDACTED if SENSITIVE_KEY_RE.fullmatch(name) else value
+    if stripped[:1] == '"':
+        # A JSON string body, not a form; leave it untouched.
+        return text
+    pairs = _form_pairs(text)
+    if pairs is not None:
+        def _form_value(name: str, value: str) -> str:
+            if injected_parameter:
+                # The injected parameter is the proof; everything else in
+                # the form may carry session material.
+                return value if name == injected_parameter else REDACTED
+            return REDACTED if SENSITIVE_KEY_RE.fullmatch(name) else value
 
-            return "&".join(
-                f"{name}={_form_value(name, value)}" for name, value in pairs
-            )
+        return urlencode([(name, _form_value(name, value)) for name, value in pairs])
     return text
 
 
@@ -189,6 +208,12 @@ def build_curl(
             if redact
             else str(body)
         )
+        has_content_type = any(
+            str(name).lower() == "content-type" for name in (headers or {})
+        )
+        if not has_content_type and rendered.lstrip()[:1] in ("{", "["):
+            # curl defaults to form encoding; JSON bodies need the header.
+            parts.extend(["-H", shlex.quote("Content-Type: application/json")])
         parts.extend(["--data-raw", shlex.quote(rendered)])
     return " ".join(parts)
 

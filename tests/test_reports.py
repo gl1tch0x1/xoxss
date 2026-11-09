@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from xoxss.reports.html import write_html_report
 from xoxss.reports.json import write_json_report
 from xoxss.reports.markdown import write_markdown_report
+from xoxss.reports.sarif import build_sarif_document
 from xoxss.scanner import Finding, ScanStats, WAFReport
 
 
@@ -141,3 +142,85 @@ def test_html_report_creates_missing_report_directory(tmp_path):
     target = tmp_path / "nested" / "reports" / "report.html"
     write_html_report(target, _scanner())
     assert target.is_file()
+
+
+def test_reports_render_request_response_sink_and_oob_evidence(tmp_path):
+    finding = Finding(
+        kind="Reflected XSS (HTTP evidence)",
+        url="https://example.test/profile",
+        parameter="bio",
+        method="POST",
+        payload="<img src=x onerror=alert(1)>",
+        evidence="browser confirmed execution",
+        confidence="confirmed",
+        confidence_rationale="The marker reached an instrumented sink.",
+        context="html",
+        source="form",
+        request={
+            "method": "POST",
+            "url": "https://example.test/profile",
+            "headers": {"Cookie": "[REDACTED]", "Content-Type": "application/x-www-form-urlencoded"},
+            "body": "bio=%3Cimg+src%3Dx+onerror%3Dalert%281%29%3E&csrf=%5BREDACTED%5D",
+            "redacted": True,
+        },
+        response_status=200,
+        response_excerpt="...<div><img src=x onerror=alert(1)></div>...",
+        sink="innerHTML",
+        dom_path="body > div#profile > img:nth-child(2)",
+        oob={
+            "callback": "https://oob.test/abc",
+            "page_url": "https://victim.test/admin",
+            "cookies": ["session=[REDACTED]"],
+            "timestamp": "2026-11-07T10:00:00+00:00",
+        },
+    )
+    scanner = _scanner()
+    scanner.findings = [finding]
+    json_path = tmp_path / "report.json"
+    markdown_path = tmp_path / "report.md"
+    html_path = tmp_path / "report.html"
+
+    write_json_report(json_path, scanner)
+    write_markdown_report(markdown_path, scanner)
+    write_html_report(html_path, scanner)
+
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    serialized = data["findings"][0]
+    assert serialized["finding_id"] == finding.finding_id
+    assert serialized["source"] == "form"
+    assert serialized["request"]["headers"]["Cookie"] == "[REDACTED]"
+    assert serialized["response_status"] == 200
+    assert serialized["response_excerpt"].startswith("...<div>")
+    assert serialized["sink"] == "innerHTML"
+    assert serialized["dom_path"].startswith("body >")
+    assert serialized["oob"]["page_url"] == "https://victim.test/admin"
+    assert serialized["poc_curl"].startswith("curl")
+
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "Finding ID" in markdown
+    assert "Request headers" in markdown
+    assert "Response excerpt" in markdown
+    assert "innerHTML" in markdown
+    assert "OOB callback" in markdown
+    assert "curl PoC" in markdown or "```bash" in markdown
+
+    html = html_path.read_text(encoding="utf-8")
+    assert "Finding ID" in html
+    assert "Request headers" in html
+    assert "Response excerpt" in html
+    assert "innerHTML" in html
+    assert "OOB callback" in html
+    assert "curl PoC" in html
+
+    result = build_sarif_document([finding], target="https://example.test/")[
+        "runs"
+    ][0]["results"][0]
+    properties = result["properties"]
+    assert properties["findingId"] == finding.finding_id
+    assert properties["source"] == "form"
+    assert properties["sink"] == "innerHTML"
+    assert properties["domPath"].startswith("body >")
+    assert properties["responseExcerpt"].startswith("...<div>")
+    assert properties["request"]["headers"]["Cookie"] == "[REDACTED]"
+    assert properties["oob"]["page_url"] == "https://victim.test/admin"
+    assert properties["pocCurl"].startswith("curl")

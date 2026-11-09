@@ -184,12 +184,12 @@ from xoxss.reports.json import report_payload, write_json_report
 from xoxss.reports.markdown import write_markdown_report
 from xoxss.scan.reflection import ReflectionInfo, analyze_reflection, browser_prequalified
 from xoxss.core.evidence import (
-    build_curl,
     canonical_finding_url,
     finding_id as make_finding_id,
     finding_curl,
     parse_curl_request,
     parse_oob_context,
+    request_to_dict,
     response_excerpt,
 )
 from xoxss.core.http import HttpEngine, HttpResponse, RateLimiter, USER_AGENT
@@ -2374,6 +2374,10 @@ class XSSScanner(CrawlerMixin):
             hit = await browser.check_token(exploit_marker, timeout=2.0)
             self.stats.browser_checks += 1
             if hit and hit.get("executed") == "yes":
+                # Browser-confirmed execution always carries a screenshot.
+                screenshot = await browser.screenshot(
+                    str(self.screenshot_dir / f"proto-{exploit_marker}.png")
+                )
                 self.add_finding(
                     Finding(
                         kind="Prototype Pollution to XSS (gadget)",
@@ -2394,6 +2398,7 @@ class XSSScanner(CrawlerMixin):
                         source="proto",
                         sink=str(hit.get("sink") or "gadget"),
                         dom_path=str(hit.get("dom_path") or ""),
+                        screenshot=screenshot,
                     )
                 )
                 self.console.ok(f"Prototype pollution gadget fired: {name}")
@@ -3594,13 +3599,13 @@ class XSSScanner(CrawlerMixin):
                 or ""
             )
             if url:
-                request = {
-                    "method": str(getattr(response, "request_method", "GET") or "GET"),
-                    "url": url,
-                    "headers": dict(getattr(response, "request_headers", {}) or {}),
-                    "body": str(getattr(response, "request_body", "") or ""),
-                    "redacted": True,
-                }
+                request = request_to_dict(
+                    str(getattr(response, "request_method", "GET") or "GET"),
+                    url,
+                    headers=dict(getattr(response, "request_headers", {}) or {}),
+                    body=str(getattr(response, "request_body", "") or ""),
+                    injected_parameter=parameter,
+                )
         return {
             "request": request,
             "response_status": int(getattr(response, "status", 0) or 0),
@@ -3825,6 +3830,14 @@ class XSSScanner(CrawlerMixin):
                         )
                         continue
                     poc_url, poc_command = self.poc_for_point(point, payload)
+                    requested, available = self._browser_state()
+                    confidence, rationale, detail = reflection_confidence(
+                        polyglot_info,
+                        requested=requested,
+                        available=available,
+                        content_type=result.header("content-type", ""),
+                    )
+                    detail = f"Polyglot payload used for efficiency; {detail}"
                     self.add_finding(
                         Finding(
                             kind="Reflected XSS (polyglot)",
@@ -3834,13 +3847,10 @@ class XSSScanner(CrawlerMixin):
                             payload=payload,
                             evidence=f"polyglot payload reflected unescaped and executable "
                             f"({polyglot_info.detail})",
-                            confidence="high",
-                            confidence_rationale=(
-                                "The payload's delimiters survived verbatim in an executable context; "
-                                "browser execution was not confirmed."
-                            ),
+                            confidence=confidence,
+                            confidence_rationale=rationale,
                             context=info.context,
-                            detail="Polyglot payload used for efficiency",
+                            detail=detail,
                             poc_url=poc_url,
                             poc_command=poc_command,
                             source=point.source,
@@ -3902,7 +3912,9 @@ class XSSScanner(CrawlerMixin):
                 if stored_page:
                     _, stored_poc_command = self.poc_for_point(point, payload)
                     stored_response = getattr(self, "_stored_hit_response", None)
-                    evidence_fields = self.evidence_from_response(result, token, point.param)
+                    evidence_fields = self.evidence_from_response(
+                        result, payload_token, point.param
+                    )
                     if stored_response is not None:
                         evidence_fields["response_status"] = int(stored_response.status or 0)
                         evidence_fields["response_excerpt"] = response_excerpt(
@@ -4635,7 +4647,7 @@ class XSSScanner(CrawlerMixin):
                 )
                 continue
             # Raw payload present (not HTML-escaped and not URL-encoded)
-            if payload in result.text and f"&lt;" not in result.text[: result.text.find(payload) + len(payload) + 64]:
+            if payload in result.text and "&lt;" not in result.text[: result.text.find(payload) + len(payload) + 64]:
                 self.jsonp_findings.append({
                     'url': endpoint.url,
                     'callback_param': endpoint.callback_param,
@@ -4754,7 +4766,7 @@ class XSSScanner(CrawlerMixin):
             
             # Check XSS exfiltration risk
             if analyzer.check_xss_data_exfiltration_risk(analysis):
-                self.console.warn(f"  XSS data exfiltration possible via CORS")
+                self.console.warn("  XSS data exfiltration possible via CORS")
     
     async def _detect_mxss(self, url: str, js_content: str) -> None:
         """Detect mutation XSS vulnerabilities."""
@@ -5896,7 +5908,7 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         if args.verbose and candidate.evidence:
             console.raw(f"      {candidate.evidence}")
 
-    report_payload: Dict[str, Any] = {
+    audit_payload: Dict[str, Any] = {
         "tool": APP_NAME,
         "version": VERSION,
         "mode": "param-audit",
@@ -5912,7 +5924,7 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(
-                json.dumps(report_payload, indent=2, ensure_ascii=False) + "\n",
+                json.dumps(audit_payload, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
             console.info(f"Parameter audit JSON written to {output_path}", important=False)
@@ -5975,6 +5987,8 @@ async def run_targets(args: argparse.Namespace, console: Console) -> Tuple[int, 
 # --------------------------------------------------------------------------------------
 
 _REPLAY_TOKEN_RE = re.compile(r"[a-z][a-z0-9]{8,}")
+_REPLAY_COMMENT_TOKEN_RE = re.compile(r"/\*\s*([a-z][a-z0-9]{6,})\s*\*/")
+_REPLAY_CHARCODE_RE = re.compile(r"String\.fromCharCode\(\s*([0-9][0-9,\s]*)\)")
 
 
 def resolve_headless(args: argparse.Namespace, explicit_flags: Set[str]) -> None:
@@ -6061,10 +6075,22 @@ def load_replay_finding(
     wanted = str(getattr(args, "replay", "") or "").strip().lower()
     if not wanted:
         return None, path, "--replay requires a finding id (see the report's finding_id column)"
+    fields = set(Finding.__dataclass_fields__)
     for item in findings:
         if not isinstance(item, dict):
             continue
-        identity = str(item.get("finding_id") or "").lower()
+        identity = str(item.get("finding_id") or "").strip().lower()
+        if not identity:
+            # Reports written before finding IDs were introduced still carry
+            # every field needed to derive the same stable identity.
+            try:
+                derived = Finding(
+                    **{key: value for key, value in item.items() if key in fields}
+                )
+            except Exception:
+                identity = ""
+            else:
+                identity = derived.finding_id.lower()
         if identity and (identity == wanted or identity.startswith(wanted)):
             return item, path, ""
     return None, path, f"no finding matches '{wanted}' in {path.name}"
@@ -6104,11 +6130,39 @@ def _replay_request_args(
 
 
 def _replay_token(payload: str) -> str:
-    """Pick the strongest marker embedded in a payload for browser matching."""
-    candidates = _REPLAY_TOKEN_RE.findall(payload or "")
+    """Pick the strongest marker embedded in a payload for browser matching.
+
+    ``js_marker`` writes the marker both as a ``/*token*/`` comment and as a
+    ``String.fromCharCode`` call.  Preferring those forms avoids mistaking an
+    ordinary long word (``javascript``) for the run's unique marker.
+    """
+    text = payload or ""
+    charcode = _REPLAY_CHARCODE_RE.search(text)
+    if charcode:
+        try:
+            decoded = "".join(
+                chr(int(part))
+                for part in charcode.group(1).replace(" ", "").split(",")
+                if part
+            )
+        except (TypeError, ValueError):
+            decoded = ""
+        # ``js_marker`` pushes a unique token; requiring a digit and some
+        # length avoids mistaking a payload gadget (``String.fromCharCode``
+        # for "alert") for the marker.
+        if (
+            len(decoded) >= 8
+            and re.fullmatch(r"[a-z][a-z0-9]+", decoded)
+            and any(char.isdigit() for char in decoded)
+        ):
+            return decoded
+    comment = _REPLAY_COMMENT_TOKEN_RE.search(text)
+    if comment:
+        return comment.group(1)
+    candidates = _REPLAY_TOKEN_RE.findall(text)
     if candidates:
         return max(candidates, key=len)
-    return payload or ""
+    return text
 
 
 def _make_replay_browser(args: argparse.Namespace, console: Console) -> Any:

@@ -80,6 +80,24 @@ def test_analyze_char_survival_only_looks_after_the_marker():
     assert not encoded
 
 
+def test_analyze_char_survival_counts_payload_prefix_delimiters():
+    payload = '"><img src=x onerror=alert(1)>TOKEN'
+    body = f"<div>{payload}</div>"
+    raw, encoded = analyze_char_survival(body, body.find("TOKEN"), "TOKEN", payload)
+
+    assert {'"', "<", ">"}.issubset(raw)
+    assert not encoded
+
+
+def test_analyze_char_survival_marks_encoded_prefix_delimiters():
+    payload = "<script>TOKEN</script>"
+    body = "&lt;script&gt;TOKEN&lt;/script&gt;"
+    raw, encoded = analyze_char_survival(body, body.find("TOKEN"), "TOKEN", payload)
+
+    assert "<" in encoded
+    assert "<" not in raw
+
+
 def test_analyze_char_survival_detects_a_genuine_tail():
     body = "<div>TOKEN<script>alert(1)</script></div>"
     raw, encoded = analyze_char_survival(

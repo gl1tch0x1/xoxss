@@ -617,6 +617,10 @@ class HttpEngine:
             body = urlencode(data, doseq=True) if isinstance(data, dict) else str(data)
         elif json_body is not None:
             body = json.dumps(json_body, separators=(",", ":"), ensure_ascii=False)
+            if not any(name.lower() == "content-type" for name in merged):
+                # aiohttp/curl_cffi add this themselves; capture it so the
+                # evidence (and its curl PoC) reproduces the request.
+                merged["Content-Type"] = "application/json"
         return merged, body
 
     async def _request_curl(

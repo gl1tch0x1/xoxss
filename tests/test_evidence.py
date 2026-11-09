@@ -8,11 +8,12 @@ from xoxss.core.evidence import (
     build_curl,
     canonical_finding_url,
     finding_curl,
+    redact_body,
     parse_curl_request,
     request_to_dict,
     response_excerpt,
 )
-from xoxss.core.http import HttpResponse
+from xoxss.core.http import HttpEngine, HttpResponse
 from xoxss.scanner import Finding
 
 
@@ -48,9 +49,39 @@ def test_build_curl_redacts_session_headers_but_keeps_the_payload():
     assert command.startswith("curl -sk")
     assert "session=secret" not in command
     assert "Bearer secret" not in command
-    assert "q=%3Cscript%3E" in command
-    # The injected parameter survives; the CSRF value is not copied.
+    # The form is re-encoded, so the payload keeps its wire representation and
+    # the CSRF value is replaced without changing the body structure.
+    assert "q=%3Cscript%3E&csrf=%5BREDACTED%5D" in command
     assert "csrf=abc" not in command
+
+
+def test_redact_body_preserves_encoded_separators_in_form_values():
+    body = redact_body("q=a%26b&csrf=abc", injected_parameter="q")
+
+    assert body == "q=a%26b&csrf=%5BREDACTED%5D"
+
+
+def test_redact_body_leaves_json_string_bodies_untouched():
+    assert redact_body('"a=b"') == '"a=b"'
+
+
+def test_build_curl_adds_json_content_type_when_the_request_omits_it():
+    command = build_curl(
+        "POST", "https://example.test/api", body='{"q":"<script>"}'
+    )
+
+    assert "Content-Type: application/json" in command
+
+
+def test_sent_request_records_the_json_content_type():
+    engine = object.__new__(HttpEngine)
+    engine.base_headers = {}
+    engine.cookies = {}
+
+    headers, body = engine._sent_request(None, None, {"q": "<script>"})
+
+    assert headers["Content-Type"] == "application/json"
+    assert body == '{"q":"<script>"}'
 
 
 def test_request_to_dict_redacts_sensitive_json_values():

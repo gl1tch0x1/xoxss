@@ -1,11 +1,13 @@
 """Replay helpers and smart headed/headless resolution."""
 
+import asyncio
 import json
 import os
 import sys
 from types import SimpleNamespace
+from urllib.parse import quote
 
-import pytest
+from aiohttp import web
 
 from xoxss.core.browser import (
     BrowserEngine,
@@ -14,11 +16,14 @@ from xoxss.core.browser import (
     HOOK_JS,
 )
 from xoxss.scanner import (
+    Console,
+    Finding,
     _replay_request_args,
     _replay_token,
     load_replay_finding,
     reflection_confidence,
     resolve_headless,
+    run_replay,
 )
 from xoxss.scan.reflection import ReflectionInfo
 
@@ -84,6 +89,87 @@ def test_load_replay_finding_errors_without_reports(tmp_path):
     assert "no JSON report" in error
 
 
+def test_load_replay_finding_derives_ids_for_legacy_reports(tmp_path):
+    legacy = {
+        "kind": "Reflected XSS (HTTP evidence)",
+        "url": "https://example.test/search?q=payload",
+        "parameter": "q",
+        "method": "GET",
+        "payload": "<script>alert(1)</script>",
+        "source": "query",
+    }
+    expected = Finding(**legacy).finding_id
+    report = tmp_path / "legacy.json"
+    report.write_text(json.dumps({"findings": [legacy]}), encoding="utf-8")
+
+    item, path, error = load_replay_finding(
+        _args(replay=expected[:8], replay_report=str(report))
+    )
+
+    assert error == ""
+    assert item == legacy
+    assert path == report
+
+
+def test_run_replay_reproduces_an_http_finding_end_to_end(tmp_path):
+    payload = "<script>alert(1)</script>"
+
+    async def scenario() -> int:
+        app = web.Application()
+
+        async def handler(request: web.Request) -> web.Response:
+            return web.Response(
+                text=f"<html><body>{request.query.get('q', '')}</body></html>",
+                content_type="text/html",
+            )
+
+        app.router.add_get("/", handler)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        try:
+            port = site._server.sockets[0].getsockname()[1]
+            url = f"http://127.0.0.1:{port}/?q={quote(payload)}"
+            report = tmp_path / "report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "findings": [
+                            {
+                                "finding_id": "abc123def456",
+                                "kind": "Reflected XSS (HTTP evidence)",
+                                "url": url,
+                                "parameter": "q",
+                                "method": "GET",
+                                "payload": payload,
+                                "source": "query",
+                                "request": {
+                                    "method": "GET",
+                                    "url": url,
+                                    "headers": {},
+                                    "body": "",
+                                },
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = _args(
+                replay="abc123",
+                replay_report=str(report),
+                no_browser=True,
+                confirm="http",
+                timeout=5.0,
+            )
+            return await run_replay(args, Console(quiet=True))
+        finally:
+            await runner.cleanup()
+
+    assert asyncio.run(scenario()) == 0
+
+
 def test_replay_request_args_uses_structured_request():
     item = {
         "method": "POST",
@@ -122,6 +208,27 @@ def test_replay_token_prefers_the_longest_marker():
     payload = "<img src=x onerror=window.__xoxss_hits.push('zabcdefghi')>"
     assert _replay_token(payload) == "zabcdefghi"
     assert _replay_token("<script>alert(1)</script>") == "<script>alert(1)</script>"
+
+
+def test_replay_token_prefers_the_js_marker_comment_over_page_words():
+    payload = (
+        "<script>javascript:/*zabc123456*/"
+        "window.__xoxss_hits.push('zabc123456')</script>"
+    )
+
+    assert _replay_token(payload) == "zabc123456"
+
+
+def test_replay_token_decodes_a_fromcharcode_marker():
+    payload = "String.fromCharCode(122,97,98,99,49,50,51,52,53,54)"
+
+    assert _replay_token(payload) == "zabc123456"
+
+
+def test_replay_token_ignores_a_payload_gadget_fromcharcode():
+    payload = "String.fromCharCode(97,108,101,114,116);/*zabc123456*/"
+
+    assert _replay_token(payload) == "zabc123456"
 
 
 def _executable_info(**overrides):

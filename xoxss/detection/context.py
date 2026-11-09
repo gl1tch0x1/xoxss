@@ -4,7 +4,7 @@ Context detection module for precise XSS context identification.
 
 import html as html_lib
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -60,20 +60,36 @@ def analyze_char_survival(
         return survived, encoded
     marker_offset = payload.find(marker)
     sent_tail = payload[marker_offset + len(marker):]
-    if not sent_tail:
-        return survived, encoded
-    start = max(0, min(int(position), len(body))) + len(marker)
-    # Bound the window so a pathological page cannot make this quadratic.
-    received = body[start:start + max(256, len(sent_tail) * 16 + 64)]
-    decoded = decode_with_origin(received)
-    for offset, char in enumerate(sent_tail):
-        if offset >= len(decoded):
-            break
-        received_char, was_raw = decoded[offset]
-        if received_char != char:
-            continue
-        if char in SPECIAL_CHARS:
-            (survived if was_raw else encoded).add(char)
+    marker_at = max(0, min(int(position), len(body)))
+    if sent_tail:
+        start = marker_at + len(marker)
+        # Bound the windows so a pathological page cannot make this quadratic.
+        received = body[start:start + max(256, len(sent_tail) * 16 + 64)]
+        decoded = decode_with_origin(received)
+        for offset, char in enumerate(sent_tail):
+            if offset >= len(decoded):
+                break
+            received_char, was_raw = decoded[offset]
+            if received_char != char:
+                continue
+            if char in SPECIAL_CHARS:
+                (survived if was_raw else encoded).add(char)
+
+    # Delimiters *before* the marker matter too: a breakout payload such as
+    # ``"><script>TOKEN`` puts the quote first, and the marker often sits near
+    # the end.  Align the reflected prefix from the end so a value that the
+    # server slightly normalises still contributes its leading delimiters.
+    sent_prefix = payload[:marker_offset]
+    if sent_prefix:
+        window = body[max(0, marker_at - max(256, len(sent_prefix) * 16 + 64)):marker_at]
+        decoded_prefix = decode_with_origin(window)
+        if len(decoded_prefix) >= len(sent_prefix):
+            aligned = decoded_prefix[-len(sent_prefix):]
+            for char, (received_char, was_raw) in zip(sent_prefix, aligned):
+                if received_char != char:
+                    continue
+                if char in SPECIAL_CHARS:
+                    (survived if was_raw else encoded).add(char)
     return survived, encoded
 
 
@@ -86,7 +102,6 @@ def inert_zone(response: str, position: int, token: str = "") -> Tuple[str, bool
     only way a reflection inside it becomes executable.
     """
     body = str(response or "")
-    marker = str(token or "")
     index = max(0, min(int(position), len(body)))
     before = body[:index]
     low_before = before.lower()
