@@ -366,6 +366,16 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
                 f"<tr><th>Evidence</th><td>{html_lib.escape(truncate(finding.evidence or finding.detail, 500))}</td></tr>",
                 f"<tr><th>Payload</th><td><code>{html_lib.escape(truncate(finding.payload, 400))}</code></td></tr>",
             ]
+            if finding.char_matrix:
+                groups: Any = {}
+                for char, status in finding.char_matrix.items():
+                    groups.setdefault(status, []).append(char)
+                rendered_matrix = "; ".join(
+                    f"{status}: {''.join(chars)}" for status, chars in groups.items()
+                )
+                detail_rows.append(
+                    f"<tr><th>Character matrix</th><td><code>{html_lib.escape(rendered_matrix)}</code></td></tr>"
+                )
             if finding.sink:
                 sink_text = f"<code>{html_lib.escape(finding.sink)}</code>"
                 if finding.dom_path:
@@ -423,6 +433,11 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
             elif finding.poc_command:
                 detail_rows.append(
                     f"<tr><th>PoC command</th><td><code>{html_lib.escape(finding.poc_command)}</code></td></tr>"
+                )
+            if finding.poc_html:
+                detail_rows.append(
+                    f'<tr><th>Browser form PoC</th><td><a href="{html_lib.escape(finding.poc_html, quote=True)}">'
+                    "Open self-contained form PoC</a></td></tr>"
                 )
             if finding.screenshot:
                 screenshot = Path(finding.screenshot).expanduser()

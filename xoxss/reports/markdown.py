@@ -184,6 +184,14 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
                 f"- **Confidence:** {finding.confidence_rationale or 'n/a'}",
                 f"- **Detail:** {finding.detail or 'n/a'}",
             ]
+            if finding.char_matrix:
+                groups: dict = {}
+                for char, status in finding.char_matrix.items():
+                    groups.setdefault(status, []).append(char)
+                rendered_matrix = "; ".join(
+                    f"{status}: {''.join(chars)}" for status, chars in groups.items()
+                )
+                lines.append(f"- **Character matrix:** {rendered_matrix}")
             if finding.sink:
                 lines.append(
                     f"- **Sink:** `{finding.sink}`"
@@ -224,6 +232,11 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
                 lines += ["", "```bash", finding.poc_curl, "```", ""]
             elif finding.poc_command:
                 lines += ["", "```bash", finding.poc_command, "```", ""]
+            if finding.poc_html:
+                lines.append(
+                    "- **Browser form PoC:** base64 data URL "
+                    f"({len(finding.poc_html)} chars) included in the JSON report"
+                )
             lines += [
                 f"- **Screenshot:** {finding.screenshot or 'n/a'}",
                 "",

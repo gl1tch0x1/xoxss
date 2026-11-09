@@ -397,7 +397,11 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--payload-tmp-dir DIR` / `--keep-payloads` | Payload cache root / retain the temp directory after the scan. |
 | `--tamper NAME` | `doubleencode`, `hexencode`, `htmlentities`, `jscomment`, `jsonfuzz`, `spacetab`, `uppercase`, `urlencode`, `all`. |
 | `--encoder NAME` | Encoder-registry transform, repeatable (see `--list-encoders`). |
-| `--scan-headers` / `--header-list H ...` | Test header reflection with a curated default set. |
+| `--scan-headers` / `--header-list H ...` | Test header reflection with a curated default set (`--exclude-header NAME` skips candidates). Session cookies are also probed through the `Cookie` header. |
+| `--path-xss` / `--no-path-xss` | Test path segments (append, replace-last, replace-each) for breadcrumb/404/rewrite reflections. Enabled by `--deep` and `--god`. |
+| `--fragment-xss` | Test URL fragments in a real browser; fragments never reach the server, so a finding requires observed execution. Enabled by `--god` when a browser is available. |
+| `--char-matrix` | Probe which delimiters survive per point: `allowed`, `escaped`, `filtered`, `replaced`, `absent`. |
+| `--param-wordlist PATH` / `--param-wordlist-limit N` | Test operator-supplied parameter names on each endpoint (default limit `50`). |
 | `--dom` / `--stored` / `--stored-pages N` | DOM analysis (on) / persisted-payload hunting after POSTs (10 pages). |
 | `--report-reflections` | Also report non-executable reflections and static DOM candidates. |
 | `--check-libs` | JavaScript library vulnerability detection (on). |
@@ -414,6 +418,8 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--proto-pollution` | Runtime prototype-pollution proof, gadget fingerprinting, gadget URLs. |
 | `--polyglot` | Polyglot payloads for faster coverage. |
 | `--per-char-probe` | Per-character probing for precise context detection. |
+| `--ai` / `--ai-only` | Opt-in LLM fallback for contexts the corpus misses. AI output is candidate-only: deterministic reflection with surviving delimiters (and browser execution when available) is still required. `--ai-only` skips the built-in corpus. |
+| `--ai-key KEY` / `--ai-model ID` / `--ai-url URL` / `--ai-timeout S` | Credentials and endpoint override (default: OpenRouter, `deepseek/deepseek-chat`, 60s). The key also reads `XOXSS_AI_KEY`, `OPENROUTER_API_KEY`, `XSSR_AI_KEY` or `.env`. |
 | `--smart-rate` | Adaptive rate limiting instead of a fixed token bucket. |
 | `--dom-clobbering` | DOM clobbering analysis. |
 | `--trusted-types` | Trusted Types CSP analysis. |
@@ -422,6 +428,10 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--ws-active` | Actively inject marker frames into WebSocket endpoints discovered in page JavaScript (requires `--websocket`). Frame reflections are reported conservatively; they still require handler verification. |
 | `--file-upload` | File upload form discovery. |
 | `--postmessage` | `postMessage` handler analysis (origin validation). |
+
+> The `--ai*` options send a bounded reflection snippet, the parameter name and the
+> character matrix to the configured chat endpoint. Use them only when that data may
+> leave your environment; AI output never bypasses the deterministic evidence policy.
 
 ### Out-of-band confirmation
 
@@ -456,7 +466,8 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--http2` | Multiplex requests over HTTP/2 through the optional `curl_cffi` transport; degrades to aiohttp HTTP/1.1 when unavailable. |
 | `--impersonate PROFILE` | Emulate a browser TLS/JA3/JA4 fingerprint (for example `chrome124`, `firefox133`); implies the curl transport. |
 | `--max-response-bytes N` | Maximum response body size analyzed (default `5242880`). |
-| `--headers "Name: Value"` / `--cookies "a=b; c=d"` | Extra headers and cookies for HTTP probes. |
+| `--headers "Name: Value"` / `--cookies "a=b; c=d"` | Extra headers and cookies for HTTP probes. `--cookies` also accepts a JSON, Playwright storage-state, Netscape `cookies.txt`, or `name=value` file path. |
+| `--cookie-file PATH` | Explicit cookie file in any of the formats above. |
 | `--auth-state PATH` | Playwright storage-state JSON for browser discovery/verification and scoped HTTP cookies. |
 | `--mutation-probes` / `--mutation-probe-limit N` | Opt in to bounded Unicode, decoding, byte-mask and multibyte transformation probes. |
 | `--adaptive-payloads` | Add bounded syntax variants using observed delimiter constraints. |

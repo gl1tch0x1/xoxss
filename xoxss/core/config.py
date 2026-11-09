@@ -71,6 +71,12 @@ class ScanConfig:
     max_payloads: int = 6
     scan_headers: bool = False
     header_list: List[str] = field(default_factory=list)
+    exclude_header: List[str] = field(default_factory=list)
+    path_xss: bool = False
+    fragment_xss: bool = False
+    char_matrix: bool = False
+    param_wordlist: Optional[str] = None
+    param_wordlist_limit: int = 50
     dom: bool = True
     stored: bool = False
     stored_pages: int = 10
@@ -97,6 +103,13 @@ class ScanConfig:
     file_upload: bool = False
     postmessage: bool = False
     ast_analysis: bool = False
+    # AI fallback (candidate-only; evidence still comes from reflection/browser)
+    ai: bool = False
+    ai_only: bool = False
+    ai_key: Optional[str] = None
+    ai_model: Optional[str] = None
+    ai_url: Optional[str] = None
+    ai_timeout: float = 60.0
 
     # Out-of-band verification
     blind: Optional[str] = None
@@ -126,6 +139,7 @@ class ScanConfig:
     insecure: bool = False
     headers: Dict[str, str] = field(default_factory=dict)
     cookies: Dict[str, str] = field(default_factory=dict)
+    cookie_file: Optional[str] = None
 
     # Output
     output: Optional[str] = None
@@ -161,6 +175,7 @@ class ScanConfig:
             self.discover = True
             self.discover_paths = True
             self.fuzz_params = True
+            self.path_xss = True
 
         if self.no_browser:
             self.dom = False

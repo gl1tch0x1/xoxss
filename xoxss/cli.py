@@ -189,6 +189,43 @@ def build_parser(
     injection.add_argument("--adaptive-payloads", action="store_true", help="add bounded whitespace/quote and empirically observed Unicode payload variants")
     injection.add_argument("--scan-headers", action="store_true", help="test header reflection (one marker per header, batched)")
     injection.add_argument("--header-list", nargs="+", help="custom header names to inject")
+    injection.add_argument(
+        "--exclude-header",
+        nargs="+",
+        metavar="NAME",
+        help="header names to skip during header injection (case-insensitive)",
+    )
+    injection.add_argument(
+        "--path-xss",
+        dest="path_xss",
+        action="store_true",
+        default=False,
+        help="test path segments for XSS (append, replace-last, and replace-each)",
+    )
+    injection.add_argument(
+        "--no-path-xss", dest="path_xss", action="store_false", help="disable path-segment XSS testing"
+    )
+    injection.add_argument(
+        "--fragment-xss",
+        action="store_true",
+        help="test URL fragment/hash vectors in a real browser (fragments never reach the server)",
+    )
+    injection.add_argument(
+        "--char-matrix",
+        action="store_true",
+        help="probe which special characters survive at each reflection point (allowed/escaped/filtered/replaced)",
+    )
+    injection.add_argument(
+        "--param-wordlist",
+        metavar="PATH",
+        help="parameter-name wordlist (one name per line) tested on every endpoint",
+    )
+    injection.add_argument(
+        "--param-wordlist-limit",
+        type=int,
+        default=50,
+        help="maximum wordlist parameter names per endpoint (default: 50)",
+    )
     injection.add_argument("--dom", dest="dom", action="store_true", default=True, help="DOM XSS analysis (default: on)")
     injection.add_argument("--no-dom", dest="dom", action="store_false", help="disable DOM XSS analysis")
     injection.add_argument("--stored", action="store_true", help="look for persisted (stored) payloads")
@@ -260,6 +297,31 @@ def build_parser(
     advanced.add_argument("--file-upload", action="store_true", help="detect file upload XSS vulnerabilities")
     advanced.add_argument("--postmessage", action="store_true", help="detect postMessage XSS vulnerabilities")
 
+    ai_group = parser.add_argument_group("ai fallback")
+    ai_group.add_argument(
+        "--ai",
+        action="store_true",
+        help="ask an LLM for breakout payloads when the standard corpus fails "
+        "(candidates still require deterministic reflection/execution evidence)",
+    )
+    ai_group.add_argument(
+        "--ai-only",
+        action="store_true",
+        help="skip the built-in payload corpus and test only AI-generated candidates (implies --ai)",
+    )
+    ai_group.add_argument(
+        "--ai-key", metavar="KEY", help="API key (default: XOXSS_AI_KEY / OPENROUTER_API_KEY / .env)"
+    )
+    ai_group.add_argument(
+        "--ai-model", metavar="MODEL", help="model id (default: deepseek/deepseek-chat)"
+    )
+    ai_group.add_argument(
+        "--ai-url", metavar="URL", help="chat-completions endpoint (default: OpenRouter)"
+    )
+    ai_group.add_argument(
+        "--ai-timeout", type=float, default=60.0, help="AI request timeout in seconds (default: 60)"
+    )
+
     browser = parser.add_argument_group("browser")
     browser.add_argument(
         "--browser",
@@ -302,7 +364,16 @@ def build_parser(
         metavar="N", help="maximum response body bytes analyzed (default: 5242880)",
     )
     network.add_argument("--headers", nargs="+", help="extra headers: 'Name: Value'")
-    network.add_argument("--cookies", nargs="+", help="cookies: 'name=value' or 'a=b; c=d'")
+    network.add_argument(
+        "--cookies",
+        nargs="+",
+        help="cookies: 'name=value', 'a=b; c=d', or a JSON/Netscape cookies.txt path",
+    )
+    network.add_argument(
+        "--cookie-file",
+        metavar="PATH",
+        help="cookie file (JSON, Playwright storage state, Netscape cookies.txt, or name=value lines)",
+    )
 
     mass = parser.add_argument_group("mass mode")
     mass.add_argument(

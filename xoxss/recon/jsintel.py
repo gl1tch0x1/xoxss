@@ -63,6 +63,32 @@ _GET_PARAMETER_RE = re.compile(
 _OBJECT_PARAM_RE = re.compile(
     r"(?:params|query|data|body|filters)\s*[:=]\s*\{([^{}]{0,600})\}", re.I | re.S
 )
+# Global-window access: ``window.NAME = ...`` assignments and bracket reads.
+_WINDOW_ASSIGN_RE = re.compile(
+    r"\bwindow\s*\.\s*([A-Za-z_$][\w$]{0,60})\s*=(?!=)", re.I
+)
+_WINDOW_BRACKET_RE = re.compile(
+    r"""\bwindow\s*\[\s*['"]([A-Za-z_$][\w$.-]{0,60})['"]\s*\]"""
+)
+# ``Object.keys(window)`` / ``getOwnPropertyNames(window)`` enumerate globals.
+_WINDOW_ENUM_RE = re.compile(
+    r"Object\s*\.\s*(?:keys|getOwnPropertyNames)\s*\(\s*window\s*\)", re.I
+)
+_WINDOW_GLOBAL_BLOCKLIST = {
+    "alert", "atob", "blur", "btoa", "caches", "cancelAnimationFrame", "close",
+    "closed", "confirm", "console", "crypto", "customElements", "decodeURI",
+    "decodeURIComponent", "devicePixelRatio", "document", "encodeURI",
+    "encodeURIComponent", "event", "fetch", "frames", "getComputedStyle",
+    "getSelection", "history", "indexedDB", "innerHeight", "innerWidth",
+    "isSecureContext", "length", "localStorage", "location", "matchMedia",
+    "name", "navigator", "open", "opener", "origin", "outerHeight",
+    "outerWidth", "parent", "performance", "postMessage", "print", "prompt",
+    "queueMicrotask", "requestAnimationFrame", "screen", "scroll", "scrollBy",
+    "scrollTo", "scrollX", "scrollY", "self", "sessionStorage", "setInterval",
+    "setTimeout", "speechSynthesis", "status", "stop", "structuredClone",
+    "top", "window", "XMLHttpRequest", "__xoxss_hits", "__xoxss_init",
+}
+_WINDOW_GLOBAL_BLOCKLIST_LOWER = {item.lower() for item in _WINDOW_GLOBAL_BLOCKLIST}
 _GRAPHQL_RE = re.compile(
     r"([\"'`])(?:https?://[^\"'`\s]+|/[^\"'`\s]*)?/graphql(?:/[^\"'`\s]*)?\1|"
     r"([\"'`])https?://[^\"'`\s]+/graphql[^\"'`\s]*\2",
@@ -304,6 +330,21 @@ def extract_parameters(js: str) -> List[str]:
         body = match.group(1)
         for key in re.findall(r"['\"]?([A-Za-z_$][\w$.-]{0,60})['\"]?\s*:", body):
             add(key)
+    # DOM clobbering / global state: window.NAME, window['NAME'] and globals
+    # enumerated with Object.keys(window).  Reserved browser properties are
+    # filtered so the crawler does not fuzz document/navigator/location.
+    for match in _WINDOW_ASSIGN_RE.finditer(js or ""):
+        name = match.group(1)
+        if name.lower() not in _WINDOW_GLOBAL_BLOCKLIST_LOWER:
+            add(name)
+    for match in _WINDOW_BRACKET_RE.finditer(js or ""):
+        name = match.group(1)
+        if name.lower() not in _WINDOW_GLOBAL_BLOCKLIST_LOWER:
+            add(name)
+    if _WINDOW_ENUM_RE.search(js or ""):
+        # Enumeration itself exposes no names statically; record the sentinel so
+        # the browser-side miner can expand it at runtime.
+        add("__window_keys__")
     return names
 
 

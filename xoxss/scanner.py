@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import copy
 import hashlib
+import html
 import json
 import os
 import random
@@ -183,6 +185,29 @@ from xoxss.reports.html import write_html_report
 from xoxss.reports.json import report_payload, write_json_report
 from xoxss.reports.markdown import write_markdown_report
 from xoxss.scan.reflection import ReflectionInfo, analyze_reflection, browser_prequalified
+from xoxss.detection.matrix import (
+    analyze_character_matrix,
+    build_matrix_probe,
+    format_matrix_summary,
+)
+from xoxss.scan.vectors import PATH_MARKER, build_path_vectors, render_path_payload
+
+try:
+    from xoxss.analysis.ai import (
+        DEFAULT_AI_ENDPOINT,
+        DEFAULT_AI_MODEL,
+        AIAnalyzer,
+        resolve_ai_key,
+        resolve_ai_model,
+    )
+    HAS_AI = True
+except Exception:  # pragma: no cover - optional integration edge case
+    HAS_AI = False
+    AIAnalyzer = None  # type: ignore
+    DEFAULT_AI_ENDPOINT = ""  # type: ignore
+    DEFAULT_AI_MODEL = ""  # type: ignore
+    resolve_ai_key = lambda *args, **kwargs: ""  # type: ignore
+    resolve_ai_model = lambda *args, **kwargs: ""  # type: ignore
 from xoxss.core.evidence import (
     canonical_finding_url,
     finding_id as make_finding_id,
@@ -454,6 +479,31 @@ def js_marker(token: str) -> str:
     return (
         f"/*{token}*/window.__xoxss_hits=(window.__xoxss_hits||[]);"
         f"window.__xoxss_hits.push(String.fromCharCode({codes}))"
+    )
+
+
+_AI_DIALOG_RE = re.compile(
+    r"(?P<fn>alert|confirm|prompt)\s*(?:`\s*1\s*`|\(\s*(?:1|'1'|\"1\")\s*\))"
+)
+
+
+def mark_ai_payload(payload: str, token: str) -> str:
+    """Make an AI candidate attributable without changing its breakout.
+
+    The dialog argument is replaced with a value that is both a JS comment (so
+    the reflection analyser can locate it) and a runtime string (so browser
+    instrumentation records the hit).  Candidates without a recognised dialog
+    call get an appended marker statement.
+    """
+    codes = ",".join(str(ord(ch)) for ch in token)
+    call = f"/*{token}*/String.fromCharCode({codes})"
+    replaced = _AI_DIALOG_RE.sub(lambda match: f"{match.group('fn')}({call})", payload)
+    if replaced != payload:
+        return replaced
+    return (
+        payload
+        + f";/*{token}*/window.__xoxss_hits=(window.__xoxss_hits||[]);"
+        + f"window.__xoxss_hits.push(String.fromCharCode({codes}))"
     )
 
 
@@ -898,6 +948,8 @@ class Finding:
     # built from the injection only - no cookies or session data are included.
     poc_url: str = ""
     poc_command: str = ""
+    # Browser-ready form PoC (base64 data URL) for POST form points.
+    poc_html: str = ""
     # Complete evidence.  `request` holds the redacted method/URL/headers/body
     # that produced the response, `response_excerpt` shows ±100 chars around
     # the marker, and `poc_curl` is always populated so every finding is
@@ -909,6 +961,8 @@ class Finding:
     # Browser-confirmed sink detail.
     sink: str = ""
     dom_path: str = ""
+    # Special-character reflection matrix (allowed/escaped/filtered/replaced).
+    char_matrix: Dict[str, str] = field(default_factory=dict)
     # Blind/OOB callback detail (cookies, page URL, timestamp, raw callback).
     oob: Dict[str, Any] = field(default_factory=dict)
     # Identity: `source` disambiguates query/form/header/cookie points that
@@ -925,6 +979,8 @@ class Finding:
             self.request = {}
         if not isinstance(self.oob, dict):
             self.oob = {}
+        if not isinstance(self.char_matrix, dict):
+            self.char_matrix = {}
         if not self.subkey:
             self.subkey = ""
         if not self.finding_id:
@@ -2059,18 +2115,51 @@ SENSITIVE_KEY_RE = re.compile(
 )
 
 
+def build_form_html_poc(point: InjectionPoint, payload: str) -> str:
+    """Self-contained HTML form PoC (base64 data URL) for POST form points.
+
+    The URL-encoded curl command is exact and scriptable; this variant is handy
+    for reviewers who prefer a browser: opening the data URL renders a form
+    that reproduces the same request with one click.
+    """
+    if point.method.upper() == "GET":
+        return ""
+    if point.source == "json":
+        return ""
+    fields = {name: spec.value for name, spec in point.fields.items()}
+    fields[point.param] = payload
+    hidden = "\n".join(
+        f'<input type="hidden" name="{html.escape(str(name))}" '
+        f'value="{html.escape(str(value))}">'
+        for name, value in fields.items()
+    )
+    document = (
+        "<!doctype html><meta charset=\"utf-8\">"
+        "<title>XOXSS PoC</title>"
+        f'<form method="post" action="{html.escape(str(point.url))}">'
+        f"{hidden}<button type=\"submit\">Submit XOXSS PoC</button></form>"
+    )
+    encoded = base64.b64encode(document.encode("utf-8", "replace")).decode("ascii")
+    return f"data:text/html;base64,{encoded}"
+
+
 def build_poc(point: InjectionPoint, payload: str) -> Tuple[str, str]:
     """Build the reproduction proof for an injection point.
 
     Returns ``(poc_url, poc_command)``: a ready-to-open URL for GET
-    query/form/fragment points and a shell one-liner (curl) for JSON, header,
-    cookie and POST points.  The PoC embeds only the injected parameter -
-    never cookies, CSRF tokens or other session data (documented under
-    "Reports" in the README) - so the proof is safe to share as-is.
+    query/form/fragment/path points and a shell one-liner (curl) for JSON,
+    header, cookie and POST points.  The PoC embeds only the injected
+    parameter - never cookies, CSRF tokens or other session data (documented
+    under "Reports" in the README) - so the proof is safe to share as-is.
     """
     method = point.method.upper()
     if method == "GET":
-        if point.source in ("query", "form", "api", "fragment"):
+        if point.source == "path":
+            return render_path_payload(point.url, payload), ""
+        if point.source == "fragment":
+            base = str(point.url).split("#", 1)[0]
+            return f"{base}#{payload}", ""
+        if point.source in ("query", "form", "api"):
             try:
                 if point.source == "query":
                     return replace_query_param(point.url, point.param, payload), ""
@@ -2156,11 +2245,15 @@ class XSSScanner(CrawlerMixin):
             except Exception:
                 pass
         self.payloads = cached_payloads
+        self._cookies = self._parse_cookies(
+            getattr(args, "cookies", None),
+            getattr(args, "cookie_file", None),
+        )
         self.http = HttpEngine(
             console,
             self.stats,
             headers=self._parse_headers(args.headers),
-            cookies=self._parse_cookies(args.cookies),
+            cookies=self._cookies,
             timeout=args.timeout,
             retries=args.retries,
             rate=args.rate_limit,
@@ -2182,6 +2275,35 @@ class XSSScanner(CrawlerMixin):
         self.waf = WAFReport()
         self.findings: List[Finding] = []
         self._finding_keys: Set[str] = set()
+        # Opt-in AI fallback.  The key resolution order is CLI -> env -> .env;
+        # the analyzer is only constructed when a key is actually available.
+        self.ai: Any = None
+        self._ai_disabled_reason = ""
+        if HAS_AI and (getattr(args, "ai", False) or getattr(args, "ai_key", None)):
+            ai_key = resolve_ai_key(getattr(args, "ai_key", None))
+            if ai_key:
+                ai_model = resolve_ai_model(
+                    getattr(args, "ai_model", None) or DEFAULT_AI_MODEL
+                )
+                self.ai = AIAnalyzer(
+                    ai_key,
+                    model=ai_model,
+                    endpoint=getattr(args, "ai_url", None) or DEFAULT_AI_ENDPOINT,
+                    timeout=getattr(args, "ai_timeout", None) or 60.0,
+                    console=console,
+                )
+                console.info(
+                    f"AI fallback enabled ({ai_model}); candidates still require "
+                    "deterministic reflection/execution evidence",
+                    important=False,
+                )
+            else:
+                self._ai_disabled_reason = (
+                    "--ai requested but no key found (use --ai-key, XOXSS_AI_KEY, "
+                    "OPENROUTER_API_KEY or .env)"
+                )
+                console.warn(self._ai_disabled_reason)
+        self._ai_only = bool(getattr(args, "ai_only", False) and self.ai is not None)
         self._stop = asyncio.Event()
         self._status_task: Optional[asyncio.Task] = None
         self.screenshot_dir = Path(args.state_dir) / "screenshots"
@@ -2211,6 +2333,7 @@ class XSSScanner(CrawlerMixin):
         self._mined_params: Dict[str, List[str]] = {}
         self._browser_points: Dict[str, List[InjectionPoint]] = {}
         self.discovered_param_names: List[str] = []
+        self._param_wordlist_cache: Optional[List[str]] = None
         self._ast_seen: Set[str] = set()
         self.oob: Optional[OOBManager] = None  # type: ignore[valid-type]
         self._oob_task: Optional[asyncio.Task] = None
@@ -2242,13 +2365,102 @@ class XSSScanner(CrawlerMixin):
         return headers
 
     @staticmethod
-    def _parse_cookies(values: Optional[Sequence[str]]) -> Dict[str, str]:
+    def _cookies_from_text(text: str) -> Dict[str, str]:
+        """Parse ``name=value`` pairs from a header string or line set."""
+        cookies: Dict[str, str] = {}
+        value = str(text or "").strip()
+        if value.lower().startswith("cookie:"):
+            value = value.split(":", 1)[1]
+        for chunk in re.split(r"[;\r\n]+", value):
+            chunk = chunk.strip()
+            if not chunk or chunk.startswith("#") or "=" not in chunk:
+                continue
+            name, cookie_value = chunk.split("=", 1)
+            name = name.strip()
+            if name:
+                cookies[name] = cookie_value.strip()
+        return cookies
+
+    @staticmethod
+    def _parse_cookie_file(path: Path) -> Dict[str, str]:
+        """Parse JSON, Netscape or header/line cookie files.
+
+        Supported shapes:
+
+        * JSON object ``{"name": "value"}`` or Playwright-style
+          ``{"cookies": [{"name": ..., "value": ...}]}``
+        * JSON array of ``[name, value]`` pairs or ``{"name", "value"}`` objects
+        * Netscape ``cookies.txt`` (7 tab-separated fields)
+        * plain ``name=value`` lines (or a ``Cookie:`` header)
+        """
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except Exception:
+            return {}
+        stripped = text.lstrip()
+        if stripped.startswith(("[", "{")):
+            try:
+                payload = json.loads(stripped)
+            except Exception:
+                payload = None
+            cookies: Dict[str, str] = {}
+            if isinstance(payload, dict):
+                raw = payload.get("cookies")
+                if isinstance(raw, list):
+                    for item in raw:
+                        if isinstance(item, dict) and item.get("name"):
+                            cookies[str(item["name"])] = str(item.get("value", ""))
+                else:
+                    for name, value in payload.items():
+                        if isinstance(value, (str, int, float)):
+                            cookies[str(name)] = str(value)
+            elif isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, dict) and item.get("name"):
+                        cookies[str(item["name"])] = str(item.get("value", ""))
+                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                        cookies[str(item[0])] = str(item[1])
+            if cookies:
+                return cookies
+        cookies = {}
+        for line in text.splitlines():
+            line = line.rstrip("\r\n")
+            if not line.strip():
+                continue
+            # Netscape format: #HttpOnly_ prefix is data, plain # is a comment.
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.lstrip().startswith("#"):
+                continue
+            if "\t" in line:
+                fields = line.split("\t")
+                if len(fields) >= 7 and fields[5].strip():
+                    cookies[fields[5].strip()] = fields[6].strip()
+                    continue
+            cookies.update(XSSScanner._cookies_from_text(line))
+        return cookies
+
+    @staticmethod
+    def _parse_cookies(
+        values: Optional[Sequence[str]],
+        files: Optional[Sequence[str]] = None,
+    ) -> Dict[str, str]:
         cookies: Dict[str, str] = {}
         for item in values or []:
-            for chunk in item.split(";"):
-                if "=" in chunk:
-                    name, value = chunk.split("=", 1)
-                    cookies[name.strip()] = value.strip()
+            if not item:
+                continue
+            candidate = Path(str(item)).expanduser()
+            try:
+                is_file = candidate.is_file()
+            except OSError:
+                is_file = False
+            if is_file:
+                cookies.update(XSSScanner._parse_cookie_file(candidate))
+                continue
+            cookies.update(XSSScanner._cookies_from_text(str(item)))
+        for item in files or []:
+            candidate = Path(str(item)).expanduser()
+            cookies.update(XSSScanner._parse_cookie_file(candidate))
         return cookies
 
     def transform_payload(self, payload: str) -> str:
@@ -3371,6 +3583,8 @@ class XSSScanner(CrawlerMixin):
                 await self.test_headers(url)
             if self.args.dom:
                 await self.test_dom(url)
+            if getattr(self.args, "fragment_xss", False):
+                await self.test_fragment(url)
             completed = True
         except asyncio.CancelledError:
             interrupted = True
@@ -3393,6 +3607,39 @@ class XSSScanner(CrawlerMixin):
                     self.state.mark_url_status(url, "failed", error_message or "scan did not complete")
                 self.state.save(force=True)
                 self.stats.urls_done += 1
+
+    def _candidate_param_wordlist(self) -> List[str]:
+        """Load the operator's parameter-name wordlist (one name per line)."""
+        if self._param_wordlist_cache is not None:
+            return self._param_wordlist_cache
+        names: List[str] = []
+        path = getattr(self.args, "param_wordlist", None)
+        if path:
+            try:
+                text = Path(str(path)).expanduser().read_text(
+                    encoding="utf-8-sig", errors="replace"
+                )
+            except Exception as exc:
+                self.console.warn(f"Cannot read parameter wordlist {path}: {exc}")
+                text = ""
+            seen = set()
+            for line in text.splitlines():
+                name = line.strip().split("#", 1)[0].strip()
+                if not name or len(name) > 80:
+                    continue
+                if "=" in name:
+                    name = name.split("=", 1)[0].strip()
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                names.append(name)
+            if names:
+                self.console.info(
+                    f"Loaded {len(names)} parameter name(s) from {path}",
+                    important=False,
+                )
+        self._param_wordlist_cache = names
+        return names
 
     async def discover_points(self, url: str) -> List[InjectionPoint]:
         points: List[InjectionPoint] = []
@@ -3433,6 +3680,41 @@ class XSSScanner(CrawlerMixin):
                     page_url=url,
                 )
             )
+
+        # Explicit parameter wordlists mirror XSSRush's mining phase: test
+        # operator-supplied names even on clean URLs.  Cap the per-URL budget so
+        # a large wordlist cannot turn one page into thousands of requests.
+        wordlist = self._candidate_param_wordlist()
+        if wordlist:
+            limit = max(1, int(getattr(self.args, "param_wordlist_limit", 50) or 50))
+            for name in wordlist[:limit]:
+                add(
+                    InjectionPoint(
+                        url=url,
+                        method="GET",
+                        param=name,
+                        value="",
+                        source="query",
+                        page_url=url,
+                    )
+                )
+
+        # Path-segment injection: breadcrumbs, 404 handlers and rewrite rules
+        # often reflect the request path.  These points are rendered by
+        # build_get_url/build_poc with the PATH_MARKER sentinel.
+        if getattr(self.args, "path_xss", False) and not looks_like_dangerous(url):
+            for templated, path_index in build_path_vectors(url)[:8]:
+                add(
+                    InjectionPoint(
+                        url=templated,
+                        method="GET",
+                        param="PATH",
+                        value="",
+                        source="path",
+                        path_index=path_index,
+                        page_url=url,
+                    )
+                )
 
         response = await self.http.get(url, cache=True)
         if response.error or not response.text:
@@ -3569,6 +3851,11 @@ class XSSScanner(CrawlerMixin):
 
     # -- injection --------------------------------------------------------------------
     def build_get_url(self, point: InjectionPoint, payload: str) -> str:
+        if point.source == "path":
+            return render_path_payload(point.url, payload)
+        if point.source == "fragment":
+            base = str(point.url).split("#", 1)[0]
+            return f"{base}#{payload}"
         if point.source == "query":
             return replace_query_param(point.url, point.param, payload)
         values = {name: spec.value for name, spec in point.fields.items()}
@@ -3782,13 +4069,36 @@ class XSSScanner(CrawlerMixin):
             self.console.debug(f"Rejected candidate (marker not reflected): {location}")
             return
 
+        # Optional special-character matrix: one extra probe maps which
+        # delimiters survive at this point.  The result is attached to every
+        # finding and fed to the AI fallback prompt.
+        if getattr(self.args, "char_matrix", False):
+            matrix_token = unique_token("m", 8)
+            matrix_probe = build_matrix_probe(matrix_token)
+            matrix_response = await self.send_point(point, matrix_probe)
+            if (
+                matrix_response is not None
+                and not matrix_response.error
+                and matrix_response.text
+            ):
+                self.stats.payloads += 1
+                matrix = analyze_character_matrix(matrix_response.text, matrix_token)
+                point.extra["char_matrix"] = matrix
+                groups = format_matrix_summary(matrix)
+                summary = "; ".join(
+                    f"{status}={''.join(chars)}"
+                    for status, chars in groups.items()
+                    if chars
+                )
+                self.console.debug(f"Character matrix {location}: {summary}")
+
         if getattr(self.args, "mutation_probes", False):
             await self._probe_mutations(point)
 
         self.console.debug(f"Reflected ({info.detail}): {location}")
 
-        # Use polyglot payloads if enabled
-        if HAS_ADVANCED and getattr(self.args, 'polyglot', False):
+        # Use polyglot payloads if enabled (skipped in AI-only mode).
+        if HAS_ADVANCED and getattr(self.args, 'polyglot', False) and not self._ai_only:
             from xoxss.analysis.polyglot import (
                 PolyglotContext,
                 PolyglotGenerator as PolyglotPayloadGenerator,
@@ -3853,6 +4163,8 @@ class XSSScanner(CrawlerMixin):
                             detail=detail,
                             poc_url=poc_url,
                             poc_command=poc_command,
+                            poc_html=build_form_html_poc(point, payload),
+                            char_matrix=dict(point.extra.get("char_matrix") or {}),
                             source=point.source,
                             **self.evidence_from_response(result, token, point.param),
                         )
@@ -3864,7 +4176,11 @@ class XSSScanner(CrawlerMixin):
             # so the injection point is never left untested.
 
         # Standard payload testing
-        templates = self.payloads.payloads_for(info.context, self.args.max_payloads)
+        templates = (
+            []
+            if self._ai_only
+            else self.payloads.payloads_for(info.context, self.args.max_payloads)
+        )
         if getattr(self.args, "adaptive_payloads", False):
             probe_templates = list(templates)
             base_key = self._mutation_key(point.url)
@@ -3937,6 +4253,8 @@ class XSSScanner(CrawlerMixin):
                             detail="Persistence verified over HTTP; execution not re-confirmed",
                             poc_url=stored_page,
                             poc_command=stored_poc_command,
+                            poc_html=build_form_html_poc(point, payload),
+                            char_matrix=dict(point.extra.get("char_matrix") or {}),
                             source="stored",
                             **evidence_fields,
                         )
@@ -4003,8 +4321,104 @@ class XSSScanner(CrawlerMixin):
                     detail=detail,
                     poc_url=poc_url,
                     poc_command=poc_command,
+                    poc_html=build_form_html_poc(point, payload),
+                    char_matrix=dict(point.extra.get("char_matrix") or {}),
                     source=point.source,
                     **self.evidence_from_response(result, payload_token, point.param),
+                )
+            )
+            return
+
+        # -- AI fallback ---------------------------------------------------------
+        # Reached only when the deterministic corpus produced no finding.  AI
+        # output is a candidate: it must still reflect with surviving delimiters
+        # and, when a browser is available, execute in the instrumented sink.
+        if self.ai is None or not self.ai.available():
+            return
+        ai_payloads = await self.ai.generate_payloads(
+            endpoint=point.url,
+            param_name=point.param,
+            location=point.method.upper(),
+            context=info.context,
+            char_matrix=point.extra.get("char_matrix") or {},
+            snippet=info.snippet,
+            reflected_token=token,
+            limit=max(1, min(8, int(getattr(self.args, "max_payloads", 20) or 20))),
+        )
+        if not ai_payloads:
+            return
+        self.console.info(
+            f"AI fallback produced {len(ai_payloads)} candidate(s) for {location}",
+            important=False,
+        )
+        for candidate in ai_payloads:
+            if self._stop.is_set():
+                return
+            ai_token = unique_token("a", 9)
+            marked = mark_ai_payload(candidate, ai_token)
+            result = await self.send_point(point, marked)
+            if result is None or result.error or not result.text:
+                continue
+            self.stats.payloads += 1
+            ai_info = analyze_reflection(
+                result.text, ai_token, marked, result.header("content-type", "")
+            )
+            if not ai_info.reflected or not ai_info.executable:
+                self.console.debug(
+                    f"Rejected AI candidate "
+                    f"({ai_info.inert_reason or ai_info.context}): {location}"
+                )
+                continue
+            content_type = result.header("content-type", "")
+            if (
+                self.pool is not None
+                and self.pool.engines
+                and self.args.confirm != "http"
+            ):
+                finding = await self.confirm_in_browser(
+                    point, marked, ai_token, ai_info, content_type, response=result
+                )
+                if finding:
+                    finding.kind = "Reflected XSS (AI-assisted)"
+                    finding.detail = (
+                        "AI candidate; "
+                        + (finding.detail or "execution confirmed in browser")
+                    )
+                    self.add_finding(finding)
+                    return
+                self.console.debug(
+                    f"AI candidate did not confirm in browser: {location}"
+                )
+                continue
+            requested, available = self._browser_state()
+            confidence, rationale, detail = reflection_confidence(
+                ai_info,
+                requested=requested,
+                available=available,
+                content_type=content_type,
+            )
+            poc_url, poc_command = self.poc_for_point(point, marked)
+            self.add_finding(
+                Finding(
+                    kind="Reflected XSS (AI-assisted)",
+                    url=point.url,
+                    parameter=point.param,
+                    method=point.method.upper(),
+                    payload=marked,
+                    evidence=f"AI candidate reflected unescaped ({ai_info.detail})",
+                    confidence=confidence,
+                    confidence_rationale=(
+                        "AI output is candidate-only; deterministic reflection with "
+                        "surviving delimiters was re-verified. " + rationale
+                    ),
+                    context=ai_info.context,
+                    detail=detail,
+                    poc_url=poc_url,
+                    poc_command=poc_command,
+                    poc_html=build_form_html_poc(point, marked),
+                    char_matrix=dict(point.extra.get("char_matrix") or {}),
+                    source=point.source,
+                    **self.evidence_from_response(result, ai_token, point.param),
                 )
             )
             return
@@ -4126,6 +4540,8 @@ class XSSScanner(CrawlerMixin):
                     screenshot=screenshot,
                     poc_url=poc_url,
                     poc_command=poc_command,
+                    poc_html=build_form_html_poc(point, payload),
+                    char_matrix=dict(point.extra.get("char_matrix") or {}),
                     source=point.source,
                     sink=sink,
                     dom_path=dom_path,
@@ -4150,15 +4566,34 @@ class XSSScanner(CrawlerMixin):
 
     # -- header injection -------------------------------------------------------------
     async def test_headers(self, url: str) -> None:
-        candidates = self.args.header_list or [
+        excluded = {
+            str(name).strip().lower()
+            for name in (getattr(self.args, "exclude_header", None) or [])
+            if str(name).strip()
+        }
+        candidates = getattr(self.args, "header_list", None) or [
             "User-Agent",
             "Referer",
             "X-Forwarded-Host",
             "X-Forwarded-For",
+            "X-Forwarded-Server",
+            "X-Real-IP",
+            "X-Client-IP",
+            "True-Client-IP",
+            "CF-Connecting-IP",
+            "Forwarded",
             "X-Original-URL",
+            "X-Rewrite-URL",
+            "X-Forwarded-Uri",
+            "X-Request-URI",
+            "X-Original-URI",
             "Origin",
         ]
-        headers = list(dict.fromkeys(candidates))
+        headers = [
+            header
+            for header in dict.fromkeys(candidates)
+            if header.lower() not in excluded and header.lower() != "cookie"
+        ]
         for offset in range(0, len(headers), 10):
             if self._stop.is_set():
                 return
@@ -4241,6 +4676,82 @@ class XSSScanner(CrawlerMixin):
                     )
                 )
 
+        await self._test_cookie_header(url, excluded)
+
+    async def _test_cookie_header(self, url: str, excluded: Optional[Set[str]] = None) -> None:
+        """Inject into existing session cookies through the ``Cookie`` header.
+
+        The whole cookie jar is preserved and only one value is replaced, so the
+        proof runs against the same authenticated session instead of a stripped
+        request.
+        """
+        excluded = excluded or set()
+        if "cookie" in excluded:
+            return
+        jar = dict(getattr(self, "_cookies", {}) or {})
+        if not jar:
+            return
+        limit = max(1, int(getattr(self.args, "cookie_test_limit", 10) or 10))
+        for name in list(jar)[:limit]:
+            if self._stop.is_set():
+                return
+            marker = unique_token("c", 9)
+            probe_jar = dict(jar)
+            probe_jar[name] = marker
+            cookie_header = "; ".join(f"{key}={value}" for key, value in probe_jar.items())
+            try:
+                response = await self.http.get(url, headers={"Cookie": cookie_header})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.console.debug(f"Cookie reflection probe failed for {name}: {exc}")
+                continue
+            if response.error or not response.text or marker not in response.text:
+                continue
+
+            token = unique_token()
+            payload = self.transform_payload(
+                self.payloads.render("<script>{m}</script>", token)
+            )
+            probe_jar[name] = payload
+            cookie_header = "; ".join(f"{key}={value}" for key, value in probe_jar.items())
+            try:
+                response = await self.http.get(url, headers={"Cookie": cookie_header})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.console.debug(f"Cookie validation failed for {name}: {exc}")
+                continue
+            if response.error or not response.text:
+                continue
+            info = analyze_reflection(
+                response.text, token, payload, response.header("content-type", "")
+            )
+            if not info.reflected or not info.executable:
+                continue
+            point = InjectionPoint(url=url, method="GET", param=name, source="cookie")
+            poc_url, poc_command = self.poc_for_point(point, payload)
+            self.add_finding(
+                Finding(
+                    kind="Cookie XSS (reflection)",
+                    url=url,
+                    parameter=name,
+                    method="GET",
+                    payload=payload,
+                    evidence=(
+                        "injected cookie reflected unescaped and executable "
+                        f"({info.detail})"
+                    ),
+                    confidence="medium",
+                    context=info.context,
+                    detail="Cookie reflections cannot be browser-verified without a proxy",
+                    poc_url=poc_url,
+                    poc_command=poc_command,
+                    source="cookie",
+                    **self.evidence_from_response(response, token, name),
+                )
+            )
+
     # -- DOM XSS ----------------------------------------------------------------------
     async def _probe_websocket_frames(self, page_url: str, scripts: Sequence[DomScript]) -> None:
         """Actively inject marker frames into WebSocket endpoints found in page JS."""
@@ -4257,7 +4768,7 @@ class XSSScanner(CrawlerMixin):
         parts = urlsplit(page_url)
         origin = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
         headers = self._parse_headers(self.args.headers)
-        cookies = self._parse_cookies(self.args.cookies)
+        cookies = self._parse_cookies(getattr(self.args, "cookies", None), getattr(self.args, "cookie_file", None))
         probe = WebSocketActiveProbe(
             self.console,
             timeout=min(10.0, max(3.0, float(self.args.timeout))),
@@ -4598,6 +5109,72 @@ class XSSScanner(CrawlerMixin):
                     return
             except Exception as exc:
                 self.console.debug(f"DOM {source_name} source verification error: {exc}")
+
+    async def test_fragment(self, url: str) -> None:
+        """Browser-only fragment/hash injection phase.
+
+        URL fragments never reach the server, so this phase is meaningful only
+        with a real browser.  A finding is raised only when the marker reaches
+        an instrumented execution sink.
+        """
+        if self.pool is None or not self.pool.engines:
+            self.console.debug("Fragment XSS needs a browser; skipping")
+            return
+        templates = self.payloads.payloads_for("html", 8)
+        if not templates:
+            return
+        self.console.info(f"Testing fragment/hash vectors on {truncate(url, 110)}")
+        base = str(url).split("#", 1)[0]
+        for template in templates:
+            if self._stop.is_set():
+                return
+            token = unique_token("f", 9)
+            payload = self.payloads.render(template, token, "html")
+            target = f"{base}#{payload.replace(' ', '%20')}"
+            try:
+                async with self.pool.borrow() as browser:
+                    await browser.navigate(target)
+                    hit = await browser.check_token(token, timeout=2.5)
+                    self.stats.browser_checks += 1
+                    if not hit or hit.get("executed") != "yes":
+                        continue
+                    screenshot_path = self.screenshot_dir / f"{token}.png"
+                    screenshot = await browser.screenshot(str(screenshot_path))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.console.debug(f"Fragment probe failed: {str(exc)[:160]}")
+                continue
+            evidence = str(hit.get("evidence") or "")
+            sink = str(hit.get("sink") or "")
+            if sink:
+                evidence = f"sink={sink}; {evidence}" if evidence else f"sink={sink}"
+            self.add_finding(
+                Finding(
+                    kind="DOM XSS (fragment)",
+                    url=target,
+                    parameter="#hash",
+                    method="GET",
+                    payload=payload,
+                    evidence=evidence,
+                    confidence="confirmed",
+                    confidence_rationale=(
+                        "The fragment marker reached an instrumented execution sink "
+                        "in a real browser."
+                    ),
+                    context="fragment",
+                    detail=(
+                        "URL fragment executed in the browser; fragments never reach "
+                        "the server"
+                    ),
+                    screenshot=screenshot,
+                    poc_url=target,
+                    source="fragment",
+                    sink=sink,
+                    dom_path=str(hit.get("dom_path") or ""),
+                )
+            )
+            return
 
     # -- stored XSS -------------------------------------------------------------------
     # -- Advanced feature methods (Phase 1 & 2) ----------------------------------------
@@ -5204,6 +5781,9 @@ def apply_god_preset(
     args.report_reflections = True
     args.mutation_probes = True
     args.adaptive_payloads = True
+    args.char_matrix = True
+    if unclaimed("--path-xss", "--no-path-xss"):
+        args.path_xss = True
 
     # -- advanced analysis (cheap, HTTP-level) -------------------------------------------
     args.polyglot = True
@@ -5247,6 +5827,7 @@ def apply_god_preset(
             bump("browser_workers", 2, "--browser-workers")
             args.headless = True
             args.screenshot = True
+            args.fragment_xss = True
 
     # -- blind XSS / out-of-band -----------------------------------------------------------
     configured_oob = bool(
@@ -5556,7 +6137,7 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
         console,
         stats,
         headers=XSSScanner._parse_headers(args.headers),
-        cookies=XSSScanner._parse_cookies(args.cookies),
+        cookies=XSSScanner._parse_cookies(args.cookies, getattr(args, "cookie_file", None)),
         timeout=args.timeout,
         retries=args.retries,
         rate=args.rate_limit,
@@ -5718,7 +6299,7 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         console,
         stats,
         headers=XSSScanner._parse_headers(args.headers),
-        cookies=XSSScanner._parse_cookies(args.cookies),
+        cookies=XSSScanner._parse_cookies(args.cookies, getattr(args, "cookie_file", None)),
         timeout=args.timeout,
         retries=args.retries,
         rate=args.rate_limit,
@@ -5859,7 +6440,7 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         console,
         stats,
         headers=XSSScanner._parse_headers(args.headers),
-        cookies=XSSScanner._parse_cookies(args.cookies),
+        cookies=XSSScanner._parse_cookies(args.cookies, getattr(args, "cookie_file", None)),
         timeout=args.timeout,
         retries=args.retries,
         rate=args.rate_limit,
@@ -6197,7 +6778,7 @@ async def run_replay(args: argparse.Namespace, console: Console) -> int:
     payload = str(item.get("payload") or "")
     token = _replay_token(payload)
     user_headers = XSSScanner._parse_headers(getattr(args, "headers", None))
-    user_cookies = XSSScanner._parse_cookies(getattr(args, "cookies", None))
+    user_cookies = XSSScanner._parse_cookies(getattr(args, "cookies", None), getattr(args, "cookie_file", None))
     headers.update(user_headers)
 
     console.rule("replay")
@@ -6341,6 +6922,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     explicit_flags = {token.split("=", 1)[0] for token in raw_args if token.startswith("--")}
     god_mode_requested = "--god" in explicit_flags or "--yolo" in explicit_flags
+    if args.ai_only:
+        args.ai = True
+
     if args.profile == "quick" and not god_mode_requested:
         if "--crawl" not in explicit_flags and "--deep" not in explicit_flags:
             args.crawl = False
@@ -6480,6 +7064,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         args.discover = True
         args.discover_paths = True
         args.fuzz_params = True
+        if "--no-path-xss" not in explicit_flags:
+            args.path_xss = True
 
     # Headed vs headless is resolved from the terminal/CI context unless the
     # operator pinned it with --headless or --show-browser.

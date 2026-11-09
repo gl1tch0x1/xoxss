@@ -161,6 +161,8 @@ def build_sarif_document(
                     "responseStatus": getattr(finding, "response_status", 0) or 0,
                     "responseExcerpt": getattr(finding, "response_excerpt", ""),
                     "oob": getattr(finding, "oob", {}) or {},
+                    "charMatrix": getattr(finding, "char_matrix", {}) or {},
+                    "pocHtml": getattr(finding, "poc_html", ""),
                     "screenshot": getattr(finding, "screenshot", ""),
                     "pocUrl": poc_url,
                     "pocCommand": poc_command,
