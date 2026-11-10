@@ -259,9 +259,16 @@ except Exception:  # pragma: no cover
 
 try:  # required
     from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+    try:
+        from bs4 import XMLParsedAsHTMLWarning
+    except ImportError:
+        XMLParsedAsHTMLWarning = None
 
     HAS_BS4 = True
     warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
+    if XMLParsedAsHTMLWarning is not None:
+        warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+    warnings.filterwarnings("ignore", module=r"bs4(\..*)?")
 except Exception:  # pragma: no cover
     BeautifulSoup = None  # type: ignore
     HAS_BS4 = False
@@ -271,7 +278,9 @@ def _soup(html_text: str) -> BeautifulSoupType:
     """Parse HTML, raising a clear error when BeautifulSoup is unavailable."""
     if BeautifulSoup is None:
         raise RuntimeError("beautifulsoup4 is required: pip install -r requirements.txt")
-    return BeautifulSoup(html_text, "html.parser")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return BeautifulSoup(html_text, "html.parser")
 
 
 APP_NAME = "XOX$$"
@@ -290,31 +299,47 @@ PAYLOAD_SOURCES: Tuple[str, ...] = (
 MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
 MAX_REMOTE_PAYLOADS = 5000
 
-# Parameter names tried on discovered endpoints that do not expose any query string.
+# Parameter names tried on discovered endpoints that show evidence of accepting query parameters.
+# Organised by sink category with fallback usage only after HTML/JS discovery.
 FUZZ_PARAM_NAMES: Tuple[str, ...] = (
-    "q",
-    "s",
-    "search",
-    "query",
-    "keyword",
-    "name",
-    "id",
-    "page",
-    "url",
-    "redirect",
-    "next",
-    "callback",
-    "message",
-    "text",
-    "input",
-    "value",
-    "email",
-    "username",
-    "title",
-    "content",
-    "return",
-    "view",
+    # search / user input
+    "q", "s", "search", "query", "keyword", "keywords", "term", "filter",
+    "name", "id", "page", "title", "content", "text", "input", "value",
+    "email", "username", "user", "userid", "account",
+    # redirect / URL sinks (high value: open redirect to javascript: URIs)
+    "redirect_url", "redirect_uri", "redirectTo", "returnTo", "return_url",
+    "return_uri", "ruri", "next_url", "continueUrl", "goto", "dest",
+    "destination", "forward", "link", "path", "uri", "u", "to", "rurl",
+    "url", "redirect", "return", "returnUrl", "next", "continue",
+    "callback", "cb", "go", "target", "out", "jump", "r", "host",
+    # template / rendering sinks (view engines, themes, locales)
+    "template", "tpl", "view", "section", "lang", "locale", "format",
+    "mode", "sort", "order", "action", "type", "page_id", "layout", "theme",
+    # content / UI / messaging
+    "comment", "msg", "body", "description", "summary", "message",
+    # error / status / fragment sinks
+    "error", "errors", "status", "code", "reason", "note",
+    "hl", "q0", "s0", "sh", "redir", "u1", "d", "x",
 )
+
+
+def endpoint_accepts_query_params(url: str, response_text: str = "") -> bool:
+    """Gate 1: Verify whether the endpoint shows evidence of accepting query parameters.
+
+    Prevents blind parameter fuzzing on static or non-query endpoints.
+    Accepts if:
+      - The URL already contains a query string, OR
+      - The response body or inline scripts reference '?', 'location.search', or 'URLSearchParams'.
+    """
+    if bool(urlsplit(url).query):
+        return True
+    if not response_text:
+        return False
+    return (
+        "?" in response_text
+        or "location.search" in response_text
+        or "URLSearchParams" in response_text
+    )
 
 # Patterns used to pull API routes out of inline/external JavaScript.
 JS_ENDPOINT_PATTERNS = (
@@ -468,7 +493,7 @@ def unique_token(prefix: str = "z", length: int = 9) -> str:
 
 
 def js_marker(token: str) -> str:
-    """Quote-free JS snippet that records `token` in window.__xoxss_hits.
+    """Quote-free JS snippet that records `token` in window.__xoxss_hits and triggers window.alert.
 
     Quote-free matters: the same marker is embedded inside single quoted,
     double quoted and unquoted HTML attributes without breaking them.
@@ -476,13 +501,16 @@ def js_marker(token: str) -> str:
     codes = ",".join(str(ord(ch)) for ch in token)
     return (
         f"/*{token}*/window.__xoxss_hits=(window.__xoxss_hits||[]);"
-        f"window.__xoxss_hits.push(String.fromCharCode({codes}))"
+        f"window.__xoxss_hits.push(String.fromCharCode({codes}));"
+        f"try{{window.alert(String.fromCharCode({codes}))}}catch(e){{}}"
     )
 
 
-_AI_DIALOG_RE = re.compile(
-    r"(?P<fn>alert|confirm|prompt)\s*(?:`\s*1\s*`|\(\s*(?:1|'1'|\"1\")\s*\))"
+_DIALOG_CALL_RE = re.compile(
+    r"\b(?P<fn>alert|confirm|prompt)\s*(?:`\s*1\s*`|\(\s*(?:1|'1'|\"1\"|`1`|)\s*\))",
+    re.I,
 )
+_AI_DIALOG_RE = _DIALOG_CALL_RE
 
 
 def mark_ai_payload(payload: str, token: str) -> str:
@@ -501,7 +529,8 @@ def mark_ai_payload(payload: str, token: str) -> str:
     return (
         payload
         + f";/*{token}*/window.__xoxss_hits=(window.__xoxss_hits||[]);"
-        + f"window.__xoxss_hits.push(String.fromCharCode({codes}))"
+        + f"window.__xoxss_hits.push(String.fromCharCode({codes}));"
+        + f"try{{window.alert(String.fromCharCode({codes}))}}catch(e){{}}"
     )
 
 
@@ -1052,6 +1081,7 @@ class Finding:
     # Identity: `source` disambiguates query/form/header/cookie points that
     # share a URL and parameter; `finding_id` is the stable --replay handle.
     source: str = ""
+    param_source: str = "discovered"  # discovered | fuzzed
     finding_id: str = ""
     subkey: str = ""
     tags: List[str] = field(default_factory=list)
@@ -1145,6 +1175,28 @@ def enforce_finding_policy(finding: Finding) -> bool:
     return True
 
 
+# Validation outcomes (execution-based validation pipeline)
+CONFIRMED_EXECUTION = "CONFIRMED_EXECUTION"
+REJECTED = "REJECTED"
+UNVERIFIED = "UNVERIFIED"
+
+# Classifications for non-confirmed candidates
+FALSE_POSITIVE = "FALSE_POSITIVE"
+NEEDS_MANUAL_TEST = "NEEDS_MANUAL_TEST"
+
+
+@dataclass
+class ValidationResult:
+    status: str  # CONFIRMED_EXECUTION | REJECTED | UNVERIFIED
+    classification: Optional[str] = None  # FALSE_POSITIVE | NEEDS_MANUAL_TEST | None
+    reason: str = ""
+    evidence: str = ""
+    dialog_text: Optional[str] = None
+    in_dom: bool = False
+    in_response: bool = False
+    screenshot: str = ""
+
+
 @dataclass
 class ScanStats:
     requests: int = 0
@@ -1169,6 +1221,9 @@ class ScanStats:
     oob_registered: int = 0
     oob_hits: int = 0
     external_findings: int = 0
+    false_positives: int = 0
+    needs_manual_test: int = 0
+    rejections: Dict[str, int] = field(default_factory=dict)
     started: float = field(default_factory=time.time)
 
     @property
@@ -1192,6 +1247,7 @@ class InjectionPoint:
     value: str = ""
     # query | form | json | cookie | header | path | fragment | api | websocket
     source: str = "query"
+    param_source: str = "discovered"  # discovered | fuzzed
     form_index: Optional[int] = None
     fields: Dict[str, FormField] = field(default_factory=dict)
     page_url: str = ""
@@ -1876,6 +1932,12 @@ class PayloadEngine:
 
     def render(self, template: str, token: str, context: str = "") -> str:
         marker = js_marker(token)
+        codes = ",".join(str(ord(ch)) for ch in token)
+        # Substitute alert(1) and generic dialog calls with the unique per-payload marker
+        template = _DIALOG_CALL_RE.sub(
+            lambda m: f"{m.group('fn')}(String.fromCharCode({codes}))",
+            template,
+        )
         if "{m}" in template:
             return template.replace("{m}", marker)
         if "{t}" in template:
@@ -2403,6 +2465,7 @@ class XSSScanner(CrawlerMixin):
         self.waf = WAFReport()
         self.findings: List[Finding] = []
         self._finding_keys: Set[str] = set()
+        self._confirmed_contexts: Set[Tuple[str, str, str]] = set()
         # Opt-in AI fallback.  The key resolution order is CLI -> env -> .env;
         # the analyzer is only constructed when a key is actually available.
         self.ai: Any = None
@@ -2645,56 +2708,61 @@ class XSSScanner(CrawlerMixin):
 
         marker = unique_token("pp", 10)
         probes = build_proto_probes(url, marker)
-        async with self.pool.borrow() as browser:
-            for probe_url, probe in probes:
-                if self._stop.is_set():
+        try:
+            async with self.pool.borrow() as browser:
+                for probe_url, probe in probes:
+                    if self._stop.is_set():
+                        return
+                    await browser.navigate(probe_url)
+                    result = await browser.evaluate(PROTO_PROBE_JS, {"marker": marker})
+                    self.stats.browser_checks += 1
+                    if not isinstance(result, dict) or not result.get("polluted"):
+                        continue
+
+                    values = [str(item) for item in (result.get("values") or []) if item]
+                    evidence = values[0] if values else marker
+                    added = self.add_finding(
+                        Finding(
+                            kind="Prototype Pollution (confirmed)",
+                            url=probe_url,
+                            parameter=probe.parameter,
+                            method="GET",
+                            payload=f"{probe.parameter}={marker}",
+                            evidence=f"Object.prototype.{PROTO_MARKER_KEY} == {evidence}",
+                            confidence="confirmed",
+                            context=f"client-side ({probe.location})",
+                            detail=(
+                                "A fresh object inherited the marker after the page consumed "
+                                "the probe, so attacker-controlled input reaches a merge or "
+                                "assignment sink that copies __proto__."
+                            ),
+                            tags=["prototype-pollution"],
+                            subkey=probe.parameter,
+                            poc_url=probe_url,
+                            source="proto",
+                            sink=f"Object.prototype.{PROTO_MARKER_KEY}",
+                        )
+                    )
+                    if added:
+                        self.console.ok(
+                            f"Prototype pollution confirmed via {probe.location}: "
+                            f"{truncate(url, 90)}"
+                        )
+
+                    gadgets = result.get("gadgets") or []
+                    fingerprinted = [
+                        str(item.get("name"))
+                        for item in gadgets
+                        if isinstance(item, dict) and item.get("name")
+                    ]
+                    self.console.debug(f"Gadgets on page: {', '.join(fingerprinted) or 'none'}")
+                    names = gadget_exploit_names(gadgets) if gadget_exploit_names else []
+                    await self._exploit_proto_gadgets(browser, url, names)
                     return
-                await browser.navigate(probe_url)
-                result = await browser.evaluate(PROTO_PROBE_JS, {"marker": marker})
-                self.stats.browser_checks += 1
-                if not isinstance(result, dict) or not result.get("polluted"):
-                    continue
-
-                values = [str(item) for item in (result.get("values") or []) if item]
-                evidence = values[0] if values else marker
-                added = self.add_finding(
-                    Finding(
-                        kind="Prototype Pollution (confirmed)",
-                        url=probe_url,
-                        parameter=probe.parameter,
-                        method="GET",
-                        payload=f"{probe.parameter}={marker}",
-                        evidence=f"Object.prototype.{PROTO_MARKER_KEY} == {evidence}",
-                        confidence="confirmed",
-                        context=f"client-side ({probe.location})",
-                        detail=(
-                            "A fresh object inherited the marker after the page consumed "
-                            "the probe, so attacker-controlled input reaches a merge or "
-                            "assignment sink that copies __proto__."
-                        ),
-                        tags=["prototype-pollution"],
-                        subkey=probe.parameter,
-                        poc_url=probe_url,
-                        source="proto",
-                        sink=f"Object.prototype.{PROTO_MARKER_KEY}",
-                    )
-                )
-                if added:
-                    self.console.ok(
-                        f"Prototype pollution confirmed via {probe.location}: "
-                        f"{truncate(url, 90)}"
-                    )
-
-                gadgets = result.get("gadgets") or []
-                fingerprinted = [
-                    str(item.get("name"))
-                    for item in gadgets
-                    if isinstance(item, dict) and item.get("name")
-                ]
-                self.console.debug(f"Gadgets on page: {', '.join(fingerprinted) or 'none'}")
-                names = gadget_exploit_names(gadgets) if gadget_exploit_names else []
-                await self._exploit_proto_gadgets(browser, url, names)
-                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.console.debug(f"Prototype pollution check failed for {truncate(url, 90)}: {str(exc)[:160]}")
 
     async def _exploit_proto_gadgets(
         self, browser: BrowserEngine, url: str, names: Sequence[str]
@@ -3819,6 +3887,7 @@ class XSSScanner(CrawlerMixin):
     async def discover_points(self, url: str) -> List[InjectionPoint]:
         points: List[InjectionPoint] = []
         seen: Set[str] = set()
+        discovered_names: Set[str] = set()
 
         def add(point: InjectionPoint) -> None:
             key = point.key()
@@ -3826,7 +3895,12 @@ class XSSScanner(CrawlerMixin):
                 seen.add(key)
                 points.append(point)
 
+        # ----------------------------------------------------------------------
+        # Parameter Discovery Phase 1: High-priority discovered parameters
+        # ----------------------------------------------------------------------
+        # 1. URL Query String
         for name, value in parse_qsl(urlsplit(url).query, keep_blank_values=True):
+            discovered_names.add(name)
             add(
                 InjectionPoint(
                     url=url,
@@ -3834,17 +3908,26 @@ class XSSScanner(CrawlerMixin):
                     param=name,
                     value=value,
                     source="query",
+                    param_source="discovered",
                     page_url=url,
                 )
             )
 
+        # 2. Browser-observed points
         for point in self._browser_points.get(url, []):
+            discovered_names.add(point.param)
+            point.param_source = "discovered"
             add(point)
 
-        # OpenAPI request bodies (JSON/form) become injection points too.
+        # 3. OpenAPI request bodies (JSON/form)
         for point in self._api_points(url):
+            discovered_names.add(point.param)
+            point.param_source = "discovered"
             add(point)
+
+        # 4. JavaScript mined parameters
         for name in self._mined_params.get(url, [])[:25]:
+            discovered_names.add(name)
             add(
                 InjectionPoint(
                     url=url,
@@ -3852,17 +3935,17 @@ class XSSScanner(CrawlerMixin):
                     param=name,
                     value="",
                     source="query",
+                    param_source="discovered",
                     page_url=url,
                 )
             )
 
-        # Explicit parameter wordlists mirror XSSRush's mining phase: test
-        # operator-supplied names even on clean URLs.  Cap the per-URL budget so
-        # a large wordlist cannot turn one page into thousands of requests.
+        # 5. Explicit parameter wordlists
         wordlist = self._candidate_param_wordlist()
         if wordlist:
             limit = max(1, int(getattr(self.args, "param_wordlist_limit", 50) or 50))
             for name in wordlist[:limit]:
+                discovered_names.add(name)
                 add(
                     InjectionPoint(
                         url=url,
@@ -3870,13 +3953,12 @@ class XSSScanner(CrawlerMixin):
                         param=name,
                         value="",
                         source="query",
+                        param_source="discovered",
                         page_url=url,
                     )
                 )
 
-        # Path-segment injection: breadcrumbs, 404 handlers and rewrite rules
-        # often reflect the request path.  These points are rendered by
-        # build_get_url/build_poc with the PATH_MARKER sentinel.
+        # 6. Path-segment injection
         if getattr(self.args, "path_xss", False) and not looks_like_dangerous(url):
             for templated, path_index in build_path_vectors(url)[:8]:
                 add(
@@ -3886,27 +3968,88 @@ class XSSScanner(CrawlerMixin):
                         param="PATH",
                         value="",
                         source="path",
+                        param_source="discovered",
                         path_index=path_index,
                         page_url=url,
                     )
                 )
 
         response = await self.http.get(url, cache=True)
-        if response.error or not response.text:
-            return points
+        resp_text = response.text if (response and not response.error and response.text) else ""
 
-        # Endpoint fuzzing: discovered endpoints often have no query string, so try a
-        # small set of high-signal parameter names instead of only existing ones.
+        # 7. HTML Forms and Links discovery
+        if HAS_BS4 and resp_text:
+            content_type = response.header("content-type", "").lower()
+            if not content_type or "html" in content_type:
+                soup = _soup(resp_text)
+                for index, form in enumerate(soup.find_all("form")):
+                    action, method, fields = parse_form(form, url)
+                    if not self.scope.in_scope(action):
+                        continue
+                    for name, spec in list(fields.items())[:40]:
+                        discovered_names.add(name)
+                        add(
+                            InjectionPoint(
+                                url=action,
+                                method=method.upper(),
+                                param=name,
+                                value=spec.value,
+                                source="form",
+                                param_source="discovered",
+                                form_index=index,
+                                fields=fields,
+                                page_url=url,
+                            )
+                        )
+
+                # Links carrying query strings
+                if not self.args.crawl:
+                    count = 0
+                    for tag in soup.find_all("a", href=True):
+                        href = tag.get("href")
+                        if not isinstance(href, str):
+                            continue
+                        link = urljoin(url, href)
+                        if "?" not in link or not self.scope.in_scope(link):
+                            continue
+                        if not looks_like_page(link):
+                            continue
+                        for name, value in parse_qsl(urlsplit(link).query, keep_blank_values=True):
+                            discovered_names.add(name)
+                            add(
+                                InjectionPoint(
+                                    url=link,
+                                    method="GET",
+                                    param=name,
+                                    value=value,
+                                    source="query",
+                                    param_source="discovered",
+                                    page_url=link,
+                                )
+                            )
+                        count += 1
+                        if count >= 25:
+                            break
+
+        # ----------------------------------------------------------------------
+        # Parameter Discovery Phase 2: Gated fallback fuzzing
+        # ----------------------------------------------------------------------
+        # Gate: Do NOT fuzz invented parameter names blindly.
+        # Only fuzz this list against an endpoint that shows evidence of accepting
+        # query params (URL already has a query string, or the page/JS references
+        # "?", location.search, or URLSearchParams).
+        # Parameters discovered from HTML/forms/links/JS take precedence; the fuzz
+        # list is used only as a fallback.
         if (
             getattr(self.args, "fuzz_params", False)
-            and not urlsplit(url).query
             and not looks_like_dangerous(url)
+            and endpoint_accepts_query_params(url, resp_text)
         ):
             limit = max(1, int(getattr(self.args, "fuzz_param_limit", 10)))
-            candidate_names = list(
-                dict.fromkeys([*FUZZ_PARAM_NAMES, *self.discovered_param_names])
-            )
-            for name in candidate_names[:limit]:
+            fallback_candidates = [
+                name for name in FUZZ_PARAM_NAMES if name not in discovered_names
+            ]
+            for name in fallback_candidates[:limit]:
                 add(
                     InjectionPoint(
                         url=url,
@@ -3914,62 +4057,10 @@ class XSSScanner(CrawlerMixin):
                         param=name,
                         value="",
                         source="query",
+                        param_source="fuzzed",
                         page_url=url,
                     )
                 )
-
-        if not HAS_BS4:
-            return points
-
-        content_type = response.header("content-type", "").lower()
-        if content_type and "html" not in content_type:
-            return points
-
-        soup = _soup(response.text)
-        for index, form in enumerate(soup.find_all("form")):
-            action, method, fields = parse_form(form, url)
-            if not self.scope.in_scope(action):
-                continue
-            for name, spec in list(fields.items())[:40]:
-                add(
-                    InjectionPoint(
-                        url=action,
-                        method=method.upper(),
-                        param=name,
-                        value=spec.value,
-                        source="form",
-                        form_index=index,
-                        fields=fields,
-                        page_url=url,
-                    )
-                )
-
-        # Links carrying query strings are cheap extra coverage when crawling is off.
-        if not self.args.crawl:
-            count = 0
-            for tag in soup.find_all("a", href=True):
-                href = tag.get("href")
-                if not isinstance(href, str):
-                    continue
-                link = urljoin(url, href)
-                if "?" not in link or not self.scope.in_scope(link):
-                    continue
-                if not looks_like_page(link):
-                    continue
-                for name, value in parse_qsl(urlsplit(link).query, keep_blank_values=True):
-                    add(
-                        InjectionPoint(
-                            url=link,
-                            method="GET",
-                            param=name,
-                            value=value,
-                            source="query",
-                            page_url=link,
-                        )
-                    )
-                count += 1
-                if count >= 25:
-                    break
 
         return points
 
@@ -4241,7 +4332,22 @@ class XSSScanner(CrawlerMixin):
             )
         
         if not info.reflected:
+            # Gate (a): Reflection check failed on initial probe - drop silently
             self.console.debug(f"Rejected candidate (marker not reflected): {location}")
+            self.stats.false_positives += 1
+            self.stats.rejections["marker not reflected in response body or live DOM"] = (
+                self.stats.rejections.get("marker not reflected in response body or live DOM", 0) + 1
+            )
+            return
+
+        # Deduplication Gate: Deduplicate by (endpoint, injection point, context)
+        # so the same context is reported once.
+        canonical_ep = canonical_finding_url(point.url, point.source)
+        dedup_key = (canonical_ep, point.param, info.context)
+        if dedup_key in self._confirmed_contexts:
+            self.console.debug(
+                f"Context {info.context} already confirmed on {canonical_ep} ({point.param}); skipping"
+            )
             return
 
         # Optional special-character matrix: one extra probe maps which
@@ -4305,46 +4411,12 @@ class XSSScanner(CrawlerMixin):
                         response=result,
                     )
                     if finding:
-                        self.add_finding(finding)
+                        if dedup_key not in self._confirmed_contexts:
+                            self._confirmed_contexts.add(dedup_key)
+                            self.add_finding(finding)
                         return
-                if polyglot_info.reflected:
-                    if not polyglot_info.executable:
-                        self.console.debug(
-                            f"Rejected polyglot candidate "
-                            f"({polyglot_info.inert_reason or polyglot_info.context}): {location}"
-                        )
-                        continue
-                    poc_url, poc_command = self.poc_for_point(point, payload)
-                    requested, available = self._browser_state()
-                    confidence, rationale, detail = reflection_confidence(
-                        polyglot_info,
-                        requested=requested,
-                        available=available,
-                        content_type=result.header("content-type", ""),
-                    )
-                    detail = f"Polyglot payload used for efficiency; {detail}"
-                    self.add_finding(
-                        Finding(
-                            kind="Reflected XSS (polyglot)",
-                            url=point.url,
-                            parameter=point.param,
-                            method=point.method.upper(),
-                            payload=payload,
-                            evidence=f"polyglot payload reflected unescaped and executable "
-                            f"({polyglot_info.detail})",
-                            confidence=confidence,
-                            confidence_rationale=rationale,
-                            context=info.context,
-                            detail=detail,
-                            poc_url=poc_url,
-                            poc_command=poc_command,
-                            poc_html=build_form_html_poc(point, payload),
-                            char_matrix=dict(point.extra.get("char_matrix") or {}),
-                            source=point.source,
-                            **self.evidence_from_response(result, token, point.param),
-                        )
-                    )
-                    return
+                # If execution not confirmed in browser, continue testing candidates
+                continue
             if polyglots:
                 return
             # No polyglots for this context: fall through to the standard loop
@@ -4455,54 +4527,15 @@ class XSSScanner(CrawlerMixin):
                     response=result,
                 )
                 if finding:
-                    self.add_finding(finding)
+                    if dedup_key not in self._confirmed_contexts:
+                        self._confirmed_contexts.add(dedup_key)
+                        self.add_finding(finding)
                     return
                 self.console.debug(
                     f"Browser attempted but did not confirm execution: {location}"
                 )
-
-            # Confidence must distinguish "no browser was available" from
-            # "a browser ran and did not confirm".  The former keeps the
-            # strong HTTP signal at `high`; the latter is downgraded so an
-            # unconfirmed reflection never masquerades as execution.
-            requested, available = self._browser_state()
-            confidence, rationale, detail = reflection_confidence(
-                payload_info,
-                requested=requested,
-                available=available,
-                content_type=content_type,
-            )
-            if normalization_confirmed:
-                detail = "Unicode delimiters normalized into executable syntax"
-                rationale = (
-                    "A normalization differential turned encoded delimiters into "
-                    "executable syntax; " + rationale
-                )
-            poc_url, poc_command = self.poc_for_point(point, payload)
-            self.add_finding(
-                Finding(
-                    kind=(
-                        "Reflected XSS (normalization differential)"
-                        if normalization_confirmed else "Reflected XSS (HTTP evidence)"
-                    ),
-                    url=point.url,
-                    parameter=point.param,
-                    method=point.method.upper(),
-                    payload=payload,
-                    evidence=f"payload reflected unescaped ({payload_info.detail})",
-                    confidence=confidence,
-                    confidence_rationale=rationale,
-                    context=payload_info.context,
-                    detail=detail,
-                    poc_url=poc_url,
-                    poc_command=poc_command,
-                    poc_html=build_form_html_poc(point, payload),
-                    char_matrix=dict(point.extra.get("char_matrix") or {}),
-                    source=point.source,
-                    **self.evidence_from_response(result, payload_token, point.param),
-                )
-            )
-            return
+            # Unconfirmed candidate: do not mark confirmed, continue trying remaining templates
+            continue
 
         # -- AI fallback ---------------------------------------------------------
         # Reached only when the deterministic corpus produced no finding.  AI
@@ -4554,49 +4587,50 @@ class XSSScanner(CrawlerMixin):
                     point, marked, ai_token, ai_info, content_type, response=result
                 )
                 if finding:
-                    finding.kind = "Reflected XSS (AI-assisted)"
-                    finding.detail = (
-                        "AI candidate; "
-                        + (finding.detail or "execution confirmed in browser")
-                    )
-                    self.add_finding(finding)
+                    if dedup_key not in self._confirmed_contexts:
+                        self._confirmed_contexts.add(dedup_key)
+                        finding.kind = "Reflected XSS (AI-assisted)"
+                        finding.detail = (
+                            "AI candidate; "
+                            + (finding.detail or "execution confirmed in browser")
+                        )
+                        self.add_finding(finding)
                     return
                 self.console.debug(
                     f"AI candidate did not confirm in browser: {location}"
                 )
                 continue
+
+        # Gate: Only report unconfirmed reflections if operator explicitly requested --report-reflections
+        if getattr(self.args, "report_reflections", False) and info.reflected and info.executable:
             requested, available = self._browser_state()
             confidence, rationale, detail = reflection_confidence(
-                ai_info,
+                info,
                 requested=requested,
                 available=available,
-                content_type=content_type,
+                content_type=response.header("content-type", "") if response else "",
             )
-            poc_url, poc_command = self.poc_for_point(point, marked)
+            poc_url, poc_command = self.poc_for_point(point, probe)
             self.add_finding(
                 Finding(
-                    kind="Reflected XSS (AI-assisted)",
+                    kind="Reflected XSS (unconfirmed reflection)",
                     url=point.url,
                     parameter=point.param,
                     method=point.method.upper(),
-                    payload=marked,
-                    evidence=f"AI candidate reflected unescaped ({ai_info.detail})",
-                    confidence=confidence,
+                    payload=probe,
+                    evidence=f"marker reflected but execution not confirmed ({info.detail})",
+                    confidence="medium" if confidence == "confirmed" else confidence,
                     confidence_rationale=(
-                        "AI output is candidate-only; deterministic reflection with "
-                        "surviving delimiters was re-verified. " + rationale
+                        "Informational: unconfirmed reflection reported per --report-reflections; " + rationale
                     ),
-                    context=ai_info.context,
+                    context=info.context,
                     detail=detail,
                     poc_url=poc_url,
                     poc_command=poc_command,
-                    poc_html=build_form_html_poc(point, marked),
-                    char_matrix=dict(point.extra.get("char_matrix") or {}),
                     source=point.source,
-                    **self.evidence_from_response(result, ai_token, point.param),
+                    param_source=getattr(point, "param_source", "discovered"),
                 )
             )
-            return
 
     @staticmethod
     def _mutation_key(url: str) -> str:
@@ -4649,6 +4683,172 @@ class XSSScanner(CrawlerMixin):
             self._mutation_observations[key] = observations
             self.state.extra["transform_observations"] = self.mutation_findings[:1000]
 
+    def _record_validation_rejection(self, val: ValidationResult) -> None:
+        """Record rejection reasons and false positive classifications for stats."""
+        if val.classification == FALSE_POSITIVE:
+            self.stats.false_positives += 1
+        elif val.classification == NEEDS_MANUAL_TEST:
+            self.stats.needs_manual_test += 1
+        if val.reason:
+            self.stats.rejections[val.reason] = self.stats.rejections.get(val.reason, 0) + 1
+
+    async def validate_execution(
+        self,
+        point: InjectionPoint,
+        payload: str,
+        token: str,
+        response_text: str = "",
+        content_type: str = "",
+    ) -> ValidationResult:
+        """Execution-based validation gate before confirming any finding.
+
+        A finding is only marked CONFIRMED when BOTH conditions are met:
+          (a) REFLECTION: The unique per-payload marker string is present in the HTTP
+              response body or in the live DOM. Never rely on confidence scores.
+          (b) EXECUTION: A headless browser (Playwright / Chromium) loads the URL with
+              the payload and observes execution:
+                - Hook window.alert/confirm/prompt before page JS runs,
+                - Listen for the Playwright 'dialog' event,
+                - Reject if observed dialog text does NOT contain our marker.
+
+        Waits for 'load' plus an extra ~3s to catch deferred/DOM-based sinks.
+        Returns one of: CONFIRMED_EXECUTION, REJECTED, or UNVERIFIED (navigation error).
+        """
+        if self.pool is None or not self.pool.engines:
+            return ValidationResult(
+                status=UNVERIFIED,
+                classification=NEEDS_MANUAL_TEST,
+                reason="browser verification unavailable (no active browser workers)",
+            )
+        try:
+            async with self.pool.borrow() as browser:
+                self.stats.browser_checks += 1
+                target_url = (
+                    self.build_get_url(point, payload)
+                    if point.method.upper() == "GET"
+                    else (point.page_url or point.url)
+                )
+
+                # Navigation (waiting for page load)
+                nav_err = ""
+                try:
+                    if point.method.upper() == "GET":
+                        nav_err = await browser.navigate(target_url)
+                    else:
+                        await browser.navigate(point.page_url or point.url)
+                        submitted = await browser.submit_form(
+                            point.form_index if point.form_index is not None else 0,
+                            point.param,
+                            payload,
+                        )
+                        self.console.debug(f"Form submit result: {submitted}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return ValidationResult(
+                        status=UNVERIFIED,
+                        classification=NEEDS_MANUAL_TEST,
+                        reason=f"navigation error: {exc}",
+                    )
+
+                if nav_err and ("crash" in nav_err.lower() or "closed" in nav_err.lower() or "net::" in nav_err.lower()):
+                    return ValidationResult(
+                        status=UNVERIFIED,
+                        classification=NEEDS_MANUAL_TEST,
+                        reason=f"navigation error: {nav_err}",
+                    )
+
+                # Wait for 'load' plus an extra ~3s to catch deferred/DOM-based sinks
+                deadline = time.monotonic() + 3.0
+                hit = None
+                browser_data: Dict[str, Any] = {}
+                matching_dialog: Optional[str] = None
+                foreign_dialogs: List[str] = []
+
+                while True:
+                    browser_data = await browser.collect()
+                    raw_dialogs = [
+                        str(d) for d in (browser_data.get("dialogs", []) + browser_data.get("alerts", []))
+                        if d is not None
+                    ]
+                    for d in raw_dialogs:
+                        if token in d:
+                            matching_dialog = d
+                            break
+                        elif d not in foreign_dialogs:
+                            foreign_dialogs.append(d)
+
+                    hit = BrowserEngine._match(browser_data, token)
+                    if (hit and hit.get("executed") == "yes") or matching_dialog:
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.sleep(0.25)
+
+                live_dom = str(browser_data.get("html") or "")
+                in_response = bool(response_text and token in response_text)
+                in_dom = bool(live_dom and token in live_dom)
+                reflected = in_response or in_dom
+
+                # Gate (a): REFLECTION check
+                if not reflected:
+                    return ValidationResult(
+                        status=REJECTED,
+                        classification=FALSE_POSITIVE,
+                        reason="marker string not present in response body or live DOM",
+                        in_dom=in_dom,
+                        in_response=in_response,
+                    )
+
+                # Gate (b): EXECUTION check
+                # Reject if foreign dialog observed and none contained our marker
+                if foreign_dialogs and not matching_dialog and not (hit and hit.get("executed") == "yes"):
+                    return ValidationResult(
+                        status=REJECTED,
+                        classification=FALSE_POSITIVE,
+                        reason="observed dialog text does NOT contain our marker (coincidental page dialog)",
+                        dialog_text=foreign_dialogs[0],
+                        in_dom=in_dom,
+                        in_response=in_response,
+                    )
+
+                execution_observed = bool(matching_dialog) or bool(hit and hit.get("executed") == "yes")
+                if not execution_observed:
+                    return ValidationResult(
+                        status=REJECTED,
+                        classification=FALSE_POSITIVE,
+                        reason="execution was not observed in browser within 3s",
+                        in_dom=in_dom,
+                        in_response=in_response,
+                    )
+
+                # Both gates satisfied: CONFIRMED_EXECUTION
+                target_path = self.screenshot_dir / f"{token}.png"
+                screenshot = await browser.screenshot(str(target_path))
+                evidence = hit.get("evidence", "") if hit else f"dialog: {matching_dialog}"
+                sink = str(hit.get("sink") or "") if hit else ""
+                dom_path = str(hit.get("dom_path") or "") if hit else ""
+                if sink:
+                    evidence = f"sink={sink}" + (f" at {dom_path}" if dom_path else "") + (f"; {evidence}" if evidence else "")
+                return ValidationResult(
+                    status=CONFIRMED_EXECUTION,
+                    classification=None,
+                    reason="execution and reflection verified in browser",
+                    evidence=evidence,
+                    dialog_text=matching_dialog,
+                    in_dom=in_dom,
+                    in_response=in_response,
+                    screenshot=screenshot,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return ValidationResult(
+                status=UNVERIFIED,
+                classification=NEEDS_MANUAL_TEST,
+                reason=f"browser validation error: {exc}",
+            )
+
     async def confirm_in_browser(
         self,
         point: InjectionPoint,
@@ -4658,73 +4858,39 @@ class XSSScanner(CrawlerMixin):
         content_type: str = "",
         response: Optional[HttpResponse] = None,
     ) -> Optional[Finding]:
-        if self.pool is None or not browser_prequalified(info, content_type):
+        if not browser_prequalified(info, content_type):
             return None
-        try:
-            async with self.pool.borrow() as browser:
-                self.stats.browser_checks += 1
-                if point.method.upper() == "GET":
-                    await browser.navigate(self.build_get_url(point, payload))
-                else:
-                    await browser.navigate(point.page_url or point.url)
-                    submitted = await browser.submit_form(
-                        point.form_index if point.form_index is not None else 0,
-                        point.param,
-                        payload,
-                    )
-                    self.console.debug(f"Form submit result: {submitted}")
-
-                hit = await browser.check_token(token, timeout=2.5)
-                if not hit or hit.get("executed") != "yes":
-                    self.console.debug(
-                        f"Browser did not confirm execution for token {token} "
-                        f"({info.context}); keeping HTTP evidence only"
-                    )
-                    return None
-
-                # Browser-confirmed findings always carry a screenshot, even
-                # when --screenshot was not passed: the image is the strongest
-                # possible proof and the state directory is a safe location.
-                target_path = self.screenshot_dir / f"{token}.png"
-                screenshot = await browser.screenshot(str(target_path))
-
-                poc_url, poc_command = self.poc_for_point(point, payload)
-                evidence = hit.get("evidence", "")
-                sink = str(hit.get("sink") or "")
-                dom_path = str(hit.get("dom_path") or "")
-                if sink:
-                    evidence = f"sink={sink}" + (
-                        f" at {dom_path}" if dom_path else ""
-                    ) + (f"; {evidence}" if evidence else "")
-                detail = "JavaScript execution confirmed in browser"
-                if sink:
-                    detail += f" via {sink}"
-                return Finding(
-                    kind="Reflected XSS",
-                    url=self.build_get_url(point, payload) if point.method.upper() == "GET" else point.url,
-                    parameter=point.param,
-                    method=point.method.upper(),
-                    payload=payload,
-                    evidence=evidence,
-                    confidence="confirmed",
-                    confidence_rationale=(
-                        "The marker reached an instrumented execution sink in a real browser."
-                    ),
-                    context=info.context,
-                    detail=detail,
-                    screenshot=screenshot,
-                    poc_url=poc_url,
-                    poc_command=poc_command,
-                    poc_html=build_form_html_poc(point, payload),
-                    char_matrix=dict(point.extra.get("char_matrix") or {}),
-                    source=point.source,
-                    sink=sink,
-                    dom_path=dom_path,
-                    **self.evidence_from_response(response, token, point.param),
-                )
-        except Exception as exc:
-            self.console.debug(f"Browser confirmation error: {exc}")
+        res_text = response.text if response else ""
+        val = await self.validate_execution(point, payload, token, response_text=res_text, content_type=content_type)
+        if val.status != CONFIRMED_EXECUTION:
+            self._record_validation_rejection(val)
             return None
+
+        poc_url, poc_command = self.poc_for_point(point, payload)
+        evidence = val.evidence or f"dialog({val.dialog_text or token})"
+        detail = "JavaScript execution confirmed in browser"
+        return Finding(
+            kind="Reflected XSS",
+            url=self.build_get_url(point, payload) if point.method.upper() == "GET" else point.url,
+            parameter=point.param,
+            method=point.method.upper(),
+            payload=payload,
+            evidence=evidence,
+            confidence="confirmed",
+            confidence_rationale=(
+                "Execution confirmed in headless browser: dialog/sink hit observed with unique marker."
+            ),
+            context=info.context,
+            detail=detail,
+            screenshot=val.screenshot,
+            poc_url=poc_url,
+            poc_command=poc_command,
+            poc_html=build_form_html_poc(point, payload),
+            char_matrix=dict(point.extra.get("char_matrix") or {}),
+            source=point.source,
+            param_source=getattr(point, "param_source", "discovered"),
+            **self.evidence_from_response(response, token, point.param),
+        )
 
     def add_finding(self, finding: Finding) -> bool:
         if not enforce_finding_policy(finding):

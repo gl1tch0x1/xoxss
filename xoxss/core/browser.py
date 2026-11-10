@@ -123,15 +123,21 @@ HOOK_JS = r"""
       };
     } catch (e) {}
 
+    var _origAlert = window.alert;
+    var _origConfirm = window.confirm;
+    var _origPrompt = window.prompt;
     window.alert = function (msg) {
       try { window.__xoxss_alerts.push(String(msg)); } catch (e) {}
+      try { if (window.__xoxss_pw && _origAlert) { return _origAlert.call(window, msg); } } catch (e) {}
     };
     window.confirm = function (msg) {
       try { window.__xoxss_alerts.push(String(msg)); } catch (e) {}
+      try { if (window.__xoxss_pw && _origConfirm) { return _origConfirm.call(window, msg); } } catch (e) {}
       return true;
     };
     window.prompt = function (msg) {
       try { window.__xoxss_alerts.push(String(msg)); } catch (e) {}
+      try { if (window.__xoxss_pw && _origPrompt) { return _origPrompt.call(window, msg); } } catch (e) {}
       return null;
     };
     window.addEventListener('error', function (event) {
@@ -844,7 +850,7 @@ class PlaywrightEngine:
             context_options["proxy"] = {"server": self.proxy}
         try:
             self._context = await self._browser.new_context(**context_options)
-            await self._context.add_init_script(HOOK_JS)
+            await self._context.add_init_script("window.__xoxss_pw = true;\n" + HOOK_JS)
             self.page = await self._context.new_page()
             self.page.set_default_timeout(self.page_timeout * 1000)
             self.page.on("dialog", lambda dialog: asyncio.create_task(self._on_dialog(dialog)))
@@ -940,7 +946,10 @@ class PlaywrightEngine:
             self._dialogs.clear()
             error = ""
             try:
-                await self.page.goto(url, wait_until="domcontentloaded", timeout=self.page_timeout * 1000)
+                try:
+                    await self.page.goto(url, wait_until="load", timeout=min(15000, self.page_timeout * 1000))
+                except Exception:
+                    await self.page.goto(url, wait_until="domcontentloaded", timeout=self.page_timeout * 1000)
                 await self.page.wait_for_timeout(200)
             except Exception as exc:
                 error = str(exc)
@@ -1128,12 +1137,16 @@ class BrowserPool:
     async def borrow(self):
         if self._queue is None or not self.engines:
             raise RuntimeError("browser pool is not running")
-        try:
-            engine = await asyncio.wait_for(self._queue.get(), timeout=45.0)
-        except asyncio.TimeoutError:
+        while True:
             if not self.engines:
                 raise RuntimeError("browser pool has no active engines")
-            raise RuntimeError("timed out waiting for an available browser worker")
+            try:
+                engine = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                break
+            except asyncio.TimeoutError:
+                if not self.engines:
+                    raise RuntimeError("browser pool has no active engines")
+                continue
         crashed = False
         try:
             yield engine
@@ -1142,9 +1155,7 @@ class BrowserPool:
             raise
         finally:
             alive = True
-            if crashed:
-                alive = False
-            elif hasattr(engine, "is_alive"):
+            if hasattr(engine, "is_alive"):
                 try:
                     alive = bool(
                         await asyncio.to_thread(engine.is_alive)
@@ -1153,6 +1164,8 @@ class BrowserPool:
                     )
                 except Exception:
                     alive = False
+            elif crashed:
+                alive = False
 
             should_recycle = (engine.navigation_count >= self.recycle_after) or not alive
 

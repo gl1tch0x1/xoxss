@@ -221,3 +221,20 @@ def test_sarif_empty_scan():
     run = document["runs"][0]
     assert run["results"] == []
     assert run["tool"]["driver"]["rules"] == []
+
+
+def test_soup_suppresses_xml_parsed_as_html_warning():
+    import warnings
+    from xoxss.scanner import _soup
+    from bs4 import XMLParsedAsHTMLWarning
+
+    xml_content = '<?xml version="1.0" encoding="UTF-8"?><urlset><url><loc>https://example.com/</loc></url></urlset>'
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        soup = _soup(xml_content)
+        loc = soup.find("loc")
+        assert loc is not None
+        assert loc.text == "https://example.com/"
+        xml_warnings = [w for w in recorded if issubclass(w.category, XMLParsedAsHTMLWarning)]
+        assert len(xml_warnings) == 0
+
