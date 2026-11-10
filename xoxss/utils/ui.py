@@ -167,32 +167,70 @@ def bar(fraction: float, width: int = 20) -> str:
 
 
 def panel(title: str, lines: Sequence[str], *, width: int = 0,
-          accent: str = BRAND, pad: int = 0) -> str:
-    """Boxed block used for headers, summaries and commit lists.
+          accent: str = BRAND, pad: int = 0, style: str = "badge") -> str:
+    """Boxed block used for headers, summaries, briefings, and commit lists.
 
+    Guarantees 100% mathematical column alignment across every row,
+    preventing right-border zig-zags and terminal wrapping glitches.
     Falls back to plain text (no box) on ASCII-only encodings.
     """
-    width = width or max(
-        [len(title)] + [len(strip_ansi(line)) for line in lines]
-    ) + 4 + pad * 2
     lines = list(lines)
     box_on = _glyph("|", "\u2502") != "|"
     if not box_on:
         body = "\n".join(lines)
         return (paint(f"== {title} ==", BOLD) + "\n" + body) if title else body
 
-    top = paint("\u256d" + ("\u2500" * (width + 2)) + "\u256e", accent, DIM)
-    bottom = paint("\u2570" + ("\u2500" * (width + 2)) + "\u256f", accent, DIM)
-    side = paint("\u2502", accent, DIM)
-    out = [top]
-    if title:
-        gap = max(0, width - len(strip_ansi(title)) - 4)
-        out.append(f"{side} {paint(title, BOLD)} {' ' * gap} {side}")
-        out.append(side + paint("\u2500" * (width + 2), accent, DIM) + side)
+    term_w = safe_width()
+    title_raw = strip_ansi(title)
+    max_line_len = max([len(title_raw)] + [len(strip_ansi(l)) for l in lines] + [40])
+
+    if width:
+        outer = min(width, term_w - 2)
+    else:
+        outer = min(max_line_len + 6 + pad * 2, term_w - 2)
+    outer = max(outer, 44)
+    inner = outer - 2
+
+    tl, tr = "\u256d", "\u256e"  # ╭ ╮
+    bl, br = "\u2570", "\u256f"  # ╰ ╯
+    h, v = "\u2500", "\u2502"    # ─ │
+    sep_l, sep_r = "\u251c", "\u2524"  # ├ ┤
+
+    side = paint(v, accent)
+    out = []
+
+    badge_raw = f" [ {title_raw.upper()} ] "
+    can_use_badge = style == "badge" and title and (len(badge_raw) + 6 <= inner)
+
+    if can_use_badge:
+        badge = f" [ {paint(title.upper(), WHITE, BOLD)} ] "
+        dashes_left = 3
+        dashes_right = max(1, inner - dashes_left - len(badge_raw))
+        top_str = (
+            paint(tl + (h * dashes_left), accent)
+            + badge
+            + paint((h * dashes_right) + tr, accent)
+        )
+        out.append(top_str)
+        out.append(f"{side}{' ' * inner}{side}")
+    else:
+        out.append(paint(tl + (h * inner) + tr, accent))
+        if title:
+            avail = inner - 2 - pad * 2
+            gap = max(0, avail - len(title_raw))
+            out.append(f"{side} {' ' * pad}{paint(title, BOLD)}{' ' * (gap + pad)} {side}")
+            out.append(paint(sep_l + (h * inner) + sep_r, accent))
+
     for line in lines:
-        gap = max(0, width - len(strip_ansi(line)) - 2 - pad * 2)
+        raw_len = len(strip_ansi(line))
+        avail = inner - 2 - pad * 2
+        gap = max(0, avail - raw_len)
         out.append(f"{side} {' ' * pad}{line}{' ' * (gap + pad)} {side}")
-    out.append(bottom)
+
+    if can_use_badge:
+        out.append(f"{side}{' ' * inner}{side}")
+
+    out.append(paint(bl + (h * inner) + br, accent))
     return "\n".join(out)
 
 

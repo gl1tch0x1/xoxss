@@ -433,3 +433,114 @@ def test_context_deduplication():
     scanner._confirmed_contexts.add(dedup_key)
     assert dedup_key in scanner._confirmed_contexts
 
+
+# --------------------------------------------------------------------------------------
+# False Positive Reduction & Confidence Policy Tests
+# --------------------------------------------------------------------------------------
+
+def _make_test_scanner(**kwargs):
+    console = Console(quiet=True)
+    base_args = dict(
+        state_dir="/tmp/xoxss-test",
+        no_state=True,
+        payload_file=None,
+        headers=None,
+        cookies=None,
+        cookie_file=None,
+        timeout=10.0,
+        retries=1,
+        rate_limit=0,
+        concurrency=1,
+        proxy=None,
+        insecure=True,
+    )
+    base_args.update(kwargs)
+    args = SimpleNamespace(**base_args)
+    return XSSScanner("https://example.com/", args=args, console=console)
+
+
+def test_taint_flow_low_confidence():
+    """Static AST taint flows must remain low confidence leads (never elevated to high/medium)."""
+    scanner = _make_test_scanner(report_reflections=True)
+
+    flow = SimpleNamespace(
+        source="location.search",
+        sink="element.innerHTML",
+        line=42,
+        snippet="element.innerHTML = location.search",
+        sanitized=False,
+        confidence=0.95,
+        path=["q", "target"],
+        context="dom",
+        sanitizer="",
+    )
+
+    scanner._record_taint_flow("https://example.com/app.js", flow)
+    assert len(scanner.findings) == 1
+    finding = scanner.findings[0]
+    assert finding.kind == "DOM XSS (taint flow)"
+    assert finding.confidence == "low"
+    assert "static analysis lead" in finding.confidence_rationale
+
+
+def test_enforce_finding_policy_caps_unverified_leads():
+    """enforce_finding_policy caps unverified static/header/cookie/websocket leads to low."""
+    from xoxss.scanner import enforce_finding_policy
+
+    finding = Finding(
+        kind="Header XSS (reflection)",
+        url="https://example.com/",
+        parameter="User-Agent",
+        method="GET",
+        payload="<script>alert(1)</script>",
+        evidence="reflected",
+        confidence="high",
+        source="header",
+    )
+    assert enforce_finding_policy(finding) is True
+    assert finding.confidence == "low"
+
+
+def test_check_stored_rejects_non_html_and_error_pages():
+    """check_stored rejects 4xx/5xx errors, non-HTML responses, and entity-encoded inert reflections."""
+    from xoxss.scanner import HttpResponse
+
+    scanner = _make_test_scanner(stored=True, stored_pages=5)
+
+    point = InjectionPoint(url="https://example.com/submit", method="POST", param="body", page_url="https://example.com/view")
+    token = "zxq9t1a7"
+
+    # 1. Error status (404) -> rejected
+    http_mock = MagicMock()
+    http_mock.get = AsyncMock(return_value=HttpResponse(
+        "https://example.com/view", status=404, headers={"content-type": "text/html"}, text=f"Page not found: {token}"
+    ))
+    scanner.http = http_mock
+    res = asyncio.run(scanner.check_stored(point, token, f"<script>{token}</script>"))
+    assert res is None
+
+    # 2. Non-HTML content type (application/json) -> rejected
+    http_mock.get = AsyncMock(return_value=HttpResponse(
+        "https://example.com/view", status=200, headers={"content-type": "application/json"}, text=f'{{"status": "ok", "msg": "<script>{token}</script>"}}'
+    ))
+    scanner.http = http_mock
+    res = asyncio.run(scanner.check_stored(point, token, f"<script>{token}</script>"))
+    assert res is None
+
+    # 3. Entity-encoded HTML reflection (&lt;script&gt;) -> rejected
+    http_mock.get = AsyncMock(return_value=HttpResponse(
+        "https://example.com/view", status=200, headers={"content-type": "text/html"}, text=f'<div>&lt;script&gt;{token}&lt;/script&gt;</div>'
+    ))
+    scanner.http = http_mock
+    res = asyncio.run(scanner.check_stored(point, token, f"<script>{token}</script>"))
+    assert res is None
+
+    # 4. Executable unescaped reflection in valid HTML 200 OK -> accepted
+    http_mock.get = AsyncMock(return_value=HttpResponse(
+        "https://example.com/view", status=200, headers={"content-type": "text/html"}, text=f'<div><script>{token}</script></div>'
+    ))
+    scanner.http = http_mock
+    res = asyncio.run(scanner.check_stored(point, token, f"<script>{token}</script>"))
+    assert res == "https://example.com/view"
+
+

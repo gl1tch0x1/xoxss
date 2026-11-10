@@ -1171,6 +1171,18 @@ def enforce_finding_policy(finding: Finding) -> bool:
             "Downgraded from high: no request or response evidence was recorded."
         )
 
+    # Static analysis heuristics and unverified leads must not be elevated
+    # to high or medium severity without runtime execution proof.
+    if finding.source in ("header", "cookie", "ast", "websocket") or finding.kind.startswith(
+        ("DOM XSS (taint flow)", "DOM XSS (static candidate)", "Header XSS", "Cookie XSS", "WebSocket")
+    ):
+        if confidence in ("confirmed", "high", "medium"):
+            confidence = "low"
+            if not finding.confidence_rationale:
+                finding.confidence_rationale = (
+                    "Static or unconfirmed lead classified as low confidence (informational)."
+                )
+
     finding.confidence = confidence
     return True
 
@@ -3720,7 +3732,9 @@ class XSSScanner(CrawlerMixin):
         if sum(1 for finding in self.findings if "ast" in finding.tags) >= 50:
             return
         score = float(getattr(flow, "confidence", 0.7) or 0.0)
-        confidence = "low" if sanitized else ("high" if score >= 0.85 else "medium")
+        # Static AST taint flows are informational leads and must not be elevated
+        # to high or medium severity without runtime browser execution verification.
+        confidence = "low"
         digest = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:10]
         path = ", ".join(getattr(flow, "path", []) or []) or "direct"
         self.add_finding(
@@ -3751,7 +3765,7 @@ class XSSScanner(CrawlerMixin):
                 dom_path=str(getattr(flow, "context", "") or ""),
                 confidence_rationale=(
                     "A static taint path connects an attacker-controlled source to this "
-                    "DOM sink; runtime execution was not confirmed."
+                    "DOM sink; runtime execution was not verified (static analysis lead)."
                     if not sanitized
                     else "A sanitizer was detected on the path; this flow needs manual review."
                 ),
@@ -4475,6 +4489,7 @@ class XSSScanner(CrawlerMixin):
                 if stored_page:
                     _, stored_poc_command = self.poc_for_point(point, payload)
                     stored_response = getattr(self, "_stored_hit_response", None)
+                    stored_info = getattr(self, "_stored_hit_info", None)
                     evidence_fields = self.evidence_from_response(
                         result, payload_token, point.param
                     )
@@ -4483,30 +4498,99 @@ class XSSScanner(CrawlerMixin):
                         evidence_fields["response_excerpt"] = response_excerpt(
                             stored_response.text, payload_token
                         )
-                    self.add_finding(
-                        Finding(
-                            kind="Stored XSS (payload persisted)",
-                            url=stored_page,
-                            parameter=point.param,
-                            method="POST",
-                            payload=payload,
-                            evidence=f"payload persisted and re-rendered on {stored_page}",
-                            confidence="high",
-                            confidence_rationale=(
-                                "Persistence was verified over HTTP; browser execution of the "
-                                "stored payload was not re-confirmed."
-                            ),
-                            context=payload_info.context,
-                            detail="Persistence verified over HTTP; execution not re-confirmed",
-                            poc_url=stored_page,
-                            poc_command=stored_poc_command,
-                            poc_html=build_form_html_poc(point, payload),
-                            char_matrix=dict(point.extra.get("char_matrix") or {}),
-                            source="stored",
-                            **evidence_fields,
+
+                    # Execution verification in browser for stored XSS:
+                    # Never report as high/confirmed without verifying execution in a browser.
+                    stored_executed = False
+                    stored_screenshot = ""
+                    stored_evidence = f"payload persisted and re-rendered on {stored_page}"
+                    stored_dialog_text = ""
+
+                    if self.pool is not None and self.pool.engines and self.args.confirm != "http":
+                        try:
+                            async with self.pool.borrow() as browser:
+                                self.stats.browser_checks += 1
+                                await browser.navigate(stored_page)
+                                deadline = time.monotonic() + 3.0
+                                while time.monotonic() < deadline:
+                                    browser_data = await browser.extract()
+                                    raw_dialogs = [
+                                        str(d) for d in (browser_data.get("dialogs", []) + browser_data.get("alerts", []))
+                                        if d is not None
+                                    ]
+                                    for d in raw_dialogs:
+                                        if payload_token in d:
+                                            stored_dialog_text = d
+                                            break
+                                    hit = BrowserEngine._match(browser_data, payload_token)
+                                    if (hit and hit.get("executed") == "yes") or stored_dialog_text:
+                                        stored_executed = True
+                                        stored_evidence = hit.get("evidence", "") if hit else f"dialog: {stored_dialog_text}"
+                                        break
+                                    await asyncio.sleep(0.25)
+
+                                if stored_executed:
+                                    target_path = self.screenshot_dir / f"stored-{payload_token}.png"
+                                    stored_screenshot = await browser.screenshot(str(target_path))
+                        except Exception as exc:
+                            self.console.debug(f"Stored XSS browser validation error: {exc}")
+
+                    if stored_executed:
+                        self.add_finding(
+                            Finding(
+                                kind="Stored XSS (confirmed)",
+                                url=stored_page,
+                                parameter=point.param,
+                                method="POST",
+                                payload=payload,
+                                evidence=stored_evidence,
+                                confidence="confirmed",
+                                confidence_rationale=(
+                                    "Persistence verified and JavaScript execution confirmed in browser: "
+                                    "marker dialog/sink observed."
+                                ),
+                                context=stored_info.context if stored_info else payload_info.context,
+                                detail="Persistence and execution confirmed in headless browser",
+                                screenshot=stored_screenshot,
+                                poc_url=stored_page,
+                                poc_command=stored_poc_command,
+                                poc_html=build_form_html_poc(point, payload),
+                                char_matrix=dict(point.extra.get("char_matrix") or {}),
+                                source="stored",
+                                **evidence_fields,
+                            )
                         )
-                    )
-                    return
+                        return
+                    elif getattr(self.args, "report_reflections", False):
+                        # Surface only as low-confidence lead if operator explicitly opted in
+                        self.add_finding(
+                            Finding(
+                                kind="Stored XSS (unconfirmed persistence)",
+                                url=stored_page,
+                                parameter=point.param,
+                                method="POST",
+                                payload=payload,
+                                evidence=f"payload persisted in executable context on {stored_page} (execution not observed)",
+                                confidence="low",
+                                confidence_rationale=(
+                                    "Persistence verified over HTTP in executable HTML context, "
+                                    "but browser execution was not observed."
+                                ),
+                                context=stored_info.context if stored_info else payload_info.context,
+                                detail="Persistence verified over HTTP; execution not confirmed in browser",
+                                poc_url=stored_page,
+                                poc_command=stored_poc_command,
+                                poc_html=build_form_html_poc(point, payload),
+                                char_matrix=dict(point.extra.get("char_matrix") or {}),
+                                source="stored",
+                                **evidence_fields,
+                            )
+                        )
+                        return
+                    else:
+                        self.console.debug(
+                            f"Stored candidate persisted on {stored_page} but execution was not observed in browser; dropped false positive."
+                        )
 
             content_type = result.header("content-type", "")
             if not payload_info.executable and not self.args.report_reflections:
@@ -4619,7 +4703,7 @@ class XSSScanner(CrawlerMixin):
                     method=point.method.upper(),
                     payload=probe,
                     evidence=f"marker reflected but execution not confirmed ({info.detail})",
-                    confidence="medium" if confidence == "confirmed" else confidence,
+                    confidence="low",
                     confidence_rationale=(
                         "Informational: unconfirmed reflection reported per --report-reflections; " + rationale
                     ),
@@ -4991,8 +5075,15 @@ class XSSScanner(CrawlerMixin):
                     continue
                 if response.error or not response.text:
                     continue
+                # Gate 1: Reject HTTP error status codes (4xx, 5xx)
+                if response.status and response.status >= 400:
+                    continue
+                # Gate 2: Reject non-HTML content types (JSON, plain text, XML)
+                content_type = response.header("content-type", "").lower()
+                if not content_type.startswith(("text/html", "application/xhtml+xml")):
+                    continue
                 info = analyze_reflection(
-                    response.text, token, payload, response.header("content-type", "")
+                    response.text, token, payload, content_type
                 )
                 if not info.reflected or not info.executable:
                     if info.reflected and not info.executable:
@@ -5012,7 +5103,11 @@ class XSSScanner(CrawlerMixin):
                         method="GET",
                         payload=payload,
                         evidence=f"injected header reflected unescaped and executable ({info.detail})",
-                        confidence="medium",
+                        confidence="low",
+                        confidence_rationale=(
+                            "Header reflection observed in HTML response; custom headers are restricted "
+                            "by browser CORS and execution cannot be verified without a proxy."
+                        ),
                         context=info.context,
                         detail="Header reflections cannot be browser-verified without a proxy",
                         poc_url=poc_url,
@@ -5070,8 +5165,15 @@ class XSSScanner(CrawlerMixin):
                 continue
             if response.error or not response.text:
                 continue
+            # Gate 1: Reject HTTP error status codes (4xx, 5xx)
+            if response.status and response.status >= 400:
+                continue
+            # Gate 2: Reject non-HTML content types (JSON, plain text, XML)
+            content_type = response.header("content-type", "").lower()
+            if not content_type.startswith(("text/html", "application/xhtml+xml")):
+                continue
             info = analyze_reflection(
-                response.text, token, payload, response.header("content-type", "")
+                response.text, token, payload, content_type
             )
             if not info.reflected or not info.executable:
                 continue
@@ -5088,7 +5190,11 @@ class XSSScanner(CrawlerMixin):
                         "injected cookie reflected unescaped and executable "
                         f"({info.detail})"
                     ),
-                    confidence="medium",
+                    confidence="low",
+                    confidence_rationale=(
+                        "Cookie reflection observed in HTML response; browser execution "
+                        "cannot be verified without a proxy."
+                    ),
                     context=info.context,
                     detail="Cookie reflections cannot be browser-verified without a proxy",
                     poc_url=poc_url,
@@ -5164,7 +5270,11 @@ class XSSScanner(CrawlerMixin):
                         method="WS",
                         payload=hit.payload,
                         evidence=evidence,
-                        confidence="medium" if hit.executable else "low",
+                        confidence="low",
+                        confidence_rationale=(
+                            "WebSocket frame echoed by endpoint; execution in client DOM depends "
+                            "on application message handler and was not confirmed."
+                        ),
                         context=hit.context,
                         detail=(
                             "The endpoint echoed the injected frame. Browser execution depends "
@@ -5343,6 +5453,8 @@ class XSSScanner(CrawlerMixin):
                     if not hit:
                         continue
                     executed = hit.get("executed") == "yes"
+                    if not executed and not getattr(self.args, "report_reflections", False):
+                        continue
                     # Browser-confirmed execution always carries a screenshot.
                     screenshot = ""
                     if executed or self.args.screenshot:
@@ -5417,6 +5529,8 @@ class XSSScanner(CrawlerMixin):
                     if not hit:
                         continue
                     executed = hit.get("executed") == "yes"
+                    if not executed and not getattr(self.args, "report_reflections", False):
+                        continue
                     screenshot = ""
                     if executed or self.args.screenshot:
                         screenshot = await browser.screenshot(
@@ -5773,8 +5887,20 @@ class XSSScanner(CrawlerMixin):
             response = await self.http.get(page, cache=False)
             if response.error or not response.text:
                 continue
+            # Gate 1: Drop error responses (4xx, 5xx) that merely reflect parameters
+            if response.status and response.status >= 400:
+                continue
+            # Gate 2: Drop non-HTML responses (JSON, plain text, XML)
+            content_type = response.header("content-type", "").lower()
+            if not content_type.startswith(("text/html", "application/xhtml+xml")):
+                continue
+            # Gate 3: Verify reflection and executability (escaped or dead-zone reflections are rejected)
             if token in response.text or payload in response.text:
+                stored_info = analyze_reflection(response.text, token, payload, content_type)
+                if not stored_info.reflected or not stored_info.executable:
+                    continue
                 self._stored_hit_response = response
+                self._stored_hit_info = stored_info
                 return page
         return None
 
@@ -5786,14 +5912,63 @@ class XSSScanner(CrawlerMixin):
         rows = briefing_rows(self.args, self.target)
         if not rows:
             return False
+
         label_width = max(len(label) for label, _ in rows)
-        body = [
-            _ui.paint(label.ljust(label_width), _ui.BRAND, _ui.BOLD) + "  " + value
-            for label, value in rows
-        ]
-        width = min(96, max(64, self.console._width() - 6))
+        width = min(88, max(64, self.console._width() - 4))
+        max_val_len = width - label_width - 12
+
+        formatted_lines: List[str] = []
+        for label, raw_val in rows:
+            lbl = _ui.paint(label.ljust(label_width), _ui.CYAN, _ui.BOLD)
+            sep = _ui.paint("›", "\033[38;5;242m")
+
+            if label == "TARGET":
+                styled_val = _ui.paint(raw_val, _ui.WHITE, _ui.BOLD)
+            elif label == "PROFILE":
+                parts = [p.strip() for p in raw_val.split("/") if p.strip()]
+                if len(parts) >= 1:
+                    prof = _ui.paint(parts[0], _ui.YELLOW, _ui.BOLD)
+                    rest_parts = [prof]
+                    for p in parts[1:]:
+                        if "headless" in p or "headed" in p or "http-only" in p:
+                            rest_parts.append(_ui.paint(p, _ui.WHITE))
+                        else:
+                            rest_parts.append(_ui.paint(p, _ui.GREY))
+                    styled_val = f" {_ui.paint('•', _ui.GREY_DARK)} ".join(rest_parts)
+                else:
+                    styled_val = raw_val
+            elif label == "VECTORS":
+                if "+" in raw_val:
+                    base, extra = raw_val.rsplit("+", 1)
+                    styled_val = _ui.paint(base.rstrip(), _ui.WHITE) + " " + _ui.paint(f"(+{extra.strip()} more)", _ui.CYAN, _ui.BOLD)
+                else:
+                    styled_val = _ui.paint(raw_val, _ui.WHITE)
+            elif label == "EVIDENCE":
+                if "inert" in raw_val:
+                    styled_val = _ui.paint("●", _ui.YELLOW) + " " + _ui.paint(raw_val, _ui.WHITE)
+                else:
+                    styled_val = _ui.paint("●", _ui.GREEN) + " " + _ui.paint("strict execution validation (marker dialog confirmed)", _ui.WHITE)
+            elif label == "ARTIFACTS":
+                if "->" in raw_val:
+                    fmt, dest = raw_val.split("->", 1)
+                    styled_val = _ui.paint(fmt.strip(), _ui.GREY) + " " + _ui.paint("→", _ui.BRAND_BRIGHT) + " " + _ui.paint(dest.strip(), _ui.CYAN)
+                else:
+                    styled_val = _ui.paint(raw_val, _ui.GREY)
+            elif label == "OOB":
+                styled_val = _ui.paint(raw_val, _ui.CYAN, _ui.BOLD)
+            else:
+                styled_val = raw_val
+
+            vis_len = len(_ui.strip_ansi(styled_val))
+            if vis_len > max_val_len and max_val_len > 10:
+                plain = _ui.strip_ansi(styled_val)
+                styled_val = plain[:max_val_len - 1] + "…"
+
+            formatted_lines.append(f" {lbl}  {sep}  {styled_val}")
+
         self.console.raw("")
-        self.console.raw(_ui.panel("operation briefing", body, width=width))
+        card = _ui.panel("Operation Briefing", formatted_lines, width=width, accent="\033[38;5;239m", style="badge")
+        self.console.raw(card)
         self.console.raw("")
         return True
 
