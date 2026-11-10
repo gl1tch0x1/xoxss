@@ -29,7 +29,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 class ConsoleLike(Protocol):  # pragma: no cover
     def info(self, message: str, important: bool = False) -> None: ...
@@ -92,8 +92,8 @@ def available_tools() -> Dict[str, str]:
     names = (
         "subfinder", "assetfinder", "amass", "findomain",
         "gau", "waybackurls", "katana", "hakrawler", "gospider",
-        "ffuf", "feroxbuster", "gobuster", "dirsearch",
-        "dalfox", "nuclei", "httpx", "arjun", "x8", "anew", "qsreplace",
+        "ffuf", "feroxbuster", "gobuster", "dirsearch", "wfuzz",
+        "dalfox", "nuclei", "httpx", "arjun", "x8", "anew", "qsreplace", "kxss",
     )
     return {name: path for name in names if (path := shutil.which(name))}
 
@@ -376,6 +376,58 @@ def parse_x8_json(text: str, url: str = "") -> Dict[str, List[str]]:
     return parsed
 
 
+def parse_kxss(text: str) -> List[Tuple[str, str, str]]:
+    """Parse kxss unfiltered character findings into (url, param, unfiltered_chars)."""
+    results: List[Tuple[str, str, str]] = []
+    pattern = re.compile(
+        r"(?:URL:\s*)?(https?://[^\s\"']+)\s+(?:Param|param):\s*(\S+)\s+(?:Unfiltered|unfiltered):\s*\[([^\]]*)\]",
+        re.I,
+    )
+    for line in parse_lines(text):
+        m = pattern.search(line)
+        if m:
+            url, param, chars = m.groups()
+            results.append((url, param, chars.replace(" ", "")))
+        else:
+            m2 = re.search(r"(https?://\S+)\s+\[([^\]]+)\]", line)
+            if m2:
+                url, chars = m2.groups()
+                parts = urlsplit(url)
+                params = [k for k, _ in parse_qsl(parts.query)]
+                param = params[0] if params else ""
+                results.append((url, param, chars.replace(" ", "")))
+    return results
+
+
+def parse_wfuzz_json(text: str) -> List[ExternalFinding]:
+    """Parse wfuzz JSON results into ExternalFinding instances."""
+    findings: List[ExternalFinding] = []
+    for line in parse_lines(text):
+        try:
+            items = json.loads(line)
+            if not isinstance(items, list):
+                items = [items]
+            for row in items:
+                if not isinstance(row, dict):
+                    continue
+                url = str(row.get("url") or "")
+                payload = str(row.get("payload") or "")
+                code = int(row.get("code") or 0)
+                if url and code in (200, 301, 302, 500):
+                    findings.append(
+                        ExternalFinding(
+                            tool="wfuzz",
+                            url=url,
+                            payload=payload,
+                            evidence=f"HTTP {code}",
+                            severity="medium" if code == 200 else "low",
+                        )
+                    )
+        except Exception:
+            continue
+    return findings
+
+
 def _dedupe_findings(findings: Iterable[ExternalFinding]) -> List[ExternalFinding]:
     seen: Set[Tuple[str, str, str]] = set()
     result: List[ExternalFinding] = []
@@ -399,20 +451,35 @@ class ToolRunner:
     def which(self, name: str) -> str:
         return shutil.which(name) or ""
 
-    async def run(self, tool: str, args: Sequence[str], *, timeout: Optional[float] = None) -> ToolResult:
+    async def run(
+        self,
+        tool: str,
+        args: Sequence[str],
+        *,
+        input_text: Optional[str] = None,
+        timeout: Optional[float] = None,
+    ) -> ToolResult:
         binary = self.which(tool)
-        command = [binary or tool, *[str(arg) for arg in args]]
+        command = [binary or tool, *args]
         if not binary:
             return ToolResult(tool=tool, command=command, returncode=127, stderr="not installed")
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *command,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE if input_text is not None else asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd,
             )
+            if input_text is not None and proc.stdin:
+                try:
+                    proc.stdin.write(input_text.encode("utf-8", errors="replace"))
+                    await proc.stdin.drain()
+                except Exception:
+                    pass
+                finally:
+                    proc.stdin.close()
             stdout_data = await self._read_stream(proc.stdout, MAX_OUTPUT)
             stderr_data = await self._read_stream(proc.stderr, MAX_OUTPUT // 4 + 256)
             await asyncio.wait_for(proc.wait(), timeout=timeout or self.timeout)
@@ -663,7 +730,7 @@ class ExternalToolkit:
 
     async def parameters(self, urls: Sequence[str]) -> Dict[str, List[str]]:
         """Run installed hidden-parameter tools and merge their results by URL."""
-        if not urls or not (self.enabled("arjun") or self.enabled("x8")):
+        if not urls or not (self.enabled("arjun") or self.enabled("x8") or self.enabled("wfuzz")):
             return {}
         merged: Dict[str, Set[str]] = {}
         names: Sequence[str] = (
@@ -732,6 +799,14 @@ class ExternalToolkit:
                                 os.unlink(output_path)
                             except OSError:
                                 pass
+                    if not found and self.enabled("wfuzz"):
+                        try:
+                            wfuzz_hits = await self.fuzz_wfuzz(url, wordlist, param_fuzz=True)
+                            for hit in wfuzz_hits:
+                                if hit.parameter:
+                                    found.setdefault(hit.url or url, set()).add(hit.parameter)
+                        except Exception as exc:
+                            self.console.debug(f"wfuzz failed for {url}: {exc}")
                 return found
 
             results = await asyncio.gather(*(
@@ -751,6 +826,60 @@ class ExternalToolkit:
                 pass
         return {url: sorted(params) for url, params in merged.items() if params}
 
+    async def probe_kxss(self, urls: Sequence[str]) -> List[Tuple[str, str, str]]:
+        """Run kxss on targets to rapidly identify unescaped reflected characters."""
+        if not urls or not self.enabled("kxss"):
+            return []
+        input_data = "\n".join(dict.fromkeys(urls))
+        try:
+            result = await self.runner.run(
+                "kxss",
+                [],
+                input_text=input_data,
+                timeout=self.timeout,
+            )
+            return parse_kxss(result.stdout)
+        except Exception as exc:
+            self.console.debug(f"kxss failed: {exc}")
+            return []
+
+    async def fuzz_wfuzz(
+        self,
+        url: str,
+        wordlist_path: str,
+        *,
+        param_fuzz: bool = True,
+    ) -> List[ExternalFinding]:
+        """Run wfuzz against an endpoint to discover parameters or reflected inputs."""
+        if not url or not wordlist_path or not self.enabled("wfuzz"):
+            return []
+        target = url
+        if param_fuzz and "FUZZ" not in target:
+            sep = "&" if "?" in target else "?"
+            target = f"{target}{sep}FUZZ=xoxss"
+        handle = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        output_path = handle.name
+        handle.close()
+        try:
+            result = await self.runner.run(
+                "wfuzz",
+                ["-w", wordlist_path, "--sc", "200,301,302", "-f", f"{output_path},json", target],
+                timeout=self.timeout,
+            )
+            try:
+                exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                exported = ""
+            return parse_wfuzz_json(exported or result.stdout)
+        except Exception as exc:
+            self.console.debug(f"wfuzz failed for {url}: {exc}")
+            return []
+        finally:
+            try:
+                os.unlink(output_path)
+            except OSError:
+                pass
+
 
 __all__ = [
     "ToolResult",
@@ -767,4 +896,6 @@ __all__ = [
     "parse_ffuf",
     "parse_arjun_json",
     "parse_x8_json",
+    "parse_kxss",
+    "parse_wfuzz_json",
 ]

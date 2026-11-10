@@ -34,6 +34,10 @@ _UNICODE_DELIMITERS = (
     ("fullwidth-double-quote", "\uff02", '"'),
     ("fullwidth-single-quote", "\uff07", "'"),
     ("fullwidth-backtick", "\uff40", "`"),
+    ("left-double-quote", "\u201c", '"'),
+    ("right-double-quote", "\u201d", '"'),
+    ("left-single-quote", "\u2018", "'"),
+    ("right-single-quote", "\u2019", "'"),
 )
 
 
@@ -51,6 +55,10 @@ def build_probes(marker: str, limit: int = 12) -> List[MutationProbe]:
             MutationProbe("nested-html-entity-quote", f"{marker}&amp;quot;{end}", f'{marker}"{end}', "multi-pass-decode", marker=marker),
             MutationProbe("legacy-7bit-lt", f"{marker}%BC{end}", f"{marker}<{end}", "byte-mask", marker=marker),
             MutationProbe("legacy-7bit-gt", f"{marker}%BE{end}", f"{marker}>{end}", "byte-mask", marker=marker),
+            MutationProbe("overlong-utf8-lt", f"{marker}%C0%BC{end}", f"{marker}<{end}", "overlong-utf8", marker=marker),
+            MutationProbe("overlong-utf8-gt", f"{marker}%C0%BE{end}", f"{marker}>{end}", "overlong-utf8", marker=marker),
+            MutationProbe("utf7-decode-lt", f"{marker}+ADw-{end}", f"{marker}<{end}", "utf7-decode", marker=marker),
+            MutationProbe("utf7-decode-gt", f"{marker}+AD4-{end}", f"{marker}>{end}", "utf7-decode", marker=marker),
             MutationProbe("gbk-backslash-swallow", f"{marker}%DF%5C%22{end}", f'{marker}"{end}', "multibyte", "gbk-quote", marker),
             MutationProbe("shift-jis-backslash-swallow", f"{marker}%81%5C%27{end}", f"{marker}'{end}", "multibyte", "sjis-quote", marker),
         ]

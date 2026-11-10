@@ -34,7 +34,7 @@ def test_multi_pass_decode_probe_requires_marker_and_expected_delimiter():
 
 def test_mutation_probe_count_is_bounded():
     assert len(build_probes("M", limit=3)) == 3
-    assert len(build_probes("M", limit=100)) == 14
+    assert len(build_probes("M", limit=100)) == 22
     assert build_probes("M", limit=0) == []
 
 

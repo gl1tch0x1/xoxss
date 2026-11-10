@@ -63,7 +63,13 @@ _SANITIZERS: List[Tuple[str, re.Pattern]] = [
     ("trustedTypes", re.compile(r"^TrustedTypes")),
 ]
 
-_HTML_ASSIGN = {"innerHTML": "innerHTML", "outerHTML": "outerHTML", "srcdoc": "srcdoc"}
+_HTML_ASSIGN = {
+    "innerHTML": "innerHTML",
+    "outerHTML": "outerHTML",
+    "srcdoc": "srcdoc",
+    "dangerouslySetInnerHTML": "dangerouslySetInnerHTML",
+    "v-html": "v-html",
+}
 _CALL_SINKS = {
     "document.write": ("document.write", "html", 0),
     "document.writeln": ("document.write", "html", 0),
@@ -85,6 +91,11 @@ _CALL_SINKS = {
     "replaceWith": ("jquery.replaceWith", "html", 0),
     "setHTMLUnsafe": ("setHTMLUnsafe", "html", 0),
     "setHTML": ("setHTML", "html", 0),
+    "bypassSecurityTrustHtml": ("bypassSecurityTrustHtml", "html", 0),
+    "bypassSecurityTrustScript": ("bypassSecurityTrustScript", "js", 0),
+    "bypassSecurityTrustResourceUrl": ("bypassSecurityTrustResourceUrl", "url", 0),
+    "postMessage": ("postMessage", "js", 0),
+    "importScripts": ("importScripts", "url", 0),
 }
 _DANGEROUS_ATTRS = re.compile(r"^(?:href|src|srcdoc|action|formaction|style|on\w+)$", re.I)
 _FUNCTION_TYPES = {

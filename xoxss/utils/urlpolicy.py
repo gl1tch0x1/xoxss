@@ -47,6 +47,20 @@ def normalize_scan_url(url: str) -> str:
     return urlunsplit((scheme, netloc, path, query, ""))
 
 
+def url_cluster_key(url: str) -> str:
+    """Cluster key representing endpoint signature: scheme://host/path?[sorted_param_names].
+
+    Prevents pagination and ID traps like /item?id=1, /item?id=2, ... from exploding the queue.
+    """
+    parts = urlsplit(url.strip())
+    scheme = (parts.scheme or "http").lower()
+    netloc = parts.netloc.lower()
+    path = (parts.path or "/").rstrip("/") or "/"
+    param_names = sorted({k.lower() for k, _ in parse_qsl(parts.query, keep_blank_values=True)})
+    query_sig = "&".join(param_names)
+    return f"{scheme}://{netloc}{path}?{query_sig}" if query_sig else f"{scheme}://{netloc}{path}"
+
+
 def looks_like_page(url: str) -> bool:
     path = urlsplit(url).path.lower()
     ext = os.path.splitext(path)[1]

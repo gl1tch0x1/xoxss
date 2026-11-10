@@ -198,7 +198,7 @@ class CSPBypassAutomator:
     def get_applicable_bypasses(
         self,
         csp: Dict[CSPDirective, List[str]],
-        marker: str
+        marker: str = "xoxss",
     ) -> List[CSPBypass]:
         """
         Get applicable CSP bypass techniques based on the CSP.
