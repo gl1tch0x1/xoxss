@@ -10,6 +10,7 @@ them independently testable.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -1114,7 +1115,7 @@ class BrowserPool:
             size = self.MAX_CONCURRENT_WORKERS
         self.size = max(1, size)
         self.factory = factory
-        self.recycle_after = max(1, int(recycle_after))
+        self.recycle_after = max(1, recycle_after)
         self.engines: List[BrowserEngine] = []
         self._queue: Optional[asyncio.Queue] = None
 
@@ -1159,7 +1160,7 @@ class BrowserPool:
                 try:
                     alive = bool(
                         await asyncio.to_thread(engine.is_alive)
-                        if not asyncio.iscoroutinefunction(engine.is_alive)
+                        if not inspect.iscoroutinefunction(engine.is_alive)
                         else await engine.is_alive()
                     )
                 except Exception:
