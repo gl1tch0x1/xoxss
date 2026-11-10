@@ -632,9 +632,9 @@ class BrowserEngine:
     @staticmethod
     def _match(data: Dict[str, Any], token: str) -> Optional[Dict[str, str]]:
         channels: List[str] = []
-        executed = False
-        sink_name = ""
-        dom_path = ""
+        executed: bool = False
+        sink_name: str = ""
+        dom_path: str = ""
         for key, label in (
             ("hits", "js-executed"),
             ("alerts", "alert"),

@@ -4844,7 +4844,7 @@ class XSSScanner(CrawlerMixin):
 
                 # Wait for 'load' plus an extra ~3s to catch deferred/DOM-based sinks
                 deadline = time.monotonic() + 3.0
-                hit = None
+                hit: Optional[Dict[str, str]] = None
                 browser_data: Dict[str, Any] = {}
                 matching_dialog: Optional[str] = None
                 foreign_dialogs: List[str] = []
@@ -4909,11 +4909,15 @@ class XSSScanner(CrawlerMixin):
                 # Both gates satisfied: CONFIRMED_EXECUTION
                 target_path = self.screenshot_dir / f"{token}.png"
                 screenshot = await browser.screenshot(str(target_path))
-                evidence = hit.get("evidence", "") if hit else f"dialog: {matching_dialog}"
-                sink = str(hit.get("sink") or "") if hit else ""
-                dom_path = str(hit.get("dom_path") or "") if hit else ""
+                hit_dict: Dict[str, str] = hit or {}
+                sink: str = hit_dict.get("sink", "")
+                dom_path: str = hit_dict.get("dom_path", "")
+                raw_evidence: str = hit_dict.get("evidence", "") if hit else (f"dialog: {matching_dialog}" if matching_dialog else "")
                 if sink:
-                    evidence = f"sink={sink}" + (f" at {dom_path}" if dom_path else "") + (f"; {evidence}" if evidence else "")
+                    sink_desc = f"sink={sink}" + (f" at {dom_path}" if dom_path else "")
+                    evidence = f"{sink_desc}; {raw_evidence}" if raw_evidence else sink_desc
+                else:
+                    evidence = raw_evidence
                 return ValidationResult(
                     status=CONFIRMED_EXECUTION,
                     classification=None,
