@@ -60,3 +60,40 @@ def test_updater_can_refuse_to_stash_when_requested(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         updater.stash_if_needed(auto_stash=False)
     assert updater.is_dirty()
+
+
+def test_updater_handles_multiple_remotes(tmp_path, monkeypatch):
+    _repo(tmp_path, monkeypatch)
+    _git(tmp_path, "remote", "add", "origin", "https://github.com/gl1tch0x1/xoxss.git")
+    _git(tmp_path, "remote", "add", "upstream", "https://github.com/fork/xoxss.git")
+
+    branch = updater.ensure_repo()
+    assert branch == "main"
+
+
+def test_updater_tracking_branch_resolution(tmp_path, monkeypatch):
+    _repo(tmp_path, monkeypatch)
+    # No origin tracking ref exists in local tmp repo, so fallback to origin/main
+    target = updater.resolve_tracking_branch("feature-branch")
+    assert target == "origin/main"
+
+
+def test_installer_launcher_generation_and_venv_lookup(tmp_path, monkeypatch):
+    import installer
+    monkeypatch.setattr(installer, "ROOT", tmp_path)
+
+    venv_dir = tmp_path / ".venv"
+    scripts_dir = venv_dir / ("Scripts" if installer.os.name == "nt" else "bin")
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    fake_python = scripts_dir / ("python.exe" if installer.os.name == "nt" else "python")
+    fake_python.write_text("", encoding="utf-8")
+
+    found_py = installer.find_venv_python(venv_dir)
+    assert found_py is not None
+    assert found_py.exists()
+
+    installer.create_launcher_scripts(venv_dir)
+    assert (tmp_path / "xoxss.bat").exists()
+    assert (tmp_path / "xoxss").exists()
+    assert ".venv" in (tmp_path / "xoxss.bat").read_text(encoding="ascii")
+

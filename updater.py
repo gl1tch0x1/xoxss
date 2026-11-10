@@ -4,28 +4,25 @@ XOXSS updater.
 
 Keeps a git-based installation up to date: fetches the latest code from the
 origin remote, fast-forwards the current branch, and refreshes the installed
-package so code and dependencies stay in sync.
+package in the active or repository virtual environment so code and dependencies
+stay in sync.
 
 Usage:
     python updater.py            # preserve local changes, fast-forward, reinstall
     python updater.py --check    # report only (no changes)
     python updater.py --no-auto-stash  # refuse to update a dirty checkout
     python updater.py --extras interactsh,playwright   # also refresh named extras
-
-The update performs two guarded operations:
-
-1. `git pull --ff-only` - never rewrites history; aborts on unexpected divergence.
-2. `pip install -U .`   - refreshes the installed package after new code lands.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
 
@@ -74,13 +71,41 @@ def die(message: str, code: int = 1) -> "None":
     sys.exit(code)
 
 
+def in_venv() -> bool:
+    """Return True if running inside a virtual environment."""
+    return (
+        getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+        or hasattr(sys, "real_prefix")
+    )
+
+
+def find_venv_python() -> Optional[Path]:
+    """Find Python binary in repository .venv or venv directory."""
+    for name in (".venv", "venv"):
+        candidate_dir = ROOT / name
+        if not candidate_dir.is_dir():
+            continue
+        if os.name == "nt":
+            py = candidate_dir / "Scripts" / "python.exe"
+        else:
+            py = candidate_dir / "bin" / "python"
+        if py.exists():
+            return py
+    return None
+
+
 def git(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    result = subprocess.run(
-        ["git", *args], cwd=ROOT, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=ROOT, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        raise RuntimeError("git is not installed or not found on PATH.")
     if check and result.returncode != 0:
         detail = (result.stderr.strip() or result.stdout.strip()).splitlines()
         raise RuntimeError(
-            f"git {' '.join(args)} failed: {detail[-1] if detail else 'unknown error'}")
+            f"git {' '.join(args)} failed: {detail[-1] if detail else 'unknown error'}"
+        )
     return result
 
 
@@ -89,9 +114,12 @@ def out(result: subprocess.CompletedProcess) -> str:
 
 
 def local_version() -> str:
-    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
-    return match.group(1) if match else "unknown"
+    try:
+        text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.M)
+        return match.group(1) if match else "unknown"
+    except OSError:
+        return "unknown"
 
 
 def is_dirty() -> bool:
@@ -109,19 +137,31 @@ def ensure_repo() -> str:
             "switch to a branch first (git switch main).")
     info(f"branch: {branch}")
 
-    if out(git(["remote"])) != "origin":
+    remotes = [r.strip() for r in out(git(["remote"])).splitlines() if r.strip()]
+    if "origin" not in remotes:
         die("no 'origin' remote configured; add one or update manually.")
     return branch
 
 
-def fetch_state(branch: str) -> tuple[int, int]:
-    """Return (behind, ahead) commit counts versus origin/<branch>."""
-    git(["fetch", "origin", "--quiet"])
+def resolve_tracking_branch(branch: str) -> str:
+    """Return the upstream tracking branch ref, falling back to origin/main."""
     tracking = f"origin/{branch}"
     exists = git(["rev-parse", "--verify", "--quiet", tracking], check=False)
     if exists.returncode != 0:
         warn(f"no origin/{branch} branch; comparing against origin/main instead")
-        tracking = "origin/main"
+        return "origin/main"
+    return tracking
+
+
+def fetch_state(branch: str) -> tuple[int, int]:
+    """Return (behind, ahead) commit counts versus origin tracking ref."""
+    try:
+        git(["fetch", "origin", "--quiet"])
+    except RuntimeError as exc:
+        warn(f"git fetch failed ({exc}); update check might be inaccurate")
+        return 0, 0
+
+    tracking = resolve_tracking_branch(branch)
     counts = out(git(["rev-list", "--left-right", "--count", f"HEAD...{tracking}"]))
     behind_s, ahead_s = (counts.split() + ["0", "0"])[:2]
     return int(behind_s), int(ahead_s)
@@ -132,6 +172,7 @@ def check_only(branch: str) -> int:
         print(ui.panel("xoxss updater - update check", [
             f"{ui.paint('version', ui.GREY)}  {local_version()}",
             f"{ui.paint('branch', ui.GREY)}   {branch}",
+            f"{ui.paint('env', ui.GREY)}      {'virtualenv' if in_venv() else 'system'}",
         ]))
     else:
         print("XOXSS update check")
@@ -139,7 +180,8 @@ def check_only(branch: str) -> int:
     behind, ahead = fetch_state(branch)
     if behind:
         info(f"{behind} commit(s) behind origin, {ahead} ahead - an update is available")
-        log = out(git(["log", "--oneline", f"HEAD..origin/{branch}", "-n", "15"]))
+        tracking = resolve_tracking_branch(branch)
+        log = out(git(["log", "--oneline", f"HEAD..{tracking}", "-n", "15"]))
         lines = [
             f"{ui.paint(ui.glyphs()['bullet'] + ' ' + commit, ui.CYAN)}"
             if ui is not None and ui.enabled() else f"      {commit}"
@@ -182,23 +224,27 @@ def stash_if_needed(auto_stash: bool = True) -> Optional[str]:
 
 
 def restore_stash(stash_commit: str) -> bool:
-    """Restore the updater's exact stash, keeping it if conflicts occur."""
+    """Restore the updater's exact stash, attempting index restoration first."""
+    # First attempt: apply with index preservation
     result = git(["stash", "apply", "--index", stash_commit], check=False)
     if result.returncode != 0:
-        warn(
-            "local changes could not be reapplied cleanly. The stash is preserved; "
-            "resolve conflicts, then restore it with `git stash apply --index "
-            f"{stash_commit}`."
-        )
-        return False
+        # Fallback: attempt applying without --index to handle untracked file index differences
+        fallback = git(["stash", "apply", stash_commit], check=False)
+        if fallback.returncode != 0:
+            warn(
+                "local changes could not be reapplied cleanly. The stash is preserved; "
+                "resolve conflicts, then restore it with `git stash apply "
+                f"{stash_commit}`."
+            )
+            return False
 
     commits = out(git(["stash", "list", "--format=%H"])).splitlines()
     try:
         stash_index = commits.index(stash_commit)
-    except ValueError:
+        git(["stash", "drop", f"stash@{{{stash_index}}}"])
+    except (ValueError, RuntimeError):
         warn(f"restored local changes; temporary stash remains at {stash_commit}")
         return True
-    git(["stash", "drop", f"stash@{{{stash_index}}}"])
     info("local changes were restored after the update")
     return True
 
@@ -209,6 +255,7 @@ def update(branch: str, auto_stash: bool, extras: list[str]) -> int:
         print(ui.panel("xoxss updater", [
             f"{ui.paint('version', ui.GREY)}  {old_version}",
             f"{ui.paint('branch', ui.GREY)}   {branch}",
+            f"{ui.paint('env', ui.GREY)}      {'virtualenv' if in_venv() else 'system'}",
             f"{ui.paint('policy', ui.GREY)}   fast-forward only - history is never rewritten",
         ]))
     else:
@@ -230,8 +277,10 @@ def update(branch: str, auto_stash: bool, extras: list[str]) -> int:
                 info("code is already up to date")
             new_version = old_version
         else:
-            log = out(git(["log", "--oneline", f"HEAD..origin/{branch}", "-n", "15"]))
-            incoming = len(out(git(["rev-list", f"HEAD..origin/{branch}"])).splitlines())
+            tracking = resolve_tracking_branch(branch)
+            target_remote_branch = tracking.replace("origin/", "", 1)
+            log = out(git(["log", "--oneline", f"HEAD..{tracking}", "-n", "15"]))
+            incoming = len(out(git(["rev-list", f"HEAD..{tracking}"])).splitlines())
             log_lines = [
                 f"{ui.paint(ui.glyphs()['bullet'] + ' ' + commit, ui.CYAN)}"
                 if ui is not None and ui.enabled() else commit
@@ -244,8 +293,8 @@ def update(branch: str, auto_stash: bool, extras: list[str]) -> int:
                 for line_text in log_lines:
                     print(f"      {line_text}")
 
-            step(f"Fast-forwarding {branch} to origin/{branch}")
-            result = git(["pull", "--ff-only", "origin", branch], check=False)
+            step(f"Fast-forwarding {branch} to {tracking}")
+            result = git(["pull", "--ff-only", "origin", target_remote_branch], check=False)
             if result.returncode != 0:
                 raise RuntimeError(
                     f"update failed:\n{(result.stderr or result.stdout).strip()}\n"
@@ -266,30 +315,43 @@ def update(branch: str, auto_stash: bool, extras: list[str]) -> int:
         )
 
     # Refresh the installed package so the running tool matches the new code.
-    step("Refreshing the installed package (pip install -U .)")
+    step("Refreshing the installed package (pip install --upgrade)")
     pip_result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-U", "."], cwd=ROOT)
+        [
+            sys.executable, "-m", "pip", "install", "--prefer-binary",
+            "--upgrade", "--upgrade-strategy", "only-if-needed", ".",
+        ],
+        cwd=ROOT,
+    )
     if pip_result.returncode != 0:
         warn("pip refresh failed; the previously installed version still works.")
 
     for extra in extras:
         step(f"Refreshing optional extra '{extra}'")
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-U", f".[{extra}]"], cwd=ROOT)
+            [
+                sys.executable, "-m", "pip", "install", "--prefer-binary",
+                "--upgrade", "--upgrade-strategy", "only-if-needed", f".[{extra}]",
+            ],
+            cwd=ROOT,
+        )
         if result.returncode != 0:
             warn(f"extra '{extra}' refresh failed; it keeps its previous version.")
 
     # Sanity check.
     result = subprocess.run(
-        [sys.executable, "-m", "xoxss", "--version"], capture_output=True,
-        text=True, timeout=60)
-    new_version = result.stdout.strip() or "unknown"
+        [sys.executable, "-m", "xoxss", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    reported_version = result.stdout.strip() or "unknown"
     if result.returncode == 0:
         if ui is not None and ui.enabled():
             print(f"{ui.paint(ui.glyphs()['tick'] + ' scanner now reports', ui.GREEN)} "
-                  f"{ui.paint(new_version, ui.BOLD)}")
+                  f"{ui.paint(reported_version, ui.BOLD)}")
         else:
-            info(f"scanner now reports: {new_version}")
+            info(f"scanner now reports: {reported_version}")
     info(f"verify with: {sys.executable} -m xoxss --doctor")
     return 0
 
@@ -308,8 +370,21 @@ def main() -> int:
                         help="only report whether an update is available; change nothing")
     parser.add_argument("--extras", default="",
                         help="comma-separated optional extras to refresh after updating "
-                             "(e.g. interactsh,playwright)")
+                             "(e.g. interactsh,playwright,http2,ast)")
+    parser.add_argument("--no-venv", action="store_true",
+                        help="do not switch to repository .venv even if present")
     args = parser.parse_args()
+
+    # Automatically re-exec with repository .venv if executed with system Python
+    if not in_venv() and not args.no_venv:
+        venv_py = find_venv_python()
+        if venv_py and venv_py.resolve() != Path(sys.executable).resolve():
+            info(f"Using virtual environment: {venv_py}")
+            env = os.environ.copy()
+            env["VIRTUAL_ENV"] = str(venv_py.parent.parent)
+            env.pop("PYTHONHOME", None)
+            result = subprocess.run([str(venv_py), str(ROOT / "updater.py"), *sys.argv[1:]], env=env)
+            return result.returncode
 
     branch = ensure_repo()
     extras = [name.strip() for name in args.extras.split(",") if name.strip()]

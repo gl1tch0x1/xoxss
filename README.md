@@ -76,8 +76,11 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 - Execution markers instead of blocking dialogs. Payloads write a random token to
   `window.__xoxss_hits`; `alert`, `confirm` and `prompt` are intercepted and recorded.
 - Runtime DOM instrumentation for `innerHTML`, `outerHTML`, `document.write`,
-  `insertAdjacentHTML`, `eval`, `setTimeout` and `setInterval`, distinguishing
-  *confirmed execution* from *static sink taint*.
+  `insertAdjacentHTML`, `eval`, `setTimeout`, `setInterval`, `postMessage`, and framework
+  sinks (React `dangerouslySetInnerHTML`, Vue `v-html`, Angular `bypassSecurityTrust*`, Navigation API),
+  distinguishing *confirmed execution* from *static sink taint*.
+- Parenthesis-less JavaScript execution vectors, universal multi-context polyglots, and
+  overlong 2-byte UTF-8 (`%C0%BC`, `%C0%BE`) mutation probes for bypassing modern WAFs.
 - Reflected, stored, header and DOM XSS with an explicit confidence model instead of a
   binary "vulnerable" label.
 - Runtime prototype pollution with marker proof, gadget fingerprinting and
@@ -93,6 +96,10 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 - Level-by-level concurrent crawler (`engine/crawler.py`) with depth and URL budgets; parses
   links, forms, iframes, `object`, meta-refresh, `robots.txt`, recursive sitemaps and
   JavaScript.
+- Parameter schema clustering (`url_cluster_key`) to automatically eliminate repetitive
+  query and pagination crawl traps (`/items?page=1..10000`).
+- Single Page Application (SPA) client-side route discovery extracted dynamically from HTML
+  scripts and JavaScript bundles.
 - JavaScript intelligence: hidden endpoints, parameter names, GraphQL/WebSocket URLs,
   source maps and embedded `sourcesContent`, leaked credential patterns, and
   source-to-sink taint flows with sanitizer awareness. A scope-aware tree-sitter CST
@@ -109,7 +116,7 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 - Internal path fuzzing with soft-404 detection, hidden-parameter mining, and parameter
   fuzzing on endpoints that expose no query string.
 - Optional orchestration of installed `subfinder`, `gau`, `waybackurls`, `katana`,
-  `httpx`, `arjun`, `x8`, `dalfox` and `nuclei` binaries.
+  `httpx`, `arjun`, `x8`, `dalfox`, `nuclei`, `kxss` and `wfuzz` binaries.
 
 **Payloads and evasion**
 
@@ -208,7 +215,7 @@ survived unescaped in an executable context, executed in a browser, was
 persisted and re-rendered, or its out-of-band marker was answered. A blind
 probe that was merely *sent* never produces a finding; polyglot payloads must
 be executable, not just reflected; header injections must be executable; and
-third-party tools (`dalfox`/`nuclei`) ship as `low` + `unverified` because
+third-party tools (`dalfox`/`nuclei`/`kxss`/`wfuzz`) ship as `low` + `unverified` because
 XOXSS did not confirm them itself. Every finding carries a reproduction proof:
 `poc_url` (a ready-to-open URL for GET injection points) or `poc_command` (a
 `curl` one-liner for POST / header / cookie points). The PoC embeds only the
@@ -229,7 +236,7 @@ injected parameter — no cookies or session data.
 | `curl_cffi` | Optional | `--http2` multiplexing and `--impersonate` TLS fingerprints (`pip install "xoxss[http2]"`). |
 | `tree-sitter` + `tree-sitter-javascript` | Optional | Scope-aware CST taint backend (`pip install "xoxss[ast]"`); the regex analyzer remains the fallback. |
 | `uvloop` | Optional | Faster event loop on non-Windows platforms. |
-| External binaries | Optional | `subfinder`, `gau`, `waybackurls`, `katana`, `httpx`, `arjun`, `x8`, `dalfox`, `nuclei`; missing tools contribute nothing. |
+| External binaries | Optional | `subfinder`, `gau`, `waybackurls`, `katana`, `httpx`, `arjun`, `x8`, `dalfox`, `nuclei`, `kxss`, `wfuzz`; missing tools contribute nothing. |
 
 Linux, macOS and Windows are supported. On Windows, `uvloop` is skipped and Selenium
 Manager resolves the browser driver. The scanner degrades to HTTP-only mode when no
@@ -237,64 +244,66 @@ browser is available.
 
 ## Installation
 
+### 1. Automated Setup (Recommended)
+
+The repository includes an automated installer (`installer.py`) that **automatically creates an isolated Python virtual environment (`.venv`)** and configures root launchers so you don't need to manually create or activate environments:
+
 ```bash
 git clone https://github.com/gl1tch0x1/xoxss.git
 cd xoxss
 
-# install the package and the `xoxss` console script
-pip install .
-
-# or an editable development install
-pip install -e ".[dev]"
-
-# runtime dependencies only, without packaging
-pip install -r requirements.txt
-```
-
-Optional extras:
-
-```bash
-pip install ".[interactsh]"        # native interactsh client
-pip install ".[playwright]"        # Playwright backend, then: playwright install chromium
-```
-
-### Automated setup and updates
-
-The repository ships two helper scripts for hands-off setup and maintenance.
-Both run every pip call through the interpreter that started them
-(`sys.executable -m pip`), so they are safe inside virtual environments.
-
-```bash
-# interactive installer: installs the package, then asks about each optional extra
-python installer.py
-
-# non-interactive: installs everything, optional extras included
+# non-interactive: auto-creates .venv, installs core, Playwright (with Chromium), and all extras
 python installer.py -y
 
-# skip the extras, or only verify prerequisites and current state
-python installer.py --no-extras
-python installer.py --check
+# or interactive mode: prompts for each optional extra
+python installer.py
 
-# update an existing git clone: fetch, fast-forward, refresh the install
+# check prerequisites, virtualenv, and installed packages without making changes
+python installer.py --check
+```
+
+Once installed, convenient root launchers are generated automatically:
+- **Windows:** Run `.\xoxss.bat --help` or `.\xoxss.bat example.com --god`
+- **Linux / macOS:** Run `./xoxss --help` or `./xoxss example.com --god`
+
+*(You can also activate the virtual environment manually via `.venv\Scripts\activate` on Windows or `source .venv/bin/activate` on Linux/macOS. Use `--no-venv` with `installer.py` if installing directly into a global container or system environment).*
+
+### 2. Manual Installation
+
+```bash
+# create and activate an isolated virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# install the package and console script
+pip install .
+
+# install with all optional extras (interactsh, playwright, http2, ast, dev)
+pip install ".[playwright,interactsh,http2,ast,dev]"
+playwright install chromium
+```
+
+### 3. Self-Healing Updates
+
+The updater (`updater.py`) automatically synchronizes your clone with origin and refreshes the installed package inside your virtual environment:
+
+```bash
+# update clone: fast-forward branch, preserve local edits in temporary stash, and refresh packages
 python updater.py
 
-# report whether an update is available, without changing anything
-python updater.py --check
+# update non-interactively with optional extras refreshed
+python updater.py -y --extras interactsh,playwright,http2,ast
 
-# local changes are temporarily stashed, restored after updating, and extras refreshed
-python updater.py -y
-python updater.py -y --extras interactsh,playwright
+# report whether an update is available without changing anything
+python updater.py --check
 
 # opt out of automatic local-change preservation
 python updater.py --no-auto-stash
 ```
 
-The installer refuses to run outside a repository checkout and falls back to
-the core scanner even when an optional extra fails. The updater never rewrites
-history — it temporarily stashes tracked and untracked local changes, fast-forwards
-with `git pull --ff-only`, then restores the changes. If restoration conflicts, the
-stash is kept and the updater asks you to resolve the conflict. Use `--no-auto-stash`
-to make a dirty checkout stop before updating.
+The updater detects multi-remote configurations, automatically tracks upstream branches (`origin/main`), and performs a 2-stage stash restoration to safely preserve uncommitted work without conflicts.
+
+### Docker deployment
 
 The bundled Docker image is intentionally HTTP-only: no browser, no external scanners,
 non-root user — suitable for reflection checks in CI:
@@ -304,6 +313,8 @@ docker build -t xoxss .
 docker run --rm -v xoxss-data:/data xoxss https://target.tld/?q=1 \
   --no-browser --no-state --no-remote-payloads --state-dir /data --report-dir /data/reports
 ```
+
+### Environment Verification
 
 Verify the installation (exits non-zero only when a required component is missing):
 
@@ -563,7 +574,7 @@ It enables and retries degraded setups automatically:
   headless workers, screenshots; HTTP-only without a browser.
 - **Blind XSS**: public interactsh (`oast.pro`) unless you supplied `--blind`,
   `--interactsh`, `--oob-poll` or `--oob-file`.
-- **External tools**: dalfox/nuclei/subfinder/gau/katana/arjun/x8 when installed.
+- **External tools**: dalfox/nuclei/subfinder/gau/katana/arjun/x8/kxss/wfuzz when installed.
 
 Networking is raised to 20 workers × 32 concurrent requests, 30 s timeout. Explicit
 flags always win (`--god --max-urls 500` keeps the URL budget). Not combinable with
