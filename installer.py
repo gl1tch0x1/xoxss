@@ -22,9 +22,10 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import venv
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 MIN_PYTHON = (3, 9)
 
@@ -51,6 +52,83 @@ REQUIRED_IMPORTS = [
     ("selenium", "selenium"),
     ("webdriver-manager", "webdriver_manager"),
 ]
+
+
+def get_free_space_mb(path: Path | str) -> int:
+    """Return free disk space in megabytes for a given path."""
+    try:
+        usage = shutil.disk_usage(str(path))
+        return int(usage.free / (1024 * 1024))
+    except Exception:
+        return 999999
+
+
+def configure_safe_temp_dir() -> Optional[Path]:
+    """
+    Ensure pip build environments use a location with sufficient disk space.
+    Linux systems (e.g. Kali, Debian, Docker) often mount /tmp as a small tmpfs RAM disk
+    (e.g. 512MB-1GB), which runs out of space during Playwright or C-extension builds ([Errno 28]).
+    If /tmp has < 1500 MB free but ROOT has significantly more free space,
+    redirect TMPDIR to ROOT / '.tmp'.
+    """
+    try:
+        sys_tmp = Path(tempfile.gettempdir())
+        tmp_free = get_free_space_mb(sys_tmp)
+        root_free = get_free_space_mb(ROOT)
+        if tmp_free < 1500 and root_free > (tmp_free + 200):
+            safe_tmp = ROOT / ".tmp"
+            safe_tmp.mkdir(parents=True, exist_ok=True)
+            os.environ["TMPDIR"] = str(safe_tmp)
+            os.environ["TEMP"] = str(safe_tmp)
+            os.environ["TMP"] = str(safe_tmp)
+            return safe_tmp
+    except Exception:
+        pass
+    return None
+
+
+def clean_build_artifacts() -> None:
+    """Clean transient build artifacts and temporary files."""
+    for pattern in ("build", "*.egg-info", "pip-wheel-metadata"):
+        for item in ROOT.glob(pattern):
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                elif item.is_file():
+                    item.unlink(missing_ok=True)
+            except Exception:
+                pass
+    safe_tmp = ROOT / ".tmp"
+    if safe_tmp.is_dir():
+        try:
+            shutil.rmtree(safe_tmp, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def print_disk_space_help() -> None:
+    """Emit clear, actionable instructions when out-of-disk condition occurs."""
+    tmp_dir = tempfile.gettempdir()
+    free_tmp = get_free_space_mb(tmp_dir)
+    free_root = get_free_space_mb(ROOT)
+    free_prefix = get_free_space_mb(sys.prefix)
+
+    lines = [
+        f"Available disk space: /tmp: {free_tmp} MB | repo: {free_root} MB | env: {free_prefix} MB",
+        "Common remedies for Linux/Debian/Kali:",
+        "  1. Clean packages:  sudo apt-get clean && sudo apt-get autoremove -y",
+        "  2. Purge pip cache: python -m pip cache purge",
+        "  3. Free /tmp tmpfs: sudo mount -o remount,size=2G /tmp  (or rm -rf /tmp/pip-*)",
+        "  4. Minimal install: ./installer.py --no-extras",
+    ]
+    if ui is not None and ui.enabled():
+        print(ui.panel("out of disk space ([Errno 28])", lines, accent=ui.YELLOW))
+    else:
+        print("\n" + "=" * 60)
+        print(" [!] OUT OF DISK SPACE ([Errno 28])")
+        for line in lines:
+            print(f"     {line}")
+        print("=" * 60 + "\n")
 
 
 def _emit(label: str, color: str, message: str, stream=sys.stdout) -> None:
@@ -197,16 +275,79 @@ def module_available(module: str) -> bool:
         return False
 
 
-def pip(args: list[str], *, capture: bool = False) -> int:
-    """Run pip through the active interpreter."""
-    command = [sys.executable, "-m", "pip", *args]
+def pip(args: list[str], *, capture: bool = False, no_cache: bool = False) -> int:
+    """Run pip through the active interpreter with space-awareness and error recovery."""
+    cmd_args = list(args)
+    free_temp = get_free_space_mb(tempfile.gettempdir())
+    free_prefix = get_free_space_mb(sys.prefix)
+    low_space = (free_temp < 1200 or free_prefix < 1200)
+
+    # Proactively inject --no-cache-dir if low space or explicitly requested
+    if (no_cache or low_space) and "--no-cache-dir" not in cmd_args and "install" in cmd_args and "cache" not in cmd_args:
+        idx = cmd_args.index("install") + 1
+        cmd_args.insert(idx, "--no-cache-dir")
+
+    command = [sys.executable, "-m", "pip", *cmd_args]
     if capture:
         result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0 and result.stderr.strip():
-            print(result.stderr.strip()[-800:])
+        err_output = (result.stderr or "") + (result.stdout or "")
+        is_no_space = "Errno 28" in err_output or "No space left on device" in err_output or "ENOSPC" in err_output
+        if result.returncode != 0:
+            if is_no_space:
+                warn("pip ran out of disk or temporary space ([Errno 28] No space left on device).")
+                try:
+                    subprocess.run([sys.executable, "-m", "pip", "cache", "purge"], capture_output=True, timeout=15)
+                except Exception:
+                    pass
+                configure_safe_temp_dir()
+                if "--no-cache-dir" not in cmd_args and "install" in cmd_args:
+                    step("Retrying with --no-cache-dir...")
+                    retry_args = list(cmd_args)
+                    retry_args.insert(retry_args.index("install") + 1, "--no-cache-dir")
+                    retry_res = subprocess.run([sys.executable, "-m", "pip", *retry_args], capture_output=True, text=True)
+                    if retry_res.returncode == 0:
+                        return 0
+                print_disk_space_help()
+            elif err_output.strip():
+                print(err_output.strip()[-800:])
         return result.returncode
-    result = subprocess.run(command)
-    return result.returncode
+
+    # Real-time streaming output
+    proc = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    collected_lines: list[str] = []
+    if proc.stdout:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            collected_lines.append(line)
+            if len(collected_lines) > 80:
+                collected_lines.pop(0)
+    proc.wait()
+    ret = proc.returncode
+
+    if ret != 0:
+        tail_text = "".join(collected_lines)
+        is_no_space = "Errno 28" in tail_text or "No space left on device" in tail_text or "ENOSPC" in tail_text
+        if is_no_space:
+            warn("pip ran out of disk or temporary space ([Errno 28] No space left on device).")
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "cache", "purge"], capture_output=True, timeout=15)
+            except Exception:
+                pass
+            configure_safe_temp_dir()
+            if "--no-cache-dir" not in cmd_args and "install" in cmd_args:
+                step("Retrying with --no-cache-dir...")
+                retry_args = list(cmd_args)
+                retry_args.insert(retry_args.index("install") + 1, "--no-cache-dir")
+                return pip(retry_args, capture=False, no_cache=True)
+            print_disk_space_help()
+    return ret
 
 
 def git_available() -> bool:
@@ -214,7 +355,7 @@ def git_available() -> bool:
 
 
 def precheck() -> bool:
-    """Verify prerequisites before installing."""
+    """Verify prerequisites and check available disk space before installing."""
     if sys.version_info < MIN_PYTHON:
         die(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required; "
             f"you are running {sys.version_info.major}.{sys.version_info.minor}.")
@@ -231,6 +372,14 @@ def precheck() -> bool:
             f"no pyproject.toml found next to {Path(__file__).name}.")
     info(f"Repository checkout found: {ROOT}")
 
+    # Inspect disk space early to prevent out-of-disk failures
+    free_temp = get_free_space_mb(tempfile.gettempdir())
+    free_root = get_free_space_mb(ROOT)
+    free_prefix = get_free_space_mb(sys.prefix)
+    info(f"Disk space available: {free_root} MB (repo), {free_temp} MB (temp), {free_prefix} MB (env)")
+    if free_temp < 500 or free_prefix < 500:
+        warn("Low disk space detected (< 500 MB free). Installation of heavy packages like Playwright may fail.")
+
     if not git_available():
         warn("git is not on PATH; only needed by updater.py, not for installation.")
     return True
@@ -241,6 +390,8 @@ def report_state() -> int:
     venv_status = "active virtualenv" if in_venv() else "system Python (no venv active)"
     venv_path = ROOT / ".venv"
     has_stored_venv = venv_path.is_dir()
+    free_temp = get_free_space_mb(tempfile.gettempdir())
+    free_root = get_free_space_mb(ROOT)
 
     if ui is not None and ui.enabled():
         print(ui.panel("xoxss installer - state check", [
@@ -248,6 +399,7 @@ def report_state() -> int:
             f"{ui.paint('env', ui.GREY)}        {venv_status}",
             f"{ui.paint('.venv exists', ui.GREY)} {'yes' if has_stored_venv else 'no'}",
             f"{ui.paint('checkout', ui.GREY)}   {ROOT}",
+            f"{ui.paint('disk space', ui.GREY)} {free_root} MB repo / {free_temp} MB temp",
         ]))
     else:
         print("XOXSS installation check")
@@ -345,21 +497,15 @@ def run_installer(args: argparse.Namespace) -> int:
         print("=" * 60)
     print()
 
+    configure_safe_temp_dir()
     precheck()
 
     # 3. Refresh packaging tooling inside the environment.
     step("Upgrading pip / setuptools / wheel (best effort)")
-    if pip(["install", "--prefer-binary", "--upgrade", "pip", "setuptools", "wheel"], capture=True) != 0:
+    if pip(["install", "--prefer-binary", "--upgrade", "pip", "setuptools", "wheel"], capture=True, no_cache=args.no_cache) != 0:
         warn("could not upgrade pip tooling; continuing with existing versions")
 
-    # 4. Core install: package + required dependencies.
-    section("core install")
-    step("Installing XOXSS core (package + required dependencies)")
-    if pip(["install", "--prefer-binary", "--upgrade", "--upgrade-strategy", "only-if-needed", "."]) != 0:
-        die("core installation failed; see the pip output above for details.", 1)
-    info("XOXSS core installed")
-
-    # 5. Optional extras.
+    # 4. Optional extras selection upfront
     section("optional extras")
     selected: list[str] = []
     if args.no_extras:
@@ -368,7 +514,7 @@ def run_installer(args: argparse.Namespace) -> int:
         auto = args.yes
         if auto:
             selected = [name for name, _module, _desc in OPTIONAL_EXTRAS]
-            info(f"--yes: installing all optional extras ({', '.join(selected)})")
+            info(f"--yes: selected all optional extras ({', '.join(selected)})")
         elif not is_maybe_interactive():
             warn("stdin is not interactive; skipping optional extras. "
                  "Re-run with -y to install them automatically.")
@@ -376,26 +522,55 @@ def run_installer(args: argparse.Namespace) -> int:
             for name, _module, description in OPTIONAL_EXTRAS:
                 if ask(name, description):
                     selected.append(name)
-        if not selected:
-            info("nothing selected - core scanner only")
+
+    # 5. Core + extras install:
+    # Single-pass batch install builds the wheel ONCE and resolves dependencies together,
+    # preventing out-of-disk errors ([Errno 28]) from repeated wheel builds in /tmp.
+    section("installation")
+    if not selected:
+        step("Installing XOXSS core (package + required dependencies)")
+        if pip(["install", "--prefer-binary", "--upgrade", "--upgrade-strategy", "only-if-needed", "."], no_cache=args.no_cache) != 0:
+            die("core installation failed; see the pip output above for details.", 1)
+        info("XOXSS core installed")
+    else:
+        batch_spec = f".[{','.join(selected)}]"
+        step(f"Installing XOXSS with selected extras ({', '.join(selected)}) in a single pass")
+        batch_status = pip(["install", "--prefer-binary", "--upgrade", "--upgrade-strategy", "only-if-needed", batch_spec], no_cache=args.no_cache)
+        if batch_status == 0:
+            info(f"XOXSS and selected extras ({', '.join(selected)}) installed successfully")
         else:
+            warn("Single-pass install encountered an issue; falling back to core install followed by individual extras.")
+            if pip(["install", "--prefer-binary", "--upgrade", "--upgrade-strategy", "only-if-needed", "."], no_cache=args.no_cache) != 0:
+                die("core installation failed; see the pip output above for details.", 1)
+            info("XOXSS core installed")
             for name in selected:
                 step(f"Installing optional extra '{name}'")
-                if pip(["install", "--prefer-binary", "--upgrade", "--upgrade-strategy", "only-if-needed", f".[{name}]"]) != 0:
+                if pip(["install", "--prefer-binary", "--upgrade", "--upgrade-strategy", "only-if-needed", f".[{name}]"], no_cache=args.no_cache) != 0:
                     warn(f"optional extra '{name}' failed; the core scanner still works.")
-                    continue
-                if name == "playwright":
-                    step("Downloading the Chromium browser for Playwright")
-                    result = subprocess.run(
-                        [sys.executable, "-m", "playwright", "install", "chromium"]
-                    )
-                    if result.returncode != 0:
-                        warn("Chromium download failed; run "
-                             f"{sys.executable} -m playwright install chromium later.")
-                    else:
-                        info("Chromium installed")
 
-    # 6. Ensure launcher scripts exist.
+    # 6. Playwright Chromium download (with free disk space safety check)
+    if "playwright" in selected and module_available("playwright"):
+        free_mb = get_free_space_mb(sys.prefix)
+        if free_mb < 500:
+            warn(f"Low disk space detected ({free_mb} MB available; Playwright Chromium requires ~350 MB).")
+            warn("Skipping automatic Playwright Chromium download to avoid [Errno 28] disk exhaustion.")
+            warn("XOXSS will run with standard Selenium (using system Chrome/Chromium).")
+            warn(f"To download Chromium later after freeing space, run:\n    {sys.executable} -m playwright install chromium")
+        else:
+            step("Downloading the Chromium browser for Playwright")
+            result = subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"]
+            )
+            if result.returncode != 0:
+                warn("Chromium download failed; run "
+                     f"{sys.executable} -m playwright install chromium later.")
+            else:
+                info("Chromium installed")
+
+    # 7. Clean up temporary build artifacts
+    clean_build_artifacts()
+
+    # 8. Ensure launcher scripts exist.
     create_launcher_scripts(ROOT / ".venv")
 
     # 7. Verification.
@@ -449,6 +624,8 @@ def main() -> int:
                         help="do not create or use a virtual environment; install into current Python")
     parser.add_argument("--venv-dir", metavar="PATH", default="",
                         help="custom path for virtual environment (default: .venv in repository root)")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="disable pip caching (--no-cache-dir) to save disk space on small partitions")
     parser.add_argument("--check", action="store_true",
                         help="only verify prerequisites and current state; change nothing")
     args = parser.parse_args()

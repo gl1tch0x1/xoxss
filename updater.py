@@ -17,14 +17,84 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent
+
+# (extra name, probe module)
+KNOWN_EXTRAS = [
+    ("interactsh", "cryptography"),
+    ("playwright", "playwright"),
+    ("http2", "curl_cffi"),
+    ("ast", "tree_sitter"),
+    ("dev", "pytest"),
+]
+
+
+def get_free_space_mb(path: Path | str) -> int:
+    """Return free disk space in megabytes for a given path."""
+    try:
+        usage = shutil.disk_usage(str(path))
+        return int(usage.free / (1024 * 1024))
+    except Exception:
+        return 999999
+
+
+def configure_safe_temp_dir() -> Optional[Path]:
+    """Redirect TMPDIR away from small tmpfs RAM disks if ROOT has more free space."""
+    try:
+        sys_tmp = Path(tempfile.gettempdir())
+        tmp_free = get_free_space_mb(sys_tmp)
+        root_free = get_free_space_mb(ROOT)
+        if tmp_free < 1500 and root_free > (tmp_free + 200):
+            safe_tmp = ROOT / ".tmp"
+            safe_tmp.mkdir(parents=True, exist_ok=True)
+            os.environ["TMPDIR"] = str(safe_tmp)
+            os.environ["TEMP"] = str(safe_tmp)
+            os.environ["TMP"] = str(safe_tmp)
+            return safe_tmp
+    except Exception:
+        pass
+    return None
+
+
+def clean_build_artifacts() -> None:
+    """Clean transient build artifacts and temporary files."""
+    for pattern in ("build", "*.egg-info", "pip-wheel-metadata"):
+        for item in ROOT.glob(pattern):
+            try:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                elif item.is_file():
+                    item.unlink(missing_ok=True)
+            except Exception:
+                pass
+    safe_tmp = ROOT / ".tmp"
+    if safe_tmp.is_dir():
+        try:
+            shutil.rmtree(safe_tmp, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def detect_installed_extras() -> list[str]:
+    """Detect which optional extras are already installed in the current environment."""
+    installed: list[str] = []
+    for extra, module in KNOWN_EXTRAS:
+        try:
+            importlib.import_module(module)
+            installed.append(extra)
+        except Exception:
+            pass
+    return installed
 
 sys.path.insert(0, str(ROOT))
 try:
@@ -162,8 +232,9 @@ def fetch_state(branch: str) -> tuple[int, int]:
         return 0, 0
 
     tracking = resolve_tracking_branch(branch)
+    # rev-list --left-right: left count is HEAD (ahead), right count is tracking (behind)
     counts = out(git(["rev-list", "--left-right", "--count", f"HEAD...{tracking}"]))
-    behind_s, ahead_s = (counts.split() + ["0", "0"])[:2]
+    ahead_s, behind_s = (counts.split() + ["0", "0"])[:2]
     return int(behind_s), int(ahead_s)
 
 
@@ -296,11 +367,23 @@ def update(branch: str, auto_stash: bool, extras: list[str]) -> int:
             step(f"Fast-forwarding {branch} to {tracking}")
             result = git(["pull", "--ff-only", "origin", target_remote_branch], check=False)
             if result.returncode != 0:
-                raise RuntimeError(
-                    f"update failed:\n{(result.stderr or result.stdout).strip()}\n"
-                    "If you rebased or rewrote history locally, resolve it manually "
-                    "or re-clone."
-                )
+                if ahead > 0:
+                    step(f"Fast-forward blocked by {ahead} local commit(s); attempting safe rebase onto {tracking}")
+                    rebase = git(["pull", "--rebase", "origin", target_remote_branch], check=False)
+                    if rebase.returncode != 0:
+                        git(["rebase", "--abort"], check=False)
+                        raise RuntimeError(
+                            f"update failed: local commits conflict with incoming upstream changes.\n"
+                            f"{(rebase.stderr or rebase.stdout).strip()}\n"
+                            "Resolve conflicts manually or re-clone."
+                        )
+                    info("local commits cleanly rebased on top of updated upstream")
+                else:
+                    raise RuntimeError(
+                        f"update failed:\n{(result.stderr or result.stdout).strip()}\n"
+                        "If you rebased or rewrote history locally, resolve it manually "
+                        "or re-clone."
+                    )
             new_version = local_version()
             info(f"updated {branch}: {version_line(old_version, new_version)}")
     except BaseException:
@@ -315,28 +398,36 @@ def update(branch: str, auto_stash: bool, extras: list[str]) -> int:
         )
 
     # Refresh the installed package so the running tool matches the new code.
-    step("Refreshing the installed package (pip install --upgrade)")
-    pip_result = subprocess.run(
-        [
-            sys.executable, "-m", "pip", "install", "--prefer-binary",
-            "--upgrade", "--upgrade-strategy", "only-if-needed", ".",
-        ],
-        cwd=ROOT,
-    )
-    if pip_result.returncode != 0:
-        warn("pip refresh failed; the previously installed version still works.")
+    all_extras = list(extras)
+    if not all_extras:
+        all_extras = detect_installed_extras()
+        if all_extras:
+            info(f"Detected installed optional extras: {', '.join(all_extras)}")
 
-    for extra in extras:
-        step(f"Refreshing optional extra '{extra}'")
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "pip", "install", "--prefer-binary",
-                "--upgrade", "--upgrade-strategy", "only-if-needed", f".[{extra}]",
-            ],
-            cwd=ROOT,
-        )
-        if result.returncode != 0:
-            warn(f"extra '{extra}' refresh failed; it keeps its previous version.")
+    step("Refreshing the installed package (pip install --upgrade)")
+    configure_safe_temp_dir()
+    pip_cmd = [
+        sys.executable, "-m", "pip", "install", "--prefer-binary",
+        "--upgrade", "--upgrade-strategy", "only-if-needed",
+    ]
+    free_temp = get_free_space_mb(tempfile.gettempdir())
+    free_prefix = get_free_space_mb(sys.prefix)
+    if free_temp < 1200 or free_prefix < 1200:
+        pip_cmd.append("--no-cache-dir")
+
+    batch_spec = f".[{','.join(all_extras)}]" if all_extras else "."
+    batch_res = subprocess.run([*pip_cmd, batch_spec], cwd=ROOT)
+    if batch_res.returncode != 0:
+        warn("Batch refresh failed; falling back to core package followed by individual extras.")
+        core_res = subprocess.run([*pip_cmd, "."], cwd=ROOT)
+        if core_res.returncode != 0:
+            warn("Core package pip refresh failed; previously installed version still works.")
+        for extra in all_extras:
+            extra_res = subprocess.run([*pip_cmd, f".[{extra}]"], cwd=ROOT)
+            if extra_res.returncode != 0:
+                warn(f"Extra '{extra}' refresh failed; keeping previous version.")
+
+    clean_build_artifacts()
 
     # Sanity check.
     result = subprocess.run(
