@@ -188,12 +188,48 @@ def analyze_reflection(
     return info
 
 
+#: MIME types a browser parses as an active document.  A missing/blank
+#: ``Content-Type`` is included deliberately: browsers sniff the body and many
+#: lightweight servers omit the header entirely.
+DOCUMENT_EXECUTABLE_MIME = {
+    "",
+    "text/html",
+    "application/xhtml+xml",
+    "image/svg+xml",
+}
+
+#: MIME types worth handing to the browser execution gate.  ``text/plain`` is
+#: included here because a browser attempt is harmless and lets the gate
+#: disprove odd sniffing deployments; it is *not* in
+#: :data:`DOCUMENT_EXECUTABLE_MIME`, because a plain-text document cannot
+#: execute markup on its own and must not be graded ``high`` without execution.
+BROWSER_RENDERABLE_MIME = DOCUMENT_EXECUTABLE_MIME | {"text/plain"}
+
+
+def http_executable(info: ReflectionInfo, content_type: str) -> bool:
+    """True when HTTP-only evidence can justify a ``high``-confidence finding.
+
+    The difference from :func:`browser_prequalified` is ``text/plain``: it is
+    worth a browser attempt but is not executable markup, so an unconfirmed
+    plain-text reflection is a candidate, not a high-severity finding.
+    """
+    if not browser_prequalified(info, content_type):
+        return False
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    return mime in DOCUMENT_EXECUTABLE_MIME
+
+
 def browser_prequalified(info: ReflectionInfo, content_type: str) -> bool:
-    """Conservatively avoid browser work for non-executable reflection candidates."""
+    """Conservatively avoid browser work for non-executable reflection candidates.
+
+    The MIME check only rules out document types a browser can never execute
+    (JSON, XML, binaries).  Everything else is decided by the browser itself,
+    so the gate never becomes the reason a real XSS is dropped.
+    """
     if not info.reflected or not info.executable:
         return False
     mime = (content_type or "").split(";", 1)[0].strip().lower()
-    if mime not in {"text/html", "application/xhtml+xml", "image/svg+xml"}:
+    if mime not in BROWSER_RENDERABLE_MIME:
         return False
     if info.context in {"comment", "textarea", "json", "style"}:
         return False

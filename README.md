@@ -191,24 +191,28 @@ flowchart TD
 4. **Payload selection.** Context-specific templates are rendered with a second unique
    marker; a controlled share of slots comes from the remote corpus, local corpora fill
    the rest.
-5. **HTTP evidence.** If a payload is reflected unescaped, the finding is `high`
-   confidence when browser verification is unavailable or inconclusive.
+5. **HTTP evidence.** If a payload is reflected unescaped in a browser-renderable
+   document context, the finding is `high` confidence when browser verification is
+   unavailable or was explicitly disabled. Reflections in a JSON/XML/binary document,
+   comment, textarea or static dead zone remain `low` candidates because a browser
+   cannot execute them.
 6. **Browser confirmation.** Candidates must pass the context, MIME and static
    dead-zone gate before browser work. GET points are navigated; forms are filled and submitted.
    The scanner checks `window.__xoxss_hits`, intercepted dialogs and instrumented
    sinks. Execution upgrades the finding to `confirmed`.
 7. **Persistence and reporting.** Findings are deduplicated by family, URL, parameter,
    method and optional subkey, then written to the checkpoint and every requested
-   report format.
+   report format. A browser-confirmed runtime sink replaces the matching static
+   taint-flow lead instead of appearing beside it.
 
-Confidence model (drives `--fail-on-findings` and SARIF severity):
+Confidence model (drives `--fail-on`, `--fail-on-findings` and SARIF severity):
 
 | Confidence | Meaning |
 |---|---|
 | `confirmed` | The marker executed or produced an observed dialog in a browser, or an out-of-band callback answered with the blind-XSS marker. |
-| `high` | Payload reflected unescaped in an executable context (browser verification unavailable), or a payload persisted and re-rendered for stored XSS. |
-| `medium` | Header reflection that survived unescaped and executable (browser verification needs a proxy, so it stays below `high`). |
-| `low` | Reflected but not executable, a static DOM candidate, an un-verified external-tool claim, or a DOM sink that was reached without executing. Usually requires `--report-reflections` for the reflection case. |
+| `high` | Payload reflected unescaped in an executable, browser-renderable document context (browser verification unavailable or disabled), or a payload persisted and re-rendered for stored XSS. |
+| `medium` | A browser was available and the candidate passed the execution gate but did not execute, or a header reflection survived unescaped (browser verification needs a proxy, so it stays below `high`). |
+| `low` | Reflected but not executable or not browser-executable markup (JSON/XML/binary, `text/plain`, comment, textarea), a static DOM candidate, an un-verified external-tool claim, or a DOM sink that was reached without executing. Reflection leads require `--report-reflections`. |
 
 **Evidence policy.** A finding is only raised on real evidence: the payload
 survived unescaped in an executable context, executed in a browser, was
@@ -316,7 +320,8 @@ docker run --rm -v xoxss-data:/data xoxss https://target.tld/?q=1 \
 
 ### Environment Verification
 
-Verify the installation (exits non-zero only when a required component is missing):
+Verify the installation (exits non-zero only when a required component is missing;
+an optional browser stack that is absent is reported as a warning, not a failure):
 
 ```bash
 xoxss --doctor
@@ -482,13 +487,14 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--auth-state PATH` | Playwright storage-state JSON for browser discovery/verification and scoped HTTP cookies. |
 | `--mutation-probes` / `--mutation-probe-limit N` | Opt in to bounded Unicode, decoding, byte-mask and multibyte transformation probes. |
 | `--adaptive-payloads` | Add bounded syntax variants using observed delimiter constraints. |
-| `-o, --output PATH` | Mirror the console log to a file. |
+| `--log-file PATH` | Write the full human-readable text log to a file. `-o, --output` remains a deprecated alias. |
 | `--report LIST` | `json`, `md`, `html`, `sarif`, combinations, `all`, or `none` (default `all`). |
 | `--report-dir DIR` / `--state-dir DIR` | Report root / checkpoint root (default `.xoxss`). |
 | `--events-jsonl PATH` | Append versioned JSONL target, discovery, finding, and completion events for automation. |
 | `--no-state` / `--no-resume` | Disable checkpoints / reset and start over. |
 | `--verbose` / `--quiet` / `--no-color` | Debug output / findings-only / disable ANSI colours. |
-| `--fail-on-findings` | Exit `2` when confirmed/high findings exist. |
+| `--fail-on LEVEL` | Exit `2` when a finding meets the confidence floor: `any`, `low`, `medium`, `high`, `confirmed` (default: off). |
+| `--fail-on-findings` | Shorthand for `--fail-on any`. |
 | `--replay FINDING_ID` | Re-run one finding from a previous JSON report: one request plus one browser check. |
 | `--replay-report PATH` | JSON report to load for `--replay` (default: newest `*.json` in `--report-dir`). |
 | `--doctor` / `--list-payloads` / `--list-tampers` / `--list-encoders` / `--version` | Diagnostics and registry inspection. |
@@ -504,9 +510,11 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 reports. Existing parameters are rewritten one at a time; URLs without a query string
 get `--mass-params "q,search,..."` fallbacks, and each parameter gets
 `--mass-payloads N` (default `4`) payloads plus local-corpus slots. Tamper and encoder
-transforms apply per request. Only executable reflections are emitted, as
-`Reflected XSS (HTTP evidence)` with `confidence: high`. `--jsonl PATH` appends one
-finding object per line for streaming ingestion.
+transforms apply per request. Only reflections that can execute as a document
+(HTML/XHTML/SVG or a sniffed body with no `Content-Type`) are emitted, as
+`Reflected XSS (HTTP evidence)` with `confidence: high`. JSON, XML, binary and
+`text/plain` responses are treated as non-executable leads. `--jsonl PATH` appends
+one finding object per line for streaming ingestion.
 
 When no target argument or `--target-list` is provided, xoxss reads one URL per
 line from piped standard input. Blank lines and lines beginning with `#` are ignored:
@@ -799,9 +807,9 @@ Redacted credentials are never replayed literally; supply your own session with
 
 | Exit code | Meaning |
 |---|---|
-| `0` | Completed; no actionable findings (or `--fail-on-findings` not set). |
+| `0` | Completed; no finding met the `--fail-on` floor. |
 | `1` | Fatal error, missing required dependency, invalid configuration, or `--doctor` failure. |
-| `2` | Actionable findings with `--fail-on-findings`, or invalid CLI usage. |
+| `2` | A finding met the `--fail-on` / `--fail-on-findings` floor, or invalid CLI usage. |
 | `130` | Interrupted with Ctrl+C; checkpoints are saved. |
 
 ## State and resume
@@ -1005,10 +1013,36 @@ measured the full scanner at **1.83 s** vs mass mode at **1.34 s** (~`1.37×`). 
 general performance promise: it depends on how much discovery and confirmation the
 full scan performs.
 
+Remote payload lists are cached for 24 hours in the system temp directory
+(`xoxss-payload-cache`, at most 2 MB), so repeated short scans do not re-download
+the same GitHub files. Set `XOXSS_NO_PAYLOAD_CACHE=1` to disable the cache or
+`XOXSS_PAYLOAD_CACHE_DIR` to relocate it. The loader also caps the in-memory remote
+corpus at 5,000 payloads.
+
+### Coverage benchmark
+
+`benchmarks/` contains a local-only fixture and a machine-readable corpus covering
+reflected HTML/attribute/script contexts, DOM sources (query, hash, storage,
+`window.name`, `postMessage`), stored XSS, authenticated routes, and negative
+controls (escaped reflection, `textContent`-only DOM, static tokens, JSON echo).
+Run it from a clean checkout:
+
+```bash
+python benchmarks/run_benchmark.py                       # Playwright + HTTP cases
+python benchmarks/run_benchmark.py --quick               # HTTP-only cases
+python benchmarks/run_benchmark.py --only dom-location-hash --browser playwright
+```
+
+The runner starts its own loopback fixture on a free port (or use `--base-url`),
+invokes the real CLI per case, reads the JSON report, and passes only when the
+strongest evidence grade matches the case expectation. `--json-out PATH` writes the
+machine-readable result table. Use `--browser none` for HTTP-only retrieval.
+Never point it at a system you are not authorized to test.
+
 ## Troubleshooting
 
 Start with `xoxss --doctor`. Add `--verbose` for context classification, payload
-decisions and browser errors; `-o scan.log` keeps a timestamped log; `--no-state`
+decisions and browser errors; `--log-file scan.log` keeps a timestamped log; `--no-state`
 avoids stale checkpoints while iterating.
 
 | Symptom | Likely cause | Fix |

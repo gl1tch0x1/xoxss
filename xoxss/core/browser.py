@@ -10,6 +10,7 @@ them independently testable.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import inspect
 import json
 import os
@@ -19,6 +20,9 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol
+
+#: Whether the optional Playwright backend can be imported in this environment.
+HAS_PLAYWRIGHT = importlib.util.find_spec("playwright") is not None
 
 
 class ConsoleLike(Protocol):
@@ -1191,8 +1195,12 @@ class BrowserPool:
                         self.engines.remove(engine)
                     engine = None
 
-            is_dead_driver = hasattr(engine, "driver") and engine.driver is None
-            is_dead_playwright = hasattr(engine, "page") and engine.page is None
+            is_dead_driver = (
+                engine is not None and hasattr(engine, "driver") and engine.driver is None
+            )
+            is_dead_playwright = (
+                engine is not None and hasattr(engine, "page") and engine.page is None
+            )
             if engine is not None and engine in self.engines and not (is_dead_driver or is_dead_playwright):
                 self._queue.put_nowait(engine)
 

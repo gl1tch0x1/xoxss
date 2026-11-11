@@ -182,7 +182,7 @@ def panel(title: str, lines: Sequence[str], *, width: int = 0,
 
     term_w = safe_width()
     title_raw = strip_ansi(title)
-    max_line_len = max([len(title_raw)] + [len(strip_ansi(l)) for l in lines] + [40])
+    max_line_len = max([len(title_raw)] + [len(strip_ansi(line)) for line in lines] + [40])
 
     if width:
         outer = min(width, term_w - 2)

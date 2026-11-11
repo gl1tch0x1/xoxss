@@ -73,6 +73,26 @@ COMMON_ENDPOINTS: Tuple[str, ...] = (
 class CrawlerMixin:
     """BFS crawl helpers mixed into :class:`xoxss.scanner.XSSScanner`."""
 
+    # Attributes/methods supplied by XSSScanner.  Declared here so the mixin can
+    # be type-checked in isolation without importing the 7k-line coordinator.
+    args: Any
+    console: Any
+    scope: Any
+    state: Any
+    stats: Any
+    target: str
+    endpoints: Any
+    endpoint_sources: Any
+    recon_seeds: Any
+    http: Any
+    pool: Any
+    vulnerable_libs: Any
+    _mined_params: Any
+    _stop: Any
+    _endpoints_from_scripts: Any
+    _endpoints_from_js_file: Any
+    discover_browser_requests: Any
+
     async def prepare_urls(self) -> List[str]:
         recon = await self.recon_seeds()
         if not self.args.crawl:

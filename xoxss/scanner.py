@@ -33,7 +33,6 @@ import random
 import re
 import shutil
 import shlex
-import socket
 import string
 import sys
 import tempfile
@@ -46,11 +45,11 @@ import urllib.request
 import uuid
 import warnings
 from collections import Counter
-from contextlib import asynccontextmanager, suppress
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 from urllib.parse import (
     parse_qsl,
     quote,
@@ -62,12 +61,6 @@ from urllib.parse import (
 
 # Advanced modules
 try:
-    from xoxss.analysis.polyglot import PolyglotGenerator as PolyglotPayloadGenerator
-    from xoxss.analysis.per_char import PerCharProbe
-    from xoxss.analysis.jsonp import JSONPAnalyzer as JSONPDetector
-    from xoxss.analysis.csp import CSPAnalyzer
-    from xoxss.analysis.cors import CORSAnalyzer
-    from xoxss.analysis.mxss import MXSSDetector
     from xoxss.analysis.proto_pollution import (
         PROTO_MARKER_KEY,
         PROTO_PROBE_JS,
@@ -76,13 +69,6 @@ try:
         build_proto_probes,
         gadget_exploit_names,
     )
-    from xoxss.analysis.rate_limit import SmartRateLimiter
-    from xoxss.analysis.dom_clobbering import DOMClobberingDetector
-    from xoxss.analysis.trusted_types import TrustedTypesAnalyzer
-    from xoxss.analysis.graphql import GraphQLAnalyzer
-    from xoxss.analysis.websocket import WebSocketAnalyzer
-    from xoxss.analysis.file_upload import FileUploadAnalyzer
-    from xoxss.analysis.postmessage import PostMessageAnalyzer
     from xoxss.detection.payload import build_blind_payloads
     HAS_ADVANCED = True
 except Exception:
@@ -150,7 +136,7 @@ except Exception as _recon_exc:  # pragma: no cover
     summarize_taint_flows = None  # type: ignore
     apply_encoder_chain = None  # type: ignore
     describe_encoders = None  # type: ignore
-    encoder_names = lambda: []  # type: ignore
+    encoder_names = lambda: []  # type: ignore  # noqa: E731
     get_encoder = None  # type: ignore
     CallbackPoller = FilePoller = InteractshClient = OOBManager = None  # type: ignore
     JSIntel = object  # type: ignore
@@ -177,18 +163,22 @@ except Exception as _param_exc:  # pragma: no cover
 
 from xoxss.reports.sarif import (  # noqa: E402
     build_sarif_document,
-    sarif_rule_id,
 )
 from xoxss.reports.html import write_html_report
-from xoxss.reports.json import report_payload, write_json_report
+from xoxss.reports.json import write_json_report
 from xoxss.reports.markdown import write_markdown_report
-from xoxss.scan.reflection import ReflectionInfo, analyze_reflection, browser_prequalified
+from xoxss.scan.reflection import (
+    ReflectionInfo,
+    analyze_reflection,
+    browser_prequalified,
+    http_executable,
+)
 from xoxss.detection.matrix import (
     analyze_character_matrix,
     build_matrix_probe,
     format_matrix_summary,
 )
-from xoxss.scan.vectors import PATH_MARKER, build_path_vectors, render_path_payload
+from xoxss.scan.vectors import build_path_vectors, render_path_payload
 
 try:
     from xoxss.analysis.ai import (
@@ -204,9 +194,10 @@ except Exception:  # pragma: no cover - optional integration edge case
     AIAnalyzer = None  # type: ignore
     DEFAULT_AI_ENDPOINT = ""  # type: ignore
     DEFAULT_AI_MODEL = ""  # type: ignore
-    resolve_ai_key = lambda *args, **kwargs: ""  # type: ignore
-    resolve_ai_model = lambda *args, **kwargs: ""  # type: ignore
+    resolve_ai_key = lambda *args, **kwargs: ""  # type: ignore  # noqa: E731
+    resolve_ai_model = lambda *args, **kwargs: ""  # type: ignore  # noqa: E731
 from xoxss.core.evidence import (
+    SENSITIVE_KEY_RE,
     canonical_finding_url,
     finding_id as make_finding_id,
     finding_curl,
@@ -215,9 +206,10 @@ from xoxss.core.evidence import (
     request_to_dict,
     response_excerpt,
 )
-from xoxss.core.http import HttpEngine, HttpResponse, RateLimiter, USER_AGENT
+from xoxss.core.config import ScanConfig
+from xoxss.core.http import HttpEngine, HttpResponse, USER_AGENT
 from xoxss.core.state import StateStore
-from xoxss.cli import EXAMPLES, build_parser as _build_cli_parser
+from xoxss.cli import build_parser as _build_cli_parser
 from xoxss.analysis.mutation_probe import (
     MutationObservation,
     apply_observed_normalization,
@@ -226,14 +218,10 @@ from xoxss.analysis.mutation_probe import (
     reverse_normalization,
 )
 from xoxss.analysis.payload_grammar import assemble_variants
-from xoxss.engine.crawler import COMMON_ENDPOINTS, CrawlerMixin
+from xoxss.engine.crawler import CrawlerMixin
 from xoxss.utils.urlpolicy import (
-    DANGEROUS_PATH_WORDS,
-    SCANNABLE_EXTENSIONS,
-    SKIP_EXTENSIONS,
     looks_like_dangerous,
     looks_like_page,
-    looks_like_scan_target,
     normalize_scan_url,
 )
 
@@ -298,6 +286,12 @@ PAYLOAD_SOURCES: Tuple[str, ...] = (
 )
 MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
 MAX_REMOTE_PAYLOADS = 5000
+# Downloaded lists are cached between runs so a short-lived scan does not
+# re-fetch the same GitHub files.  The TTL keeps the corpus reasonably fresh;
+# the size cap bounds both the on-disk and in-memory footprint.
+PAYLOAD_CACHE_TTL = 24 * 60 * 60.0
+PAYLOAD_CACHE_MAX_BYTES = 2 * 1024 * 1024
+PAYLOAD_CACHE_DIRNAME = "xoxss-payload-cache"
 
 # Parameter names tried on discovered endpoints that show evidence of accepting query parameters.
 # Organised by sink category with fallback usage only after HTML/JS discovery.
@@ -1013,6 +1007,24 @@ def reflection_confidence(
             f"{info.inert_reason or info.context}.",
             "Reflection is not executable in this context",
         )
+    if not prequalified:
+        # A JSON/XML/binary document (or a dead context such as a comment or
+        # textarea) never executes markup, so surviving delimiters are a lead,
+        # not evidence of XSS.  Keeping the strict gate here is what separates
+        # a real reflection from an API echo.
+        return (
+            "low",
+            "The payload survived verbatim but the response cannot be rendered "
+            "as an executable document (context or MIME type).",
+            "Reflection is not browser-executable (context/MIME)",
+        )
+    if not http_executable(info, content_type):
+        return (
+            "low",
+            "The payload survived verbatim but the response is served as plain "
+            "text, which browsers do not parse as markup.",
+            "Reflection MIME type is not an executable document (text/plain)",
+        )
     if not requested:
         return (
             "high",
@@ -1020,19 +1032,12 @@ def reflection_confidence(
             "context; browser verification was disabled.",
             "HTTP evidence only (browser verification disabled)",
         )
-    if available and prequalified:
+    if available:
         return (
             "medium",
             "A browser was available and this candidate passed the execution "
             "gate, but the browser did not observe execution.",
             "Browser verification attempted but did not confirm execution",
-        )
-    if available:
-        return (
-            "medium",
-            "A browser was available but the candidate did not pass the "
-            "browser prequalification gate (MIME/context/static dead zone).",
-            "Browser verification did not run for this candidate",
         )
     return (
         "high",
@@ -1115,6 +1120,27 @@ class Finding:
         raw = "|".join([family, url, self.parameter, self.method, self.source, self.subkey])
         return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
 
+    def dedupe_key(self) -> str:
+        """Coarser identity used to upgrade/suppress duplicate issues.
+
+        DOM findings are the main reason this exists: a static taint flow names
+        the *source* as its parameter (``window.name``) while the runtime sink
+        names the injection vector (``query/fragment``) and carries the payload
+        in its URL.  They describe one issue on one page, so the page URL alone
+        - not the parameter, method or payload - forms the identity.  All other
+        finding families keep the precise :meth:`key`.
+        """
+        family = self.kind.split(" (")[0]
+        if family == "DOM XSS":
+            parts = urlsplit(self.url)
+            page = urlunsplit(
+                (parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", "", "")
+            )
+            return hashlib.sha1(
+                f"{family}|{page}".encode("utf-8", "replace")
+            ).hexdigest()
+        return self.key()
+
     def to_dict(self) -> Dict[str, Any]:
         result = asdict(self)
         if not result["finding_id"]:
@@ -1132,6 +1158,36 @@ class Finding:
 
 
 CONFIDENCE_LEVELS = ("confirmed", "high", "medium", "low")
+#: Higher rank wins when two findings describe the same issue.
+CONFIDENCE_RANK = {level: len(CONFIDENCE_LEVELS) - index for index, level in enumerate(CONFIDENCE_LEVELS)}
+
+
+def meets_fail_threshold(findings: Any, threshold: Optional[str]) -> bool:
+    """Return True when ``findings`` should fail the process for ``threshold``.
+
+    ``threshold`` is the value of ``--fail-on`` (``any``/``low``/...).  Mass and
+    parameter-audit modes return plain counts rather than finding objects, so
+    both shapes are accepted.
+    """
+    if not threshold:
+        return False
+    if isinstance(findings, int):
+        return findings > 0
+    items = list(findings or [])
+    if not items:
+        return False
+    if threshold == "any":
+        return True
+    floor = CONFIDENCE_RANK.get(threshold, 0)
+    for item in items:
+        confidence = (
+            item.get("confidence", "low")
+            if isinstance(item, dict)
+            else getattr(item, "confidence", "low")
+        )
+        if CONFIDENCE_RANK.get(str(confidence or "low").strip().lower(), 0) >= floor:
+            return True
+    return False
 
 
 def enforce_finding_policy(finding: Finding) -> bool:
@@ -1233,7 +1289,11 @@ class ScanStats:
     oob_registered: int = 0
     oob_hits: int = 0
     external_findings: int = 0
+    # Deprecated: candidates that never reflected are *rejections*, not proven
+    # false positives.  Kept for state/report compatibility; always 0.
     false_positives: int = 0
+    # Candidates that passed discovery but failed a reflection/execution gate.
+    rejected_candidates: int = 0
     needs_manual_test: int = 0
     rejections: Dict[str, int] = field(default_factory=dict)
     started: float = field(default_factory=time.time)
@@ -1558,6 +1618,84 @@ def payload_workdir(base_dir: Optional[str] = None) -> Path:
     return root / f"xoxss-payloads-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
+def payload_cache_path(
+    sources: Sequence[str],
+    limit: int,
+    base_dir: Optional[str] = None,
+) -> Optional[Path]:
+    """Return the cache file for a source set, or ``None`` when disabled.
+
+    ``XOXSS_PAYLOAD_CACHE_DIR`` relocates the cache (useful for CI), and
+    ``XOXSS_NO_PAYLOAD_CACHE=1`` disables it entirely.
+    """
+    if os.environ.get("XOXSS_NO_PAYLOAD_CACHE"):
+        return None
+    explicit = os.environ.get("XOXSS_PAYLOAD_CACHE_DIR")
+    if explicit:
+        root = Path(explicit)
+    else:
+        root = Path(base_dir) if base_dir else Path(
+            os.environ.get("XOXSS_TMPDIR") or tempfile.gettempdir()
+        )
+        root = root / PAYLOAD_CACHE_DIRNAME
+    key = hashlib.sha1(
+        ("\n".join(sorted(sources)) + f"|{limit}").encode("utf-8", "replace")
+    ).hexdigest()[:20]
+    return root / f"payloads-{key}.txt"
+
+
+def read_payload_cache(
+    path: Optional[Path],
+    ttl: float = PAYLOAD_CACHE_TTL,
+) -> Optional[List[str]]:
+    """Read a fresh cache entry, returning ``None`` on miss/corruption/expiry."""
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    if ttl > 0 and time.time() - stat.st_mtime > ttl:
+        return None
+    if stat.st_size <= 0 or stat.st_size > PAYLOAD_CACHE_MAX_BYTES:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    entries = []
+    for line in text.splitlines():
+        payload = line.strip()
+        if not payload or payload.startswith("#"):
+            continue
+        if len(payload) > 4096 or not _plausible_remote_payload(payload):
+            continue
+        entries.append(payload)
+        if len(entries) >= MAX_REMOTE_PAYLOADS:
+            break
+    return entries or None
+
+
+def write_payload_cache(
+    path: Optional[Path],
+    payloads: Sequence[str],
+) -> None:
+    """Atomically persist a bounded cache entry; failures are non-fatal."""
+    if path is None or not payloads:
+        return
+    body = "\n".join(payloads).encode("utf-8", "replace")[:PAYLOAD_CACHE_MAX_BYTES]
+    temporary: Optional[Path] = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
+        temporary.write_bytes(body)
+        os.replace(temporary, path)
+    except OSError:
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink()
+
+
 def download_payload_lists(
     console: Console,
     sources: Sequence[str],
@@ -1579,56 +1717,62 @@ def download_payload_lists(
         console.warn(f"Cannot create temporary payload directory {work}: {exc}")
         return [], None
 
-    console.info(f"Downloading XSS payload lists ({len(sources)} source(s)) -> {work}")
-    batches: List[List[str]] = []
-    seen: Set[str] = set()
-    for url in sources:
-        try:
-            request = urllib.request.Request(
-                url,
-                headers={"User-Agent": USER_AGENT, "Accept": "text/plain,*/*"},
-            )
-            with urllib.request.urlopen(request, timeout=25) as response:
-                raw = response.read(MAX_PAYLOAD_BYTES + 1)
-            if len(raw) > MAX_PAYLOAD_BYTES:
-                raw = raw[:MAX_PAYLOAD_BYTES]
-            text = raw.decode("utf-8", "replace")
-        except Exception as exc:
-            console.warn(f"Payload source failed ({type(exc).__name__}: {exc}): {truncate(url, 110)}")
-            continue
-
-        batch: List[str] = []
-        for raw_line in text.splitlines():
-            line = raw_line.strip()
-            if not _plausible_remote_payload(line) or line in seen:
+    cache = payload_cache_path(sources, limit, base_dir)
+    chosen = read_payload_cache(cache)
+    if chosen is not None:
+        console.info(f"Using {len(chosen)} cached XSS payload(s) from {cache}")
+    else:
+        console.info(f"Downloading XSS payload lists ({len(sources)} source(s)) -> {work}")
+        batches: List[List[str]] = []
+        seen: Set[str] = set()
+        for url in sources:
+            try:
+                request = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": USER_AGENT, "Accept": "text/plain,*/*"},
+                )
+                with urllib.request.urlopen(request, timeout=25) as response:
+                    raw = response.read(MAX_PAYLOAD_BYTES + 1)
+                if len(raw) > MAX_PAYLOAD_BYTES:
+                    raw = raw[:MAX_PAYLOAD_BYTES]
+                text = raw.decode("utf-8", "replace")
+            except Exception as exc:
+                console.warn(f"Payload source failed ({type(exc).__name__}: {exc}): {truncate(url, 110)}")
                 continue
-            seen.add(line)
-            batch.append(line)
-            if len(batch) >= limit:
+
+            batch: List[str] = []
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not _plausible_remote_payload(line) or line in seen:
+                    continue
+                seen.add(line)
+                batch.append(line)
+                if len(batch) >= limit:
+                    break
+            if batch:
+                batches.append(batch)
+                console.debug(f"{truncate(url, 100)} -> {len(batch)} candidate payload(s)")
+            else:
+                console.debug(f"No usable payloads found in {truncate(url, 110)}")
+
+        if not batches:
+            shutil.rmtree(work, ignore_errors=True)
+            console.warn("Remote payload download failed; using built-in payloads")
+            return [], None
+
+        # Round-robin across sources so every list contributes even with a small limit.
+        chosen = []
+        cursor = 0
+        while len(chosen) < limit:
+            progressed = False
+            for batch in batches:
+                if cursor < len(batch) and len(chosen) < limit:
+                    chosen.append(batch[cursor])
+                    progressed = True
+            if not progressed:
                 break
-        if batch:
-            batches.append(batch)
-            console.debug(f"{truncate(url, 100)} -> {len(batch)} candidate payload(s)")
-        else:
-            console.debug(f"No usable payloads found in {truncate(url, 110)}")
-
-    if not batches:
-        shutil.rmtree(work, ignore_errors=True)
-        console.warn("Remote payload download failed; using built-in payloads")
-        return [], None
-
-    # Round-robin across sources so every list contributes even with a small limit.
-    chosen: List[str] = []
-    cursor = 0
-    while len(chosen) < limit:
-        progressed = False
-        for batch in batches:
-            if cursor < len(batch) and len(chosen) < limit:
-                chosen.append(batch[cursor])
-                progressed = True
-        if not progressed:
-            break
-        cursor += 1
+            cursor += 1
+        write_payload_cache(cache, chosen)
 
     path = work / "payloads.txt"
     try:
@@ -1827,6 +1971,10 @@ class PayloadEngine:
                             payload = rest.strip()
                             explicit = True
                     if remote:
+                        if len(self.remote_payloads) >= MAX_REMOTE_PAYLOADS:
+                            # Hard memory cap: a malicious/growing list must not
+                            # exhaust memory (the loader runs before scanning).
+                            break
                         if not _plausible_remote_payload(payload):
                             continue
                         classified = classify_remote_payload(payload)
@@ -2189,7 +2337,7 @@ def check_vulnerable_libs(
 # Browser engine
 # --------------------------------------------------------------------------------------
 
-from xoxss.core.browser import BrowserEngine, BrowserPool, PlaywrightEngine
+from xoxss.core.browser import BrowserEngine, BrowserPool, PlaywrightEngine  # noqa: E402
 
 
 # --------------------------------------------------------------------------------------
@@ -2310,13 +2458,6 @@ class Scope:
         return True
 
 
-# Keys whose values must never appear in a shared PoC (JSON request bodies).
-SENSITIVE_KEY_RE = re.compile(
-    r"[a-z0-9_-]*(csrf|xsrf|token|session|auth|password|passwd|secret|cookie|api[._-]?key|key)[a-z0-9_-]*",
-    re.IGNORECASE,
-)
-
-
 def build_form_html_poc(point: InjectionPoint, payload: str) -> str:
     """Self-contained HTML form PoC (base64 data URL) for POST form points.
 
@@ -2406,7 +2547,16 @@ def build_poc(point: InjectionPoint, payload: str) -> Tuple[str, str]:
 
 
 class XSSScanner(CrawlerMixin):
-    def __init__(self, target: str, args: argparse.Namespace, console: Console):
+    def __init__(
+        self,
+        target: str,
+        args: Union[argparse.Namespace, ScanConfig],
+        console: Console,
+    ):
+        if isinstance(args, ScanConfig):
+            # Programmatic callers may pass a validated config; ScannerOptions
+            # are still read from a namespace so there is one source of truth.
+            args = cast(argparse.Namespace, args.to_namespace())
         if not re.match(r"^https?://", target, re.IGNORECASE):
             target = "http://" + target
         self.target = normalize_url(target)
@@ -2477,6 +2627,7 @@ class XSSScanner(CrawlerMixin):
         self.waf = WAFReport()
         self.findings: List[Finding] = []
         self._finding_keys: Set[str] = set()
+        self._finding_index: Dict[str, Finding] = {}
         self._confirmed_contexts: Set[Tuple[str, str, str]] = set()
         # Opt-in AI fallback.  The key resolution order is CLI -> env -> .env;
         # the analyzer is only constructed when a key is actually available.
@@ -2551,6 +2702,9 @@ class XSSScanner(CrawlerMixin):
         self.dom_clobber_findings: List[Dict] = []
         self.postmessage_findings: List[Dict] = []
         self.websocket_findings: List[Dict] = []
+        self.storage_findings: List[Dict] = []
+        self.service_worker_findings: List[Dict] = []
+        self.detected_frameworks: Set[str] = set()
         self.file_upload_findings: List[Dict] = []
         self.graphql_endpoints: List[Dict] = []
         # Adaptive rate limiting is handled above via HttpEngine.enable_smart_rate(),
@@ -2954,6 +3108,7 @@ class XSSScanner(CrawlerMixin):
                 continue
             self.findings.append(finding)
             self._finding_keys.add(finding.key())
+            self._finding_index[finding.dedupe_key()] = finding
         self.stats.findings = len(self.findings)
         if self.state.waf:
             self.waf = WAFReport(names=list(self.state.waf))
@@ -3652,6 +3807,33 @@ class XSSScanner(CrawlerMixin):
         if HAS_ADVANCED and getattr(self.args, 'proto_pollution', False):
             await self._detect_proto_pollution(url, response.text)
 
+        # Framework-specific payload augmentation: register bypass templates
+        # (with the {m} marker preserved) only for the framework actually
+        # detected in this bundle, so the corpus grows without adding noise to
+        # sites that do not use it.
+        if HAS_ADVANCED:
+            try:
+                from xoxss.analysis.framework_sinks import FrameworkSinkExploiter
+
+                exploiter = FrameworkSinkExploiter()
+                framework = exploiter.detect_framework(response.text)
+            except Exception as exc:
+                self.console.debug(f"Framework detection failed for {url}: {exc}")
+            else:
+                if framework is not None:
+                    self.detected_frameworks.add(framework.value)
+                    added = 0
+                    for bypass in exploiter.get_bypasses(framework):
+                        if "{m}" not in bypass.payload_template:
+                            continue
+                        if self.payloads._register("html", bypass.payload_template):
+                            added += 1
+                    if added:
+                        self.payloads._lazy_pool_cache.clear()
+                        self.console.debug(
+                            f"Framework {framework.value}: registered {added} bypass payload(s) from {url}"
+                        )
+
         self.stats.js_files += 1
         intel = None
         if HAS_RECON and analyze_javascript_intel is not None:
@@ -4156,7 +4338,8 @@ class XSSScanner(CrawlerMixin):
         request: Dict[str, Any] = {}
         request_builder = getattr(response, "request_dict", None)
         if callable(request_builder):
-            request = request_builder(parameter)
+            built = request_builder(parameter)
+            request = built if isinstance(built, dict) else {}
         else:
             # Test doubles and third-party response objects may not implement
             # request_dict(); keep the evidence useful without inventing headers.
@@ -4296,19 +4479,21 @@ class XSSScanner(CrawlerMixin):
             important=False,
         )
 
-    async def test_point(self, point: InjectionPoint) -> None:
-        self.stats.points += 1
-        location = f"{point.method} {point.param} @ {truncate(point.url, 110)}"
+    async def _probe_reflection(
+        self,
+        point: InjectionPoint,
+        token: str,
+        location: str,
+    ) -> Optional[Tuple[ReflectionInfo, str, HttpResponse]]:
+        """Send the initial probe and classify the reflection.
 
-        # Out-of-band injection does not need a reflection: the payload may be
-        # stored and executed later by an admin/back-office view.
-        await self.inject_blind(point)
-
-        token = unique_token()
-        
-        # Use per-character probing if enabled
-        if HAS_ADVANCED and getattr(self.args, 'per_char_probe', False):
+        Returns ``(info, payload, response)``, or ``None`` when no analyzable
+        response was received.  With ``--per-char-probe`` the context detected
+        by the character probe refines the reflection context.
+        """
+        if HAS_ADVANCED and getattr(self.args, "per_char_probe", False):
             from xoxss.analysis.per_char import PerCharProbe, ProbeContext
+
             probe_engine = PerCharProbe()
             probe = probe_engine.generate_probe_string(token)
             response = await self.send_point(point, probe)
@@ -4318,15 +4503,15 @@ class XSSScanner(CrawlerMixin):
                     if response is not None and response.error
                     else "empty response body"
                 )
-                self.console.debug(f"Rejected candidate (no analyzable response: {reason}): {location}")
-                return
-            
-            # Analyze with per-character probe
+                self.console.debug(
+                    f"Rejected candidate (no analyzable response: {reason}): {location}"
+                )
+                return None
+
             probe_analysis = probe_engine.analyze_probe(response.text, token)
             info = analyze_reflection(
                 response.text, token, probe, response.header("content-type", "")
             )
-            # Use context from per-char analysis if available
             if probe_analysis.detected_context != ProbeContext.UNKNOWN:
                 info.context = probe_analysis.detected_context.value
         else:
@@ -4338,17 +4523,92 @@ class XSSScanner(CrawlerMixin):
                     if response is not None and response.error
                     else "empty response body"
                 )
-                self.console.debug(f"Rejected candidate (no analyzable response: {reason}): {location}")
-                return
+                self.console.debug(
+                    f"Rejected candidate (no analyzable response: {reason}): {location}"
+                )
+                return None
 
             info = analyze_reflection(
                 response.text, token, probe, response.header("content-type", "")
             )
-        
+        return info, probe, response
+
+    async def _try_polyglots(
+        self,
+        point: InjectionPoint,
+        token: str,
+        info: ReflectionInfo,
+        dedup_key: Tuple[str, str, str],
+    ) -> bool:
+        """Run polyglot candidates when enabled.
+
+        Returns ``True`` when the point was handled (a finding was added, the
+        scan stopped, or polyglots were generated but none confirmed) so the
+        caller must not continue with the standard corpus.
+        """
+        if not (HAS_ADVANCED and getattr(self.args, "polyglot", False)):
+            return False
+        if self._ai_only:
+            return False
+        from xoxss.analysis.polyglot import (
+            PolyglotContext,
+            PolyglotGenerator as PolyglotPayloadGenerator,
+        )
+
+        polyglot_gen = PolyglotPayloadGenerator()
+        target_context = next(
+            (context for context in PolyglotContext if context.value == info.context),
+            PolyglotContext.HTML,
+        )
+        polyglots = polyglot_gen.generate_polyglots(
+            token, [target_context], self.args.max_payloads
+        )
+        for polyglot in polyglots:
+            if self._stop.is_set():
+                return True
+            payload = self.transform_payload(polyglot.payload)
+            result = await self.send_point(point, payload)
+            if result is None or result.error or not result.text:
+                continue
+            self.stats.payloads += 1
+            polyglot_info = analyze_reflection(
+                result.text, token, payload, result.header("content-type", "")
+            )
+            if self.pool is not None and self.pool.engines and self.args.confirm != "http":
+                finding = await self.confirm_in_browser(
+                    point,
+                    payload,
+                    token,
+                    polyglot_info,
+                    result.header("content-type", ""),
+                    response=result,
+                )
+                if finding:
+                    if dedup_key not in self._confirmed_contexts:
+                        self._confirmed_contexts.add(dedup_key)
+                        self.add_finding(finding)
+                    return True
+        # No polyglots for this context: fall through to the standard loop so
+        # the injection point is never left untested.
+        return bool(polyglots)
+
+    async def test_point(self, point: InjectionPoint) -> None:
+        self.stats.points += 1
+        location = f"{point.method} {point.param} @ {truncate(point.url, 110)}"
+
+        # Out-of-band injection does not need a reflection: the payload may be
+        # stored and executed later by an admin/back-office view.
+        await self.inject_blind(point)
+
+        token = unique_token()
+        probed = await self._probe_reflection(point, token, location)
+        if probed is None:
+            return
+        info, probe, response = probed
         if not info.reflected:
             # Gate (a): Reflection check failed on initial probe - drop silently
             self.console.debug(f"Rejected candidate (marker not reflected): {location}")
-            self.stats.false_positives += 1
+            self.stats.rejected_candidates += 1
             self.stats.rejections["marker not reflected in response body or live DOM"] = (
                 self.stats.rejections.get("marker not reflected in response body or live DOM", 0) + 1
             )
@@ -4363,6 +4623,13 @@ class XSSScanner(CrawlerMixin):
                 f"Context {info.context} already confirmed on {canonical_ep} ({point.param}); skipping"
             )
             return
+
+        # Strongest executable reflection that no browser confirmed.  Tracked
+        # so HTTP-only evidence can still be reported instead of being thrown
+        # away when execution verification is unavailable.
+        best_unconfirmed: Optional[
+            Tuple[str, str, ReflectionInfo, str, Optional[HttpResponse]]
+        ] = None
 
         # Optional special-character matrix: one extra probe maps which
         # delimiters survive at this point.  The result is attached to every
@@ -4393,48 +4660,8 @@ class XSSScanner(CrawlerMixin):
         self.console.debug(f"Reflected ({info.detail}): {location}")
 
         # Use polyglot payloads if enabled (skipped in AI-only mode).
-        if HAS_ADVANCED and getattr(self.args, 'polyglot', False) and not self._ai_only:
-            from xoxss.analysis.polyglot import (
-                PolyglotContext,
-                PolyglotGenerator as PolyglotPayloadGenerator,
-            )
-            polyglot_gen = PolyglotPayloadGenerator()
-            target_context = next(
-                (context for context in PolyglotContext if context.value == info.context),
-                PolyglotContext.HTML,
-            )
-            polyglots = polyglot_gen.generate_polyglots(
-                token, [target_context], self.args.max_payloads
-            )
-            for polyglot in polyglots:
-                if self._stop.is_set():
-                    return
-                payload = self.transform_payload(polyglot.payload)
-                result = await self.send_point(point, payload)
-                if result is None or result.error or not result.text:
-                    continue
-                self.stats.payloads += 1
-                polyglot_info = analyze_reflection(
-                    result.text, token, payload, result.header("content-type", "")
-                )
-                # Confirm execution with the browser when one is available
-                if self.pool is not None and self.pool.engines and self.args.confirm != "http":
-                    finding = await self.confirm_in_browser(
-                        point, payload, token, polyglot_info,
-                        result.header("content-type", ""),
-                        response=result,
-                    )
-                    if finding:
-                        if dedup_key not in self._confirmed_contexts:
-                            self._confirmed_contexts.add(dedup_key)
-                            self.add_finding(finding)
-                        return
-                # If execution not confirmed in browser, continue testing candidates
-                continue
-            if polyglots:
-                return
-            # No polyglots for this context: fall through to the standard loop
-            # so the injection point is never left untested.
+        if await self._try_polyglots(point, token, info, dedup_key):
+            return
 
         # Standard payload testing
         templates = (
@@ -4482,115 +4709,24 @@ class XSSScanner(CrawlerMixin):
                 )
             if not payload_info.reflected:
                 continue
+            if payload_info.executable and best_unconfirmed is None:
+                best_unconfirmed = (
+                    payload,
+                    payload_token,
+                    payload_info,
+                    result.header("content-type", ""),
+                    result,
+                )
 
-            if point.method.upper() == "POST" and self.args.stored and point.key() not in self._stored_checked:
-                self._stored_checked.add(point.key())
-                stored_page = await self.check_stored(point, payload_token, payload)
-                if stored_page:
-                    _, stored_poc_command = self.poc_for_point(point, payload)
-                    stored_response = getattr(self, "_stored_hit_response", None)
-                    stored_info = getattr(self, "_stored_hit_info", None)
-                    evidence_fields = self.evidence_from_response(
-                        result, payload_token, point.param
-                    )
-                    if stored_response is not None:
-                        evidence_fields["response_status"] = int(stored_response.status or 0)
-                        evidence_fields["response_excerpt"] = response_excerpt(
-                            stored_response.text, payload_token
-                        )
-
-                    # Execution verification in browser for stored XSS:
-                    # Never report as high/confirmed without verifying execution in a browser.
-                    stored_executed = False
-                    stored_screenshot = ""
-                    stored_evidence = f"payload persisted and re-rendered on {stored_page}"
-                    stored_dialog_text = ""
-
-                    if self.pool is not None and self.pool.engines and self.args.confirm != "http":
-                        try:
-                            async with self.pool.borrow() as browser:
-                                self.stats.browser_checks += 1
-                                await browser.navigate(stored_page)
-                                deadline = time.monotonic() + 3.0
-                                while time.monotonic() < deadline:
-                                    browser_data = await browser.extract()
-                                    raw_dialogs = [
-                                        str(d) for d in (browser_data.get("dialogs", []) + browser_data.get("alerts", []))
-                                        if d is not None
-                                    ]
-                                    for d in raw_dialogs:
-                                        if payload_token in d:
-                                            stored_dialog_text = d
-                                            break
-                                    hit = BrowserEngine._match(browser_data, payload_token)
-                                    if (hit and hit.get("executed") == "yes") or stored_dialog_text:
-                                        stored_executed = True
-                                        stored_evidence = hit.get("evidence", "") if hit else f"dialog: {stored_dialog_text}"
-                                        break
-                                    await asyncio.sleep(0.25)
-
-                                if stored_executed:
-                                    target_path = self.screenshot_dir / f"stored-{payload_token}.png"
-                                    stored_screenshot = await browser.screenshot(str(target_path))
-                        except Exception as exc:
-                            self.console.debug(f"Stored XSS browser validation error: {exc}")
-
-                    if stored_executed:
-                        self.add_finding(
-                            Finding(
-                                kind="Stored XSS (confirmed)",
-                                url=stored_page,
-                                parameter=point.param,
-                                method="POST",
-                                payload=payload,
-                                evidence=stored_evidence,
-                                confidence="confirmed",
-                                confidence_rationale=(
-                                    "Persistence verified and JavaScript execution confirmed in browser: "
-                                    "marker dialog/sink observed."
-                                ),
-                                context=stored_info.context if stored_info else payload_info.context,
-                                detail="Persistence and execution confirmed in headless browser",
-                                screenshot=stored_screenshot,
-                                poc_url=stored_page,
-                                poc_command=stored_poc_command,
-                                poc_html=build_form_html_poc(point, payload),
-                                char_matrix=dict(point.extra.get("char_matrix") or {}),
-                                source="stored",
-                                **evidence_fields,
-                            )
-                        )
-                        return
-                    elif getattr(self.args, "report_reflections", False):
-                        # Surface only as low-confidence lead if operator explicitly opted in
-                        self.add_finding(
-                            Finding(
-                                kind="Stored XSS (unconfirmed persistence)",
-                                url=stored_page,
-                                parameter=point.param,
-                                method="POST",
-                                payload=payload,
-                                evidence=f"payload persisted in executable context on {stored_page} (execution not observed)",
-                                confidence="low",
-                                confidence_rationale=(
-                                    "Persistence verified over HTTP in executable HTML context, "
-                                    "but browser execution was not observed."
-                                ),
-                                context=stored_info.context if stored_info else payload_info.context,
-                                detail="Persistence verified over HTTP; execution not confirmed in browser",
-                                poc_url=stored_page,
-                                poc_command=stored_poc_command,
-                                poc_html=build_form_html_poc(point, payload),
-                                char_matrix=dict(point.extra.get("char_matrix") or {}),
-                                source="stored",
-                                **evidence_fields,
-                            )
-                        )
-                        return
-                    else:
-                        self.console.debug(
-                            f"Stored candidate persisted on {stored_page} but execution was not observed in browser; dropped false positive."
-                        )
+            if (
+                point.method.upper() == "POST"
+                and self.args.stored
+                and point.key() not in self._stored_checked
+            ):
+                if await self._test_stored_candidate(
+                    point, payload, payload_token, result, payload_info
+                ):
+                    return
 
             content_type = result.header("content-type", "")
             if not payload_info.executable and not self.args.report_reflections:
@@ -4621,11 +4757,33 @@ class XSSScanner(CrawlerMixin):
             # Unconfirmed candidate: do not mark confirmed, continue trying remaining templates
             continue
 
+        # -- HTTP-only evidence --------------------------------------------------
+        # Report the strongest executable reflection that the browser did not
+        # confirm.  `high` evidence (browser requested but unavailable, or HTTP
+        # verification explicitly selected) is reported by default; inert
+        # reflections and browser-attempted-but-unconfirmed candidates stay
+        # opt-in via --report-reflections.  This runs *before* the AI fallback's
+        # early returns so an unavailable AI service can never hide it.
+        def report_lead() -> None:
+            candidate = best_unconfirmed
+            if candidate is None and getattr(self.args, "report_reflections", False) and info.reflected:
+                # The probe proves delimiter survival but is not itself an
+                # exploit; surface it only as an explicitly requested lead.
+                candidate = (
+                    probe,
+                    token,
+                    info,
+                    response.header("content-type", "") if response else "",
+                    response,
+                )
+            self._report_reflection_lead(point, candidate)
+
         # -- AI fallback ---------------------------------------------------------
         # Reached only when the deterministic corpus produced no finding.  AI
         # output is a candidate: it must still reflect with surviving delimiters
         # and, when a browser is available, execute in the instrumented sink.
         if self.ai is None or not self.ai.available():
+            report_lead()
             return
         ai_payloads = await self.ai.generate_payloads(
             endpoint=point.url,
@@ -4638,6 +4796,7 @@ class XSSScanner(CrawlerMixin):
             limit=max(1, min(8, int(getattr(self.args, "max_payloads", 20) or 20))),
         )
         if not ai_payloads:
+            report_lead()
             return
         self.console.info(
             f"AI fallback produced {len(ai_payloads)} candidate(s) for {location}",
@@ -4685,36 +4844,68 @@ class XSSScanner(CrawlerMixin):
                 )
                 continue
 
-        # Gate: Only report unconfirmed reflections if operator explicitly requested --report-reflections
-        if getattr(self.args, "report_reflections", False) and info.reflected and info.executable:
-            requested, available = self._browser_state()
-            confidence, rationale, detail = reflection_confidence(
-                info,
-                requested=requested,
-                available=available,
-                content_type=response.header("content-type", "") if response else "",
+        # No deterministic or AI candidate executed: emit the best HTTP-only lead.
+        report_lead()
+
+    def _report_reflection_lead(
+        self,
+        point: InjectionPoint,
+        candidate: Optional[
+            Tuple[str, str, ReflectionInfo, str, Optional[HttpResponse]]
+        ],
+    ) -> bool:
+        """Report an unconfirmed reflection only when its evidence justifies it.
+
+        ``high`` confidence (executable delimiters, browser verification not
+        available/requested) is reported by default because it is the strongest
+        evidence obtainable without execution.  Everything weaker - inert
+        reflections, and candidates a browser actively failed to execute - is a
+        lead and requires the explicit ``--report-reflections`` opt-in.
+        """
+        if candidate is None:
+            return False
+        payload, token, info, content_type, response = candidate
+        requested, available = self._browser_state()
+        confidence, rationale, detail = reflection_confidence(
+            info, requested=requested, available=available, content_type=content_type
+        )
+        opt_in = bool(getattr(self.args, "report_reflections", False))
+        if confidence != "high" and not opt_in:
+            self.console.debug(
+                f"Suppressed unconfirmed reflection ({confidence}) on "
+                f"{truncate(point.url, 100)}; pass --report-reflections to include leads"
             )
-            poc_url, poc_command = self.poc_for_point(point, probe)
-            self.add_finding(
-                Finding(
-                    kind="Reflected XSS (unconfirmed reflection)",
-                    url=point.url,
-                    parameter=point.param,
-                    method=point.method.upper(),
-                    payload=probe,
-                    evidence=f"marker reflected but execution not confirmed ({info.detail})",
-                    confidence="low",
-                    confidence_rationale=(
-                        "Informational: unconfirmed reflection reported per --report-reflections; " + rationale
-                    ),
-                    context=info.context,
-                    detail=detail,
-                    poc_url=poc_url,
-                    poc_command=poc_command,
-                    source=point.source,
-                    param_source=getattr(point, "param_source", "discovered"),
-                )
+            return False
+        if not info.executable and not opt_in:
+            return False
+        kind = (
+            "Reflected XSS (HTTP evidence)"
+            if confidence == "high"
+            else "Reflected XSS (unconfirmed reflection)"
+        )
+        poc_url, poc_command = self.poc_for_point(point, payload)
+        return self.add_finding(
+            Finding(
+                kind=kind,
+                url=point.url,
+                parameter=point.param,
+                method=point.method.upper(),
+                payload=payload,
+                evidence=(
+                    "marker reflected with surviving delimiters "
+                    f"({info.detail})"
+                ),
+                confidence=confidence,
+                confidence_rationale=rationale,
+                context=info.context,
+                detail=detail,
+                poc_url=poc_url,
+                poc_command=poc_command,
+                source=point.source,
+                param_source=getattr(point, "param_source", "discovered"),
+                **self.evidence_from_response(response, token, point.param),
             )
+        )
 
     @staticmethod
     def _mutation_key(url: str) -> str:
@@ -4768,9 +4959,11 @@ class XSSScanner(CrawlerMixin):
             self.state.extra["transform_observations"] = self.mutation_findings[:1000]
 
     def _record_validation_rejection(self, val: ValidationResult) -> None:
-        """Record rejection reasons and false positive classifications for stats."""
+        """Record rejection reasons and non-fatal classifications for stats."""
         if val.classification == FALSE_POSITIVE:
-            self.stats.false_positives += 1
+            # A candidate rejected by the execution gate is not a "false
+            # positive finding" (nothing was reported); it is a rejected lead.
+            self.stats.rejected_candidates += 1
         elif val.classification == NEEDS_MANUAL_TEST:
             self.stats.needs_manual_test += 1
         if val.reason:
@@ -4986,10 +5179,42 @@ class XSSScanner(CrawlerMixin):
                 f"Dropped malformed finding: kind={finding.kind!r} url={finding.url!r}"
             )
             return False
+        dedupe = finding.dedupe_key()
+        existing = self._finding_index.get(dedupe)
+        if existing is not None:
+            # Same issue, different evidence.  Keep the stronger claim: a
+            # confirmed runtime sink must replace an earlier static taint-flow
+            # lead rather than being suppressed by it (and vice versa, a weak
+            # duplicate must never downgrade a confirmed finding).
+            if CONFIDENCE_RANK.get(finding.confidence, 0) <= CONFIDENCE_RANK.get(
+                existing.confidence, 0
+            ):
+                self.console.debug(
+                    f"Suppressed duplicate finding ({finding.confidence} <= "
+                    f"{existing.confidence}): {finding.kind} on {truncate(finding.url, 100)}"
+                )
+                return False
+            try:
+                index = self.findings.index(existing)
+            except ValueError:
+                index = -1
+            if index >= 0:
+                self.findings[index] = finding
+            else:
+                self.findings.append(finding)
+            self._finding_index[dedupe] = finding
+            self._finding_keys.add(finding.key())
+            self.stats.findings = len(self.findings)
+            self.state.replace_finding(existing, finding)
+            self.state.save(force=True)
+            self.console.event("finding", target=self.target, finding=finding.to_dict())
+            self.console.finding(finding)
+            return True
         key = finding.key()
         if key in self._finding_keys:
             return False
         self._finding_keys.add(key)
+        self._finding_index[dedupe] = finding
         self.findings.append(finding)
         self.stats.findings = len(self.findings)
         self.state.add_finding(finding)
@@ -5308,6 +5533,136 @@ class XSSScanner(CrawlerMixin):
             vectors.append((urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, payload)), token, kind))
         return vectors[:limit]
 
+    def _static_enhanced_candidates(
+        self, url: str, scripts: Sequence[DomScript]
+    ) -> List[Dict[str, str]]:
+        """Static source/sink hints from the enhanced and storage analyzers.
+
+        These are hints that widen the runtime verification trigger; they are
+        never reported as findings on their own.  Failures are non-fatal
+        because both analyzers are optional enhancements.
+        """
+        candidates: List[Dict[str, str]] = []
+        seen: Set[Tuple[str, str, str]] = set()
+
+        def add(source: str, sink: str, script: str, snippet: str) -> None:
+            key = (source, sink, script)
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(
+                {"source": source, "sink": sink, "script": script, "snippet": snippet[:240]}
+            )
+
+        try:
+            from xoxss.analysis.enhanced_sinks import EnhancedSinkTracker
+
+            tracker = EnhancedSinkTracker()
+        except Exception as exc:  # pragma: no cover - optional module
+            self.console.debug(f"Enhanced sink analysis unavailable: {exc}")
+            tracker = None
+        if tracker is not None:
+            for script in scripts:
+                if not script.content:
+                    continue
+                try:
+                    matches = tracker.analyze(script.content, "application/javascript")
+                except Exception as exc:
+                    self.console.debug(f"Enhanced sink analysis failed for {url}: {exc}")
+                    continue
+                for match in matches:
+                    if tracker.get_sink_importance(match.sink) < 0.7:
+                        continue
+                    add(
+                        match.sink.value,
+                        match.sink.value,
+                        script.url or url,
+                        match.code.strip(),
+                    )
+
+        try:
+            from xoxss.analysis.storage_xss import StorageXSSAnalyzer
+
+            analyzer = StorageXSSAnalyzer()
+        except Exception as exc:  # pragma: no cover - optional module
+            self.console.debug(f"Storage XSS analysis unavailable: {exc}")
+            analyzer = None
+        if analyzer is not None:
+            for script in scripts:
+                if not script.content:
+                    continue
+                try:
+                    vectors = analyzer.analyze(script.content)
+                except Exception as exc:
+                    self.console.debug(f"Storage XSS analysis failed for {url}: {exc}")
+                    continue
+                for vector in vectors:
+                    finding = {
+                        "url": script.url or url,
+                        "storage": vector.storage_type.value,
+                        "key": vector.key,
+                        "persistent": vector.persistent,
+                        "description": vector.description,
+                    }
+                    if finding not in self.storage_findings:
+                        self.storage_findings.append(finding)
+                    add(
+                        vector.storage_type.value,
+                        "storage-sink",
+                        script.url or url,
+                        vector.description,
+                    )
+        return candidates
+
+    async def _analyze_service_workers(
+        self, url: str, scripts: Sequence[DomScript]
+    ) -> None:
+        """Fetch and statically analyse service workers registered by the page."""
+        sw_urls: List[str] = []
+        pattern = re.compile(
+            r"serviceWorker\s*\.\s*register\s*\(\s*['\"]([^'\"]+)['\"]"
+        )
+        for script in scripts:
+            if not script.content or len(sw_urls) >= 3:
+                continue
+            for match in pattern.finditer(script.content):
+                sw_url = urljoin(url, match.group(1))
+                if sw_url not in sw_urls:
+                    sw_urls.append(sw_url)
+        if not sw_urls:
+            return
+        try:
+            from xoxss.analysis.service_worker import ServiceWorkerAnalyzer
+
+            analyzer = ServiceWorkerAnalyzer()
+        except Exception as exc:  # pragma: no cover - optional module
+            self.console.debug(f"Service worker analysis unavailable: {exc}")
+            return
+        for sw_url in sw_urls[:3]:
+            if not self.scope.in_scope(sw_url):
+                continue
+            response = await self.http.get(sw_url, cache=True)
+            if response.error or not response.text:
+                continue
+            try:
+                vulnerabilities = analyzer.analyze(response.text, sw_url)
+            except Exception as exc:
+                self.console.debug(f"Service worker analysis failed for {sw_url}: {exc}")
+                continue
+            for vulnerability in vulnerabilities:
+                item = {
+                    "sw_url": sw_url,
+                    "page": url,
+                    "event": vulnerability.event_type.value,
+                    "description": vulnerability.description,
+                    "severity": vulnerability.severity,
+                }
+                if item not in self.service_worker_findings:
+                    self.service_worker_findings.append(item)
+                    self.console.debug(
+                        f"Service worker sink ({vulnerability.event_type.value}) at {sw_url}"
+                    )
+
     async def test_dom(self, url: str) -> None:
         response = await self.http.get(url, cache=True)
         if response.error or not response.text or not HAS_BS4:
@@ -5339,6 +5694,11 @@ class XSSScanner(CrawlerMixin):
                     self._record_taint_flow(script.url or url, flow)
 
         candidates = static_dom_candidates(scripts)
+        # Enhanced coverage: sinks the basic DOM map does not model (postMessage,
+        # Web Speech, WebGL, SVG, CSS, worker), storage reads, and service
+        # workers registered by the page.
+        candidates.extend(self._static_enhanced_candidates(url, scripts))
+        await self._analyze_service_workers(url, scripts)
         inline_sink = any(has_dom_sink(script.content) for script in scripts if script.content)
 
         # --postmessage / --websocket: analyze inline scripts for sink handlers
@@ -5529,6 +5889,11 @@ class XSSScanner(CrawlerMixin):
                     await browser.evaluate(seed_script, runtime_value)
                     if reload_page:
                         await browser.navigate(url)
+                    else:
+                        # postMessage delivery is asynchronous: yield to the
+                        # event loop so the page's message handler runs before
+                        # the sink is inspected.
+                        await asyncio.sleep(0.3)
                     hit = await browser.check_token(marker, timeout=1.0)
                     if not hit:
                         continue
@@ -5779,9 +6144,25 @@ class XSSScanner(CrawlerMixin):
             introspection_open = analyzer.check_introspection(body)
         except Exception:
             pass
+        # Generate ready-to-run XSS test operations for the operator.  They are
+        # intentionally not sent automatically: GraphQL mutations can change
+        # state, so execution stays an explicit manual step.
+        xss_queries: List[str] = []
+        try:
+            from xoxss.analysis.graphql_xss import GraphQLAnalyzer as GraphQLXSSAnalyzer
+
+            xss_analyzer = GraphQLXSSAnalyzer()
+            marker = unique_token("g", 8)
+            xss_queries = [
+                xss_analyzer.test_inline_fragment_xss(marker),
+                xss_analyzer.test_subscription_xss(marker),
+            ]
+        except Exception as exc:
+            self.console.debug(f"GraphQL XSS vector generation failed for {url}: {exc}")
         self.graphql_endpoints.append({
             'url': url,
             'introspection': introspection_open,
+            'xss_test_queries': xss_queries,
         })
         if introspection_open:
             self.console.warn(f"GraphQL introspection enabled: {url}")
@@ -5874,6 +6255,142 @@ class XSSScanner(CrawlerMixin):
             )
     
     # -- stored XSS -------------------------------------------------------------------
+    async def _test_stored_candidate(
+        self,
+        point: InjectionPoint,
+        payload: str,
+        payload_token: str,
+        result: HttpResponse,
+        payload_info: ReflectionInfo,
+    ) -> bool:
+        """Persist one payload and verify it executes on a re-rendered page.
+
+        Adds the finding (confirmed when execution is observed, an opt-in low
+        lead otherwise) and returns ``True`` when the caller should stop
+        testing this point.  A persisted-but-inert payload returns ``False``
+        so the normal reflection loop continues.
+        """
+        self._stored_checked.add(point.key())
+        stored_page = await self.check_stored(point, payload_token, payload)
+        if not stored_page:
+            return False
+
+        _, stored_poc_command = self.poc_for_point(point, payload)
+        stored_response = getattr(self, "_stored_hit_response", None)
+        stored_info = getattr(self, "_stored_hit_info", None)
+        evidence_fields = self.evidence_from_response(result, payload_token, point.param)
+        if stored_response is not None:
+            evidence_fields["response_status"] = int(stored_response.status or 0)
+            evidence_fields["response_excerpt"] = response_excerpt(
+                stored_response.text, payload_token
+            )
+
+        # Execution verification in browser for stored XSS: never report as
+        # high/confirmed without verifying execution in a browser.
+        stored_executed = False
+        stored_screenshot = ""
+        stored_evidence = f"payload persisted and re-rendered on {stored_page}"
+        stored_dialog_text = ""
+
+        if self.pool is not None and self.pool.engines and self.args.confirm != "http":
+            try:
+                async with self.pool.borrow() as browser:
+                    self.stats.browser_checks += 1
+                    await browser.navigate(stored_page)
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
+                        browser_data = await browser.extract()
+                        raw_dialogs = [
+                            str(d)
+                            for d in (
+                                browser_data.get("dialogs", [])
+                                + browser_data.get("alerts", [])
+                            )
+                            if d is not None
+                        ]
+                        for dialog in raw_dialogs:
+                            if payload_token in dialog:
+                                stored_dialog_text = dialog
+                                break
+                        hit = BrowserEngine._match(browser_data, payload_token)
+                        if (hit and hit.get("executed") == "yes") or stored_dialog_text:
+                            stored_executed = True
+                            stored_evidence = (
+                                hit.get("evidence", "")
+                                if hit
+                                else f"dialog: {stored_dialog_text}"
+                            )
+                            break
+                        await asyncio.sleep(0.25)
+
+                    if stored_executed:
+                        target_path = self.screenshot_dir / f"stored-{payload_token}.png"
+                        stored_screenshot = await browser.screenshot(str(target_path))
+            except Exception as exc:
+                self.console.debug(f"Stored XSS browser validation error: {exc}")
+
+        if stored_executed:
+            self.add_finding(
+                Finding(
+                    kind="Stored XSS (confirmed)",
+                    url=stored_page,
+                    parameter=point.param,
+                    method="POST",
+                    payload=payload,
+                    evidence=stored_evidence,
+                    confidence="confirmed",
+                    confidence_rationale=(
+                        "Persistence verified and JavaScript execution confirmed in browser: "
+                        "marker dialog/sink observed."
+                    ),
+                    context=stored_info.context if stored_info else payload_info.context,
+                    detail="Persistence and execution confirmed in headless browser",
+                    screenshot=stored_screenshot,
+                    poc_url=stored_page,
+                    poc_command=stored_poc_command,
+                    poc_html=build_form_html_poc(point, payload),
+                    char_matrix=dict(point.extra.get("char_matrix") or {}),
+                    source="stored",
+                    **evidence_fields,
+                )
+            )
+            return True
+        if getattr(self.args, "report_reflections", False):
+            # Surface only as a low-confidence lead when explicitly requested.
+            self.add_finding(
+                Finding(
+                    kind="Stored XSS (unconfirmed persistence)",
+                    url=stored_page,
+                    parameter=point.param,
+                    method="POST",
+                    payload=payload,
+                    evidence=(
+                        f"payload persisted in executable context on {stored_page} "
+                        "(execution not observed)"
+                    ),
+                    confidence="low",
+                    confidence_rationale=(
+                        "Persistence verified over HTTP in executable HTML context, "
+                        "but browser execution was not observed."
+                    ),
+                    context=stored_info.context if stored_info else payload_info.context,
+                    detail="Persistence verified over HTTP; execution not confirmed in browser",
+                    poc_url=stored_page,
+                    poc_command=stored_poc_command,
+                    poc_html=build_form_html_poc(point, payload),
+                    char_matrix=dict(point.extra.get("char_matrix") or {}),
+                    source="stored",
+                    **evidence_fields,
+                )
+            )
+            return True
+
+        self.console.debug(
+            f"Stored candidate persisted on {stored_page} but execution was not "
+            "observed in browser; dropped false positive."
+        )
+        return False
+
     async def check_stored(self, point: InjectionPoint, token: str, payload: str) -> Optional[str]:
         if not self.args.stored:
             return None
@@ -6037,6 +6554,9 @@ class XSSScanner(CrawlerMixin):
             ("DOM clobbering", str(len(self.dom_clobber_findings))),
             ("postMessage sinks", str(len(self.postmessage_findings))),
             ("WebSocket sinks", str(len(self.websocket_findings))),
+            ("Storage sinks", str(len(self.storage_findings))),
+            ("Service workers", str(len(self.service_worker_findings))),
+            ("Frameworks", ", ".join(sorted(self.detected_frameworks)) or "none"),
             ("File upload forms", str(len(self.file_upload_findings))),
             ("GraphQL endpoints", str(len(self.graphql_endpoints))),
             ("State file", str(self.state.path) if self.state.enabled else "disabled"),
@@ -6603,7 +7123,12 @@ def run_doctor(console: Console, args: argparse.Namespace) -> int:
             try:
                 import selenium  # noqa: F401
             except Exception:
-                report("fail", "browser", f"{backend} needs selenium: pip install selenium")
+                report(
+                    "warn",
+                    "browser",
+                    f"{backend} needs selenium (pip install selenium); "
+                    "or use --browser playwright",
+                )
             else:
                 report("ok", "browser", f"selenium/{backend}")
 
@@ -6827,10 +7352,14 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
                 response = await http.get(probe_url, cache=False)
                 if response.error or not response.text:
                     continue
+                content_type = response.header("content-type", "")
                 info = analyze_reflection(
-                    response.text, token, payload, response.header("content-type", "")
+                    response.text, token, payload, content_type
                 )
-                if not info.reflected or not info.executable:
+                if not http_executable(info, content_type):
+                    # Mass mode never launches a browser, so a candidate that
+                    # cannot execute as a document (JSON, text/plain, dead zone)
+                    # would be an inflated find.
                     continue
                 finding = Finding(
                     kind="Reflected XSS (HTTP evidence)",
@@ -7303,7 +7832,8 @@ def _replay_request_args(
     item: Dict[str, Any],
 ) -> Tuple[str, str, Dict[str, str], str]:
     """Recover ``(method, url, headers, body)`` from a report finding."""
-    request = item.get("request") if isinstance(item.get("request"), dict) else {}
+    request_raw = item.get("request")
+    request: Dict[str, Any] = request_raw if isinstance(request_raw, dict) else {}
     url = str(request.get("url") or "")
     method = str(request.get("method") or item.get("method") or "GET").upper()
     headers = {
@@ -7548,6 +8078,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _ui.disable()
     parser = build_parser()
     args = parser.parse_args(argv)
+    # ``--fail-on-findings`` predates ``--fail-on`` and is its "any" shorthand.
+    if not getattr(args, "fail_on", None):
+        args.fail_on = "any" if getattr(args, "fail_on_findings", False) else None
     explicit_flags = {token.split("=", 1)[0] for token in raw_args if token.startswith("--")}
     god_mode_requested = "--god" in explicit_flags or "--yolo" in explicit_flags
     if args.ai_only:
@@ -7734,7 +8267,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         install_uvloop()
         try:
             code, reflected = asyncio.run(run_param_audit(args, console))
-            if args.fail_on_findings and reflected:
+            if meets_fail_threshold(reflected, args.fail_on):
                 code = 2
         except KeyboardInterrupt:
             console.warn("Interrupted")
@@ -7753,7 +8286,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         install_uvloop()
         try:
             code, findings = asyncio.run(run_mass(args, console))
-            if args.fail_on_findings and findings:
+            if meets_fail_threshold(findings, args.fail_on):
                 code = 2
         except KeyboardInterrupt:
             console.warn("Interrupted")
@@ -7789,7 +8322,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         console.start_status()
         code, findings = asyncio.run(run_targets(args, console))
-        if args.fail_on_findings and findings:
+        if meets_fail_threshold(findings, args.fail_on):
             code = 2
     except KeyboardInterrupt:
         console.warn("Interrupted - checkpoints were saved")

@@ -4,7 +4,7 @@ Reflection analysis module for detecting XSS vulnerabilities.
 
 import html
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 

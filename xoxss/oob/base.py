@@ -21,8 +21,8 @@ import asyncio
 import hashlib
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Set
 
 
 _MARKER_RE = re.compile(r"(?:[?&](?:m|marker|id|token)=)([A-Za-z0-9_-]{5,80})", re.I)
@@ -32,6 +32,7 @@ class ConsoleLike(Protocol):  # pragma: no cover
     def info(self, message: str, important: bool = False) -> None: ...
     def warn(self, message: str, important: bool = True) -> None: ...
     def debug(self, message: str) -> None: ...
+    def ok(self, message: str, important: bool = False) -> None: ...
 
 
 @dataclass

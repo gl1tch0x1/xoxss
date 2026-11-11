@@ -2,7 +2,6 @@
 Helper utility functions.
 """
 
-import time
 from datetime import datetime, timezone
 
 

@@ -8,6 +8,11 @@ __version__ = "2.0.0"
 __author__ = "Security Research"
 __license__ = "MIT"
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from xoxss.scanner import main
+
 # The scanner implementation lives in xoxss.scanner (moved out of the root
 # xoxss.py so the package and the console script share one code path).
 # ``main`` is exposed lazily to keep ``import xoxss`` cheap.

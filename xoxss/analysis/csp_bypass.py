@@ -4,7 +4,7 @@ Detects and tests Content-Security-Policy bypass techniques.
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
 
@@ -212,7 +212,6 @@ class CSPBypassAutomator:
         """
         applicable = []
 
-        script_src = csp.get(CSPDirective.SCRIPT_SRC, [])
         default_src = csp.get(CSPDirective.DEFAULT_SRC, [])
 
         for bypass in self.BYPASS_TECHNIQUES:

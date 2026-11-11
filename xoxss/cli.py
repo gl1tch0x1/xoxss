@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import sys
 from typing import Collection
 
 try:  # stdlib-only UI helpers; safe to import before the package is installed
@@ -47,8 +46,6 @@ def _styled_help(text: str) -> str:
 
     out = []
     for line in text.splitlines():
-        stripped = line.strip()
-
         if line.startswith("usage:"):
             line = _ui.paint("usage:", _ui.BRAND, _ui.BOLD) + line[len("usage:"):]
         elif _HEADING_RE.match(line):
@@ -544,7 +541,19 @@ def build_parser(
     )
 
     output = parser.add_argument_group("output", "reports, logs and CI signals")
-    output.add_argument("-o", "--output", help="write the full text log to this file")
+    output.add_argument(
+        "--log-file",
+        dest="output",
+        metavar="PATH",
+        help="write the full human-readable text log to this file (reports go to --report-dir)",
+    )
+    output.add_argument(
+        "-o",
+        "--output",
+        dest="output",
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
     output.add_argument("--report", default="all", help="json, md, html, sarif, all or none (default: all)")
     output.add_argument("--report-dir", default=os.path.join(default_state_dir, "reports"), help="report directory")
     output.add_argument(
@@ -555,6 +564,17 @@ def build_parser(
     output.add_argument("--quiet", action="store_true", help="only print findings and errors")
     output.add_argument("--no-color", action="store_true", help="disable ANSI colours")
     output.add_argument("--fail-on-findings", action="store_true", help="exit with status 2 when findings exist")
+    output.add_argument(
+        "--fail-on",
+        choices=("any", "low", "medium", "high", "confirmed"),
+        default=None,
+        metavar="LEVEL",
+        help=(
+            "exit with status 2 when at least one finding meets this confidence "
+            "floor (any, low, medium, high, confirmed); --fail-on-findings is "
+            "shorthand for --fail-on any"
+        ),
+    )
     output.add_argument(
         "--replay",
         metavar="FINDING_ID",

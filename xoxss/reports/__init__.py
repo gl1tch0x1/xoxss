@@ -1,4 +1,3 @@
-"""Report writers (SARIF, etc.)."""
 """Independent renderers for XOXSS report formats."""
 
 from xoxss.reports.html import write_html_report

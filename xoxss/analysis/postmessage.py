@@ -3,7 +3,7 @@ postMessage XSS detection module.
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
 
@@ -118,7 +118,7 @@ class PostMessageAnalyzer:
                             has_origin_validation=has_origin_validation,
                             origin_pattern=origin_pattern,
                             payload=self._generate_payload(marker),
-                            description=f"postMessage handler lacks origin validation and uses dangerous sink"
+                            description="postMessage handler lacks origin validation and uses dangerous sink"
                         ))
 
         return vulnerabilities

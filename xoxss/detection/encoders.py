@@ -13,7 +13,6 @@ order, which makes it easy to describe WAF-evasion chains such as
 from __future__ import annotations
 
 import base64
-import html
 import random
 import re
 import urllib.parse

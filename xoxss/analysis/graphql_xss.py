@@ -3,9 +3,8 @@ GraphQL schema introspection and XSS testing module.
 Discovers GraphQL endpoints and tests for XSS vulnerabilities.
 """
 
-import json
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List
 from dataclasses import dataclass
 from enum import Enum
 

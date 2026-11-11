@@ -14,7 +14,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 
 class HttpLike(Protocol):  # pragma: no cover
     async def get(

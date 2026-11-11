@@ -11,10 +11,6 @@ or plain-text file (handy for a local collector or interactsh-client's output).
 
 from __future__ import annotations
 
-import asyncio
-import json
-import os
-import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -52,7 +48,7 @@ class CallbackPoller(OOBSource):
             import aiohttp
         except Exception:  # pragma: no cover
             return False
-        connector = aiohttp.TCPConnector(ssl=False if self.insecure else None)
+        connector = aiohttp.TCPConnector(ssl=not self.insecure)
         self.session = aiohttp.ClientSession(
             connector=connector,
             timeout=aiohttp.ClientTimeout(total=self.timeout),

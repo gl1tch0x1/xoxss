@@ -2,8 +2,10 @@
 Configuration management for XOXSS scanner.
 """
 
+import dataclasses
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
 from enum import Enum
 
 
@@ -198,3 +200,44 @@ class ScanConfig:
             raise ValueError("mutation_probe_limit must be between 0 and 14")
         if not 1 <= self.param_batch_size <= 100:
             raise ValueError("param_batch_size must be between 1 and 100")
+
+    def to_namespace(self) -> SimpleNamespace:
+        """Return a plain ``argparse``-compatible namespace for ``XSSScanner``.
+
+        ``XSSScanner`` reads its options from an ``argparse.Namespace``.  This
+        adapter makes :class:`ScanConfig` a supported programmatic entry point
+        without leaking enums (or dataclass proxying) into scanner internals::
+
+            from xoxss.core.config import ScanConfig
+            from xoxss.scanner import XSSScanner, Console
+
+            config = ScanConfig(target="https://example.test", crawl=True)
+            scanner = XSSScanner(config.target, config.to_namespace(), Console())
+
+        Unknown/extra fields are absent, and the scanner reads optional
+        settings through ``getattr`` defaults, exactly as it does for a
+        namespace produced by the CLI.
+        """
+        values = dataclasses.asdict(self)
+        values["browser"] = self.browser.value
+        values["confirm"] = self.confirm.value
+        return SimpleNamespace(**values)
+
+    @classmethod
+    def from_namespace(cls, namespace: Any) -> "ScanConfig":
+        """Build a validated config from an ``argparse.Namespace``-like object.
+
+        Unknown attributes are ignored so this can be used with presets that
+        add CLI-only fields (``mass``, ``doctor``, ...).  ``target`` falls back
+        to the namespace's ``target`` attribute or an empty string for callers
+        that supply the URL separately.
+        """
+        known = {field.name for field in dataclasses.fields(cls)}
+        values = {
+            name: getattr(namespace, name)
+            for name in known
+            if hasattr(namespace, name)
+        }
+        values.setdefault("target", getattr(namespace, "target", ""))
+        return cls(**values)
+

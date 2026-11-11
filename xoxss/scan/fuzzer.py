@@ -14,7 +14,7 @@ import hashlib
 import random
 import re
 import string
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 

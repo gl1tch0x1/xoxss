@@ -2,8 +2,7 @@
 CORS (Cross-Origin Resource Sharing) analysis module.
 """
 
-import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
 
@@ -176,7 +175,7 @@ class CORSAnalyzer:
 
     def generate_test_origin(self, target_origin: str) -> str:
         """Generate a test origin for CORS testing."""
-        return f"https://evil.com"
+        return "https://evil.com"
 
     def check_origin_reflection(self, response_headers: Dict[str, str], test_origin: str) -> bool:
         """

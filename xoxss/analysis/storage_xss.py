@@ -4,7 +4,7 @@ Detects XSS in localStorage, sessionStorage, IndexedDB, and WebSQL.
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List
 from dataclasses import dataclass
 from enum import Enum
 

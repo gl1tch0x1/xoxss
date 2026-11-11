@@ -3,7 +3,7 @@ Polyglot payload generator for multi-context XSS detection.
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
@@ -297,7 +297,7 @@ class PolyglotGenerator:
         self,
         contexts: List[PolyglotContext],
         use_polyglots: bool = True
-    ) -> Dict[str, int]:
+    ) -> Dict[str, float]:
         """
         Estimate the efficiency gain from using polyglots.
 

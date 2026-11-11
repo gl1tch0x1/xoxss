@@ -22,10 +22,8 @@ import json
 import os
 import random
 import secrets
-import string
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 from xoxss.oob.base import OOBHit, OOBSource, extract_marker
@@ -62,9 +60,9 @@ def random_secret() -> str:
 
 def _require_crypto() -> Tuple[Any, Any, Any, Any, Any, Any]:
     try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding, rsa
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives import hashes, serialization  # type: ignore
+        from cryptography.hazmat.primitives.asymmetric import padding, rsa  # type: ignore
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes  # type: ignore
     except Exception as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
             "interactsh requires the 'cryptography' package (pip install cryptography)"
@@ -190,7 +188,7 @@ class InteractshClient(OOBSource):
             self.console.warn(self._last_error)
             return False
 
-        connector = aiohttp.TCPConnector(ssl=False if self.config.insecure else None)
+        connector = aiohttp.TCPConnector(ssl=not self.config.insecure)
         timeout = aiohttp.ClientTimeout(total=self.config.timeout)
         self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
 

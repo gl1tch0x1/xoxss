@@ -4,7 +4,7 @@ Advanced payload generation module with comprehensive XSS payload library.
 
 import random
 import string
-from typing import Dict, List, Optional, Set
+from typing import Dict, List
 from dataclasses import dataclass
 from enum import Enum
 
@@ -194,7 +194,6 @@ class PayloadGenerator:
 
         # Generate standard payloads
         for template in templates[:count]:
-            payload = template.replace("{marker}", marker)
             payloads.append(Payload(
                 template=template,
                 context=context,
@@ -205,7 +204,6 @@ class PayloadGenerator:
         # Add polyglot payloads if requested
         if include_polyglots:
             for template in self.POLYGLOT_PAYLOADS[:3]:
-                payload = template.replace("{marker}", marker)
                 payloads.append(Payload(
                     template=template,
                     context=context,
@@ -217,7 +215,6 @@ class PayloadGenerator:
         # Add obfuscated payloads if requested
         if include_obfuscated:
             for template in self.OBFUSCATED_PAYLOADS[:2]:
-                payload = template.replace("{marker}", marker)
                 payloads.append(Payload(
                     template=template,
                     context=context,
@@ -229,7 +226,6 @@ class PayloadGenerator:
         # Add evasion payloads if requested
         if include_evasion:
             for template in self.EVASION_PAYLOADS[:3]:
-                payload = template.replace("{marker}", marker)
                 payloads.append(Payload(
                     template=template,
                     context=context,
@@ -247,7 +243,6 @@ class PayloadGenerator:
         context: PayloadContext = PayloadContext.HTML
     ) -> Payload:
         """Generate a custom payload from a template."""
-        payload = template.replace("{marker}", marker)
         return Payload(
             template=template,
             context=context,

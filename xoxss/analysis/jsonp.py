@@ -3,9 +3,8 @@ JSONP endpoint detection and analysis module.
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional
 from dataclasses import dataclass
-from enum import Enum
 
 
 @dataclass

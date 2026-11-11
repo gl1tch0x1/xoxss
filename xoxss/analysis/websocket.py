@@ -317,6 +317,8 @@ class WebSocketActiveProbe:
         return hits
 
     async def _send_and_read(self, ws: Any, payload: str, marker: str) -> Tuple[str, str, bool]:
+        if aiohttp is None:  # pragma: no cover - optional dependency
+            return "", "aiohttp is not installed", False
         try:
             await ws.send_str(payload)
         except Exception as exc:

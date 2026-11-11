@@ -21,9 +21,9 @@ except Exception:  # pragma: no cover - caller reports the missing dependency
     aiohttp = None
 
 try:  # optional HTTP/2 + TLS-fingerprint transport (--http2 / --impersonate)
-    from curl_cffi import CurlHttpVersion
-    from curl_cffi.requests import AsyncSession as CurlAsyncSession
-    from curl_cffi.requests.exceptions import ImpersonateError as CurlImpersonateError
+    from curl_cffi import CurlHttpVersion  # type: ignore
+    from curl_cffi.requests import AsyncSession as CurlAsyncSession  # type: ignore
+    from curl_cffi.requests.exceptions import ImpersonateError as CurlImpersonateError  # type: ignore
 
     CURL_AVAILABLE = True
 except Exception:  # pragma: no cover - optional dependency
@@ -329,8 +329,11 @@ class HttpEngine:
                         pass
                 if not name or not domain or any(ch in domain for ch in "/:@"):
                     continue
+                cookie_jar = getattr(self.session, "cookies", None)
+                if cookie_jar is None:
+                    continue
                 try:
-                    self.session.cookies.set(
+                    cookie_jar.set(
                         str(name), str(value or ""), domain=domain,
                         path=cookie_path, secure=bool(item.get("secure")),
                     )
@@ -655,6 +658,7 @@ class HttpEngine:
                     current_url, current_method = url, method
                     current_data, current_json = data, json_body
                     response: Any = None
+                    response_headers: Dict[str, str] = {}
                     started = time.monotonic()
                     sent_headers: Dict[str, str] = {}
                     sent_body = ""

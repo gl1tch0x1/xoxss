@@ -2,8 +2,7 @@
 Per-character probe module for precise XSS context detection.
 """
 
-import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 from dataclasses import dataclass
 from enum import Enum
 
@@ -323,7 +322,7 @@ class PerCharProbe:
     def compare_probes(
         self,
         analyses: List[ProbeAnalysis]
-    ) -> Dict[str, List[str]]:
+    ) -> Dict[str, Any]:
         """
         Compare multiple probe analyses to identify consistent patterns.
 

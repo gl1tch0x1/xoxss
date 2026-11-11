@@ -4,8 +4,8 @@ Smart rate limiting module for adaptive request management.
 
 import time
 import asyncio
-from typing import Dict, List, Optional
-from dataclasses import dataclass, field
+from typing import Dict, Optional
+from dataclasses import dataclass
 from collections import deque
 
 

@@ -15,16 +15,16 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from xoxss.analysis.ast_taint import TaintFlow
 
 try:  # pragma: no cover - exercised only when the optional dependency exists
-    import tree_sitter
-    import tree_sitter_javascript
+    from tree_sitter import Language, Parser  # type: ignore
+    import tree_sitter_javascript  # type: ignore
 
-    _LANGUAGE = tree_sitter.Language(tree_sitter_javascript.language())
-    _PARSER = tree_sitter.Parser(_LANGUAGE)
+    _LANGUAGE = Language(tree_sitter_javascript.language())
+    _PARSER = Parser(_LANGUAGE)
     AVAILABLE = True
 except Exception:  # pragma: no cover - dependency-free installations
     tree_sitter = None  # type: ignore

@@ -1,20 +1,11 @@
 {
   "include": [
     "xoxss.py",
-    "xoxss/scanner.py",
-    "xoxss/cli.py",
-    "xoxss/core/config.py",
-    "xoxss/core/http.py",
-    "xoxss/core/browser.py",
-    "xoxss/scan/parameters.py",
-    "xoxss/scan/reflection.py",
-    "xoxss/analysis/mutation_probe.py",
-    "xoxss/analysis/payload_grammar.py",
-    "xoxss/tools/external.py",
-    "xoxss/analysis/ast_taint.py",
-    "xoxss/reports"
+    "xoxss"
   ],
-  "exclude": ["**/__pycache__", ".venv"],
+  "exclude": ["**/__pycache__", ".venv", "build", "dist"],
   "venvPath": ".",
-  "venv": ".venv"
+  "venv": ".venv",
+  "pythonVersion": "3.9",
+  "typeCheckingMode": "basic"
 }

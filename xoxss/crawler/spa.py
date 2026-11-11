@@ -4,7 +4,7 @@ Handles hash-based routing, dynamic content loading, and client-side navigation.
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set
 from dataclasses import dataclass
 from enum import Enum
 
@@ -146,7 +146,6 @@ class SPACrawler:
         routes = []
 
         framework = self.detect_framework(js_content)
-        router_type = self.detect_router_type(js_content)
 
         # Extract hash routes
         hash_routes = self.extract_hash_routes(js_content)

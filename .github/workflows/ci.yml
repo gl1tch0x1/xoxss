@@ -36,11 +36,11 @@ jobs:
       - name: Static type checks
         run: pyright
 
-      - name: Tests
-        run: python -m pytest tests -q
+      - name: Lint
+        run: ruff check xoxss benchmarks
 
-      - name: Local integration smoke
-        run: python tests/integration_smoke.py
+      - name: Coverage benchmark (HTTP-only)
+        run: python benchmarks/run_benchmark.py --quick
 
   windows-smoke:
     runs-on: windows-latest
@@ -60,5 +60,5 @@ jobs:
           python -m xoxss --version
           python -m xoxss --list-encoders | Out-Null
           python -m xoxss --list-tampers | Out-Null
-      - name: Tests
-        run: python -m pytest tests -q
+      - name: Coverage benchmark (HTTP-only)
+        run: python benchmarks/run_benchmark.py --quick

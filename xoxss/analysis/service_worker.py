@@ -4,7 +4,7 @@ Detects XSS in Service Worker install handlers, fetch events, and cache poisonin
 """
 
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional
 from dataclasses import dataclass
 from enum import Enum
 

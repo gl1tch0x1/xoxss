@@ -155,6 +155,26 @@ class StateStore:
         with self._lock:
             self.findings.append(finding.to_dict())
 
+    def replace_finding(self, old_finding: Any, finding: Any) -> None:
+        """Replace a stored finding with its stronger version.
+
+        Used when a stronger version of an already-reported issue is found
+        (e.g. a browser-confirmed runtime sink replacing a static taint-flow
+        lead) so resumed scans and reports never show both.  The old entry is
+        located by its stored ``finding_id`` - the new finding may legitimately
+        have a different precise key.
+        """
+        old_payload = old_finding.to_dict() if hasattr(old_finding, "to_dict") else old_finding
+        old_id = str((old_payload or {}).get("finding_id") or "")
+        payload = finding.to_dict()
+        with self._lock:
+            for index, existing in enumerate(self.findings):
+                if old_id and str(existing.get("finding_id") or "") == old_id:
+                    self.findings[index] = payload
+                    break
+            else:
+                self.findings.append(payload)
+
     def reset(self) -> None:
         self.scanned.clear()
         self.url_status.clear()

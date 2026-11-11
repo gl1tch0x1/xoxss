@@ -14,8 +14,8 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import parse_qsl, urljoin, urlsplit, urlunsplit
+from typing import Any, Dict, List, Set, Tuple
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from xoxss.analysis.ast_taint import TaintFlow, analyze_javascript
 

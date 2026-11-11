@@ -56,8 +56,12 @@ class Handler(BaseHTTPRequestHandler):
               if (value) document.querySelector('#out').innerHTML = value;
             </script>""")
         elif parsed.path == "/dom-hash":
+            # Browsers percent-encode a URL fragment set during navigation, so a
+            # naive `location.hash.slice(1)` sink can never execute.  Decoding
+            # models the real-world (and exploitable) fragment sink.
             self.respond("""<main id='out'></main><script>
-              document.querySelector('#out').insertAdjacentHTML('beforeend', location.hash.slice(1));
+              const raw = decodeURIComponent(location.hash.slice(1));
+              if (raw) document.querySelector('#out').insertAdjacentHTML('beforeend', raw);
             </script>""")
         elif parsed.path == "/dom-storage":
             self.respond("""<main id='out'></main><script>
@@ -78,6 +82,12 @@ class Handler(BaseHTTPRequestHandler):
               addEventListener('message', event => {
                 document.querySelector('#out').innerHTML = event.data;
               });
+            </script>""")
+        elif parsed.path == "/dom-sanitized":
+            # Negative control: the tainted value is rendered as text, never HTML.
+            self.respond("""<main id='out'></main><script>
+              const value = new URLSearchParams(location.search).get('q');
+              if (value) document.querySelector('#out').textContent = value;
             </script>""")
         elif parsed.path == "/stored":
             rendered = "".join(f"<li>{item}</li>" for item in STORED)
@@ -117,8 +127,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)
-    print("Local XSS benchmark at http://127.0.0.1:8765/ (Ctrl+C to stop)")
+    import os
+
+    port = int(os.environ.get("XOXSS_BENCH_PORT", "8765"))
+    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"Local XSS benchmark at http://127.0.0.1:{port}/ (Ctrl+C to stop)")
     print("Auth fixture cookie: benchmark_session=authorized")
     try:
         server.serve_forever()
