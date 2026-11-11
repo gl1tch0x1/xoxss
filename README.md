@@ -72,6 +72,13 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 
 **Detection**
 
+- **Hybrid Zero-FP Verification Pipeline (`--hybrid`, `--oracle-verify`):**
+  - **CDP Runtime Taint & Hooking (`core/cdp_hooks.py`):** Injects deep prototype hooks into Chromium DevTools Protocol (`Page.addScriptToEvaluateOnNewDocument`) across Playwright and Selenium before page scripts execute. Taints sources with trackable canary tokens (`xoxss_canary_<id>`) and hooks sinks (`Element.prototype.innerHTML`, `outerHTML`, `insertAdjacentHTML`, `Document.prototype.write`, `eval`, `Function`, `location.href`, `setAttribute`). Tracks async storage provenance (`IDBObjectStore.prototype.put/get`, `Storage.prototype.setItem/getItem`) to prevent cross-script storage contamination.
+  - **AST / CFG / DFG Program Slicing (`analysis/dfg_slicer.py`):** Tree-sitter CST and AST backward data-flow slicer that computes def-use chains, traces variable propagation across closures and minified scopes, and eliminates false positives caused by minified variable name collisions (`id`, `db`, `url`, `hash`, `loc`).
+  - **Framework Runtime Internal Sink Suppression (`analysis/framework_sinks.py`):** Eliminates vendor framework internal runtime false positives (Vue 3 `Af.innerHTML = Ef(...)`, Alpine.js `D('html', ...)`, React `dangerouslySetInnerHTML`, Angular and jQuery internal sinks) by classifying vendor internals as safe wrappers unless reachable by untrusted user data.
+  - **Context-Aware DOM Breakout Mutation (`analysis/context_mutator.py`):** Generates optimal breakout payloads tailored to the exact enclosing syntax tree context (HTML body, quoted attribute, script block, template string, or event handler).
+  - **Multi-Provider LLM Semantic Triage (`analysis/llm_triage.py`):** Optional AI triage layer supporting OpenAI, Google Gemini, Anthropic Claude, and local Ollama models with strict JSON schema validation to filter out harmless DOM flows before browser execution.
+  - **Headless Execution Oracle (`core/execution_oracle.py`):** Dual-engine verification harness for Playwright and Selenium CDP sessions that injects candidates into an isolated sandbox, monitors `window.__xoxss_verify`, and produces irrefutable PoC execution evidence.
 - Context-aware payloads for HTML, attributes (double/single/unquoted), `<script>`,
   `<style>`, comments, JSON, `javascript:` URLs and generic fallbacks.
 - HTTP-first probing with browser confirmation: Selenium (Firefox, Chrome, Edge) or
@@ -866,22 +873,21 @@ use collectors you control.
 
 ## Architecture
 
-The current codebase is split into focused CLI, transport, crawl engine, analysis, recon,
-reporting and browser modules. `scanner.py` remains the scan coordinator and target
-orchestrator.
+The codebase is split into modular core, scan orchestration, analysis, recon,
+detection, reporting and browser modules. `scanner.py` serves as the high-level scan
+coordinator and target orchestrator.
 
 ```mermaid
 flowchart LR
-    CLI["cli.py and stdin"] --> SCAN["scanner.py<br/>scope and coordinator"]
-    SCAN --> HTTP["core/http.py<br/>HTTP/1.1 and optional curl_cffi HTTP/2"]
+    CLI["cli.py and stdin"] --> SCAN["scanner.py<br/>coordinator and target orchestrator"]
+    SCAN --> CORE["core/ modules<br/>finding, scope, config, cdp_hooks, execution_oracle, http, browser, state"]
+    SCAN --> SCAN_MOD["scan/ modules<br/>injection, payloads, parameters, reflection, fuzzer"]
+    SCAN --> DETECT["detection/ modules<br/>tamper, dom, context, waf, encoders"]
+    SCAN --> ANALYSIS["analysis/ modules<br/>dfg_slicer, framework_sinks, context_mutator, llm_triage"]
     SCAN --> CRAWLER["engine/crawler.py<br/>BFS spider and sitemaps"]
-    SCAN --> RECON["recon modules<br/>passive, JS, OpenAPI"]
-    SCAN --> PARAM["scan/parameters.py<br/>batch, controls, bisection"]
-    SCAN --> REFLECT["scan/reflection.py<br/>context and browser gate"]
-    SCAN --> ANALYSIS["analysis modules<br/>taint, mutation, DOM and protocol checks"]
-    SCAN --> BROWSER["core/browser.py<br/>Playwright and Selenium"]
-    SCAN --> REPORTS["reports modules<br/>JSON, HTML, Markdown and SARIF"]
-    SCAN --> STATE["core/state.py<br/>checkpoint and resume state"]
+    SCAN --> RECON["recon/ modules<br/>passive, JS, OpenAPI"]
+    SCAN --> OOB["oob/ modules<br/>interactsh and pollers"]
+    SCAN --> REPORTS["reports/ modules<br/>JSON, HTML, Markdown, SARIF"]
     SCAN --> EVENTS["console events and JSONL"]
 ```
 
@@ -906,32 +912,48 @@ flowchart TD
 ```text
 xoxss.py                  compatibility entry point for `python xoxss.py`
 xoxss/
-  scanner.py              scan coordinator, findings and target orchestration
+  scanner.py              scan coordinator and target orchestration
   cli.py                  CLI parser construction
   core/
+    config.py             typed ScanConfig schema supporting all 102 options and presets
+    finding.py            Finding, Evidence, Confidence, and finding collection models
+    scope.py              ScopeManager, URL normalization, out-of-scope/dead-zone filters
+    cdp_hooks.py          CDP runtime taint tracking and prototype sink hooking
+    execution_oracle.py   headless browser verification harness and PoC verification
     http.py               shared asynchronous HTTP transport (aiohttp + optional curl_cffi HTTP/2)
     browser.py            Selenium and Playwright backends
-    config.py             typed configuration schema (CLI remains authoritative)
     state.py              crash-safe checkpoint/resume state and URL lifecycle
-  engine/
-    crawler.py            BFS spider, sitemap walker and endpoint recorder
+  scan/
+    injection.py          InjectionPoint model, URL discovery, form/param extraction, WAF detection
+    payloads.py           payload generation, context templates, and parameter binding
+    parameters.py         harvest + batched reflection probe and controls
+    reflection.py         reflection context and browser prequalification gate
+    fuzzer.py             path fuzzing, wordlists, parameter mining
   detection/
-    reflection.py         token alignment, context and surviving-character analysis
+    tamper.py             tamper transforms (doubleencode, hexencode, htmlentities, etc.)
     context.py            context classification helpers
-    payload.py            blind payload construction
     dom.py                DOM source/sink analysis
     waf.py                WAF signatures and blocking heuristics
     encoders.py           composable encoder registry
+    payload.py            blind payload construction
+    matrix.py             surviving character probe matrix
   analysis/
+    dfg_slicer.py         AST/CFG/DFG backward slicer and def-use chain tracking
+    framework_sinks.py    vendor framework runtime sink suppression (Vue 3, Alpine, React, jQuery)
+    context_mutator.py    context-aware DOM breakout mutation
+    llm_triage.py         multi-provider LLM triage (OpenAI, Gemini, Anthropic, Ollama)
     ast_taint.py          JavaScript source-to-sink flow analysis (regex fallback)
     cst_taint.py          scope-aware tree-sitter CST taint backend
     proto_pollution.py    static hints, probes, gadgets, exploit URLs
     mutation_probe.py     bounded response transformation observations
     payload_grammar.py    constraint-driven payload variants
-    jsonp.py csp.py cors.py mxss.py
-    dom_clobbering.py trusted_types.py graphql.py
-    websocket.py file_upload.py postmessage.py
-    per_char.py polyglot.py rate_limit.py
+    graphql.py            GraphQL introspection, endpoint discovery, and injection analysis
+    csp.py                Content Security Policy evaluation and bypass analysis
+    jsonp.py cors.py mxss.py dom_clobbering.py trusted_types.py websocket.py file_upload.py postmessage.py
+  engine/
+    crawler.py            BFS spider, sitemap walker and endpoint recorder
+  crawler/
+    spa.py                Single Page Application client route discovery
   recon/
     subdomains.py         certificate/passive DNS sources
     passive.py            Wayback, Common Crawl, urlscan, OTX
@@ -941,10 +963,6 @@ xoxss/
     base.py               OOB manager, marker correlation, generic parsing
     interactsh.py         native RSA/AES interactsh client
     poller.py             HTTP and file pollers
-  scan/
-    fuzzer.py             path fuzzing, wordlists, parameter mining
-    parameters.py         harvest + batched reflection probe and controls
-    reflection.py         reflection context and browser prequalification gate
   tools/
     external.py           optional recon, parameter discovery and XSS tool adapters
   reports/
@@ -956,8 +974,15 @@ xoxss/
   data/
     lazyxss.txt           bundled LazyXss payload pack
     LAZYXSS_NOTICE.md     payload provenance and licensing notice
-  utils/                  console, helpers, markers, URL utilities
-tests/                    pytest suite and manual integration scripts
+  utils/
+    console.py            Console output, log formatting, colors, and progress spinners
+    helpers.py url.py urlpolicy.py ui.py
+benchmarks/
+  cases.json              machine-readable benchmark corpus
+  fixture_server.py       local loopback HTTP/HTTPS test server
+  test_dom_guards.py      DOM false positive guards and framework sink regression tests
+  test_hybrid_pipeline.py 5-layer hybrid pipeline verification suite
+  run_benchmark.py        benchmark runner supporting quick (HTTP) and full browser modes
 ```
 
 Design notes:
@@ -974,11 +999,35 @@ Design notes:
 ## Using as a library
 
 The CLI is the supported interface, but the scanner can be embedded for custom
-pipelines using the same parser and scanner as the command line:
+pipelines using either typed `ScanConfig` or CLI argument namespaces:
 
 ```python
 import asyncio
-from xoxss.scanner import Console, XSSScanner, build_parser
+from xoxss.core.config import ScanConfig
+from xoxss.scanner import XSSScanner
+from xoxss.utils.console import Console
+
+# Programmatic scanning with typed ScanConfig
+config = ScanConfig(
+    url="https://target.tld/?q=1",
+    no_browser=True,
+    no_state=True,
+    no_remote_payloads=True,
+    report="none",
+    quiet=True,
+)
+scanner = XSSScanner("https://target.tld/?q=1", config, Console(quiet=True))
+findings = asyncio.run(scanner.run())
+
+for finding in findings:
+    print(f"[{finding.confidence}] {finding.title} -> {finding.poc_url}")
+```
+
+You can also parse existing CLI argument flags dynamically using `build_parser()`:
+
+```python
+from xoxss.scanner import XSSScanner, build_parser
+from xoxss.utils.console import Console
 
 args = build_parser().parse_args([
     "https://target.tld/?q=1",
@@ -987,9 +1036,6 @@ args = build_parser().parse_args([
 ])
 scanner = XSSScanner("https://target.tld/?q=1", args, Console(quiet=True))
 findings = asyncio.run(scanner.run())
-
-for finding in findings:
-    print(finding.confidence, finding.kind, finding.parameter, finding.url)
 ```
 
 `scanner.run()` starts and closes the HTTP engine and browser pool, writes reports
@@ -1081,13 +1127,15 @@ pip install -e ".[dev,interactsh]"
 pip install -e ".[playwright]" && playwright install chromium   # optional
 
 # Code quality & verification
-python -m compileall -q xoxss xoxss.py
+python -m compileall -q xoxss xoxss.py benchmarks
 ruff check xoxss benchmarks
 pyright
 
-# Run local benchmark test suite
-python benchmarks/run_benchmark.py --quick                 # HTTP-only cases (fast)
-python benchmarks/run_benchmark.py                         # full suite with Playwright
+# Run test suites & benchmarks
+python benchmarks/test_dom_guards.py        # DOM false positive guards & framework sink suppression
+python benchmarks/test_hybrid_pipeline.py   # Hybrid pipeline (CDP, DFG, Mutator, Oracle, LLM)
+python benchmarks/run_benchmark.py --quick  # HTTP-only benchmark cases (fast)
+python benchmarks/run_benchmark.py          # Full suite with Playwright browser verification
 ```
 
 The benchmark corpus in `benchmarks/` covers reflection scoring, context classification,
