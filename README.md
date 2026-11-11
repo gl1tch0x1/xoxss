@@ -889,7 +889,7 @@ flowchart TD
     DELTA -->|yes| SPLIT["Bisect candidate batch"]
     SPLIT --> B
     DELTA -->|no| MISS["Mark candidates unreflected"]
-    DYN -. annotate evidence .-> ATTR
+    DYN -.->|annotate evidence| ATTR
 ```
 
 ```text
