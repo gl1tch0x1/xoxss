@@ -511,6 +511,7 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--log-file PATH` | Write the full human-readable text log to a file. `-o, --output` remains a deprecated alias. |
 | `--report LIST` | `json`, `md`, `html`, `sarif`, combinations, `all`, or `none` (default `all`). |
 | `--report-dir DIR` / `--state-dir DIR` | Report root / checkpoint root (default `.xoxss`). |
+| `--config PATH` | Custom `.env` or `.config` file path (auto-discovers `.env` and `.config`). |
 | `--events-jsonl PATH` | Append versioned JSONL target, discovery, finding, and completion events for automation. |
 | `--no-state` / `--no-resume` | Disable checkpoints / reset and start over. |
 | `--verbose` / `--quiet` / `--no-color` | Debug output / findings-only / disable ANSI colours. |
@@ -857,13 +858,43 @@ Temporary remote payloads live in a unique directory under the system temp direc
 
 ## Configuration
 
-Configuration is entirely CLI-driven — no implicit project config file, which keeps CI
-runs reproducible.
+XOXSS automatically discovers and loads settings and sensitive API keys from `.env` or
+`.config` files located in the current working directory, repository root, or user home
+directory (`~/.xoxss/.env`). You can also specify an explicit configuration file via
+`--config PATH`.
 
-| Variable | Effect |
-|---|---|
-| `NO_COLOR` | Disable ANSI colour output. |
-| `XOXSS_TMPDIR` | Root for the temporary remote payload cache. |
+A template with all supported keys and documentation is bundled as [`.env.example`](.env.example):
+
+```bash
+cp .env.example .env
+# Edit .env with your OpenAI, Gemini, Anthropic, or Recon API keys
+```
+
+### Environment Variables & Keys
+
+| Variable | Scope | Description |
+|---|---|---|
+| `XOXSS_LLM_PROVIDER` | LLM Triage | Default provider: `openai`, `gemini`, `anthropic`, `ollama` (or empty for auto-detection). |
+| `XOXSS_LLM_KEY` | LLM Triage | Universal LLM API key override (preempts provider-specific keys). |
+| `OPENAI_API_KEY` | LLM Triage | API key for OpenAI (`gpt-4o`, `gpt-4o-mini`). |
+| `GEMINI_API_KEY` | LLM Triage | API key for Google Gemini (`gemini-2.5-flash`). |
+| `ANTHROPIC_API_KEY` | LLM Triage | API key for Anthropic Claude (`claude-3-5-sonnet-latest`). |
+| `XOXSS_LLM_MODEL` | LLM Triage | Model identifier override (defaults automatically per provider). |
+| `XOXSS_LLM_ENDPOINT` | LLM Triage | Custom base URL (e.g. `http://localhost:11434/v1/chat/completions` for Ollama). |
+| `OPENROUTER_API_KEY` / `XOXSS_AI_KEY` | AI Fallback | API key for OpenRouter / DeepSeek payload fallback (`--ai`). |
+| `XOXSS_AI_MODEL` / `XOXSS_AI_URL` | AI Fallback | Model ID (default: `deepseek/deepseek-chat`) and completions endpoint. |
+| `URLSCAN_API_KEY` | Recon | urlscan.io API key for historic URL indexing & DOM search. |
+| `OTX_API_KEY` | Recon | AlienVault OTX key for passive DNS and indicator extraction. |
+| `SECURITYTRAILS_API_KEY` | Recon | SecurityTrails API key for passive subdomain enumeration. |
+| `SHODAN_API_KEY` | Recon | Shodan API key for host and service intelligence. |
+| `GITHUB_TOKEN` | Recon | GitHub token for searching code leaks and public endpoints. |
+| `INTERACTSH_SERVER` / `INTERACTSH_TOKEN` | OOB / Blind | Custom interactsh domain (default `oast.pro`) and auth token. |
+| `XOXSS_OOB_POLL` / `XOXSS_OOB_KEY` | OOB / Blind | Collector polling endpoint (XSS Hunter, Burp bridge) and auth header. |
+| `XOXSS_CHROMIUM` / `CHROME_BIN` | Browser | Explicit path to Chrome or Chromium executable. |
+| `XOXSS_AST_BACKEND` | Parser | AST parser backend: `auto` (tree-sitter CST with fallback) or `regex`. |
+| `XOXSS_TMPDIR` | Cache | Root directory for temporary remote payload cache. |
+| `HTTP_PROXY` / `HTTPS_PROXY` | Network | Proxy URLs applied when `--proxy` is not explicitly passed. |
+| `NO_COLOR` | Console | Set to `1` to disable ANSI colors in terminal logs. |
 
 Secret hygiene: prefer a secret manager or shell-expanded environment variables; CLI
 arguments can appear in process listings and shell history. Reports may contain URLs,

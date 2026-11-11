@@ -7,8 +7,82 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+
+
+def load_dotenv_or_config(
+    custom_path: Optional[str | Path] = None,
+    override: bool = False,
+) -> Dict[str, str]:
+    """
+    Search and load environment variables from .env or .config files.
+
+    Order of discovery:
+    1. custom_path (if provided)
+    2. os.environ.get("XOXSS_CONFIG") or os.environ.get("XOXSS_ENV")
+    3. Current working directory: .env, .config
+    4. Project/repository root: .env, .config
+    5. User home: ~/.xoxss/.env, ~/.config/xoxss/config
+    """
+    import os
+
+    loaded: Dict[str, str] = {}
+    paths_to_check: List[Path] = []
+
+    if custom_path:
+        paths_to_check.append(Path(custom_path))
+
+    for env_var in ("XOXSS_CONFIG", "XOXSS_ENV"):
+        val = os.environ.get(env_var)
+        if val:
+            paths_to_check.append(Path(val))
+
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+    except Exception:
+        repo_root = Path.cwd()
+    cwd = Path.cwd()
+
+    candidates = [
+        cwd / ".env",
+        cwd / ".config",
+        repo_root / ".env",
+        repo_root / ".config",
+        Path.home() / ".xoxss" / ".env",
+        Path.home() / ".config" / "xoxss" / "config",
+    ]
+    for c in candidates:
+        if c not in paths_to_check:
+            paths_to_check.append(c)
+
+    for path in paths_to_check:
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith(";"):
+                    continue
+                if "=" in line:
+                    key, val = line.split("=", 1)
+                elif ":" in line:
+                    key, val = line.split(":", 1)
+                else:
+                    continue
+                key = key.strip()
+                val = val.strip().strip("'\"")
+                if not key:
+                    continue
+                if override or key not in os.environ:
+                    os.environ[key] = val
+                loaded[key] = val
+        except Exception:
+            continue
+
+    return loaded
 
 
 class ScanMode(Enum):
@@ -40,6 +114,7 @@ class ScanConfig:
     # Target
     target: str = ""
     target_list: Optional[str] = None
+    config: Optional[str] = None
 
     # Discovery
     crawl: bool = False
@@ -198,6 +273,10 @@ class ScanConfig:
 
     def __post_init__(self):
         """Validate and normalize configuration."""
+        if self.config:
+            load_dotenv_or_config(self.config, override=True)
+        else:
+            load_dotenv_or_config()
         if isinstance(self.browser, str):
             try:
                 self.browser = BrowserType(self.browser)
@@ -264,4 +343,5 @@ __all__ = [
     "VerificationStrategy",
     "BrowserType",
     "ScanConfig",
+    "load_dotenv_or_config",
 ]

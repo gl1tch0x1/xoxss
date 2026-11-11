@@ -220,7 +220,7 @@ from xoxss.core.evidence import (
     request_to_dict,
     response_excerpt,
 )
-from xoxss.core.config import ScanConfig
+from xoxss.core.config import ScanConfig, load_dotenv_or_config
 from xoxss.core.finding import (
     CONFIDENCE_LEVELS,
     CONFIDENCE_RANK,
@@ -6109,6 +6109,7 @@ async def run_replay(args: argparse.Namespace, console: Console) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    load_dotenv_or_config()
     raw_args = list(argv) if argv is not None else sys.argv[1:]
     # Decide about colour before argparse renders --help, so `--no-color --help`
     # is plain even on a TTY.
@@ -6118,6 +6119,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _ui.disable()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "config", None):
+        load_dotenv_or_config(args.config, override=True)
     # ``--fail-on-findings`` predates ``--fail-on`` and is its "any" shorthand.
     if not getattr(args, "fail_on", None):
         args.fail_on = "any" if getattr(args, "fail_on_findings", False) else None

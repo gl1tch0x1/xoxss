@@ -65,11 +65,43 @@ class LLMTriageEngine:
         endpoint: str = "",
         timeout: float = 12.0,
     ) -> None:
+        try:
+            from xoxss.core.config import load_dotenv_or_config
+            load_dotenv_or_config()
+        except Exception:
+            pass
+
         self.provider = (provider or os.environ.get("XOXSS_LLM_PROVIDER", "")).strip().lower()
-        self.api_key = (api_key or os.environ.get("XOXSS_LLM_KEY", "") or os.environ.get("OPENAI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")).strip()
+        self.api_key = (
+            api_key
+            or os.environ.get("XOXSS_LLM_KEY", "")
+            or os.environ.get("OPENAI_API_KEY", "")
+            or os.environ.get("GEMINI_API_KEY", "")
+            or os.environ.get("ANTHROPIC_API_KEY", "")
+        ).strip()
         self.model = (model or os.environ.get("XOXSS_LLM_MODEL", "")).strip()
         self.endpoint = (endpoint or os.environ.get("XOXSS_LLM_ENDPOINT", "")).strip()
         self.timeout = timeout
+
+        # Smart provider deduction
+        if not self.provider or self.provider == "none":
+            if self.endpoint and ("localhost" in self.endpoint or "11434" in self.endpoint or "ollama" in self.endpoint):
+                self.provider = "ollama"
+            elif os.environ.get("ANTHROPIC_API_KEY") and not (os.environ.get("OPENAI_API_KEY") or os.environ.get("GEMINI_API_KEY")):
+                self.provider = "anthropic"
+            elif os.environ.get("GEMINI_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
+                self.provider = "gemini"
+            elif self.api_key:
+                self.provider = "openai"
+
+        # Provider-specific key fallback
+        if self.provider == "anthropic" and os.environ.get("ANTHROPIC_API_KEY") and not api_key:
+            self.api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        elif self.provider == "gemini" and os.environ.get("GEMINI_API_KEY") and not api_key:
+            self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        elif self.provider == "openai" and os.environ.get("OPENAI_API_KEY") and not api_key:
+            self.api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+
         self.enabled = bool(self.api_key or (self.provider == "ollama") or self.endpoint)
 
         # Defaults

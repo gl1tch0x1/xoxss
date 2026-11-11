@@ -97,6 +97,7 @@ celerybeat.pid
 
 # Environments
 .env
+.config
 .venv
 .tmp/
 env/
