@@ -38,204 +38,9 @@ def _truncate(text: Any, limit: int = 200) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "\u2026"
 
 
-HOOK_JS = r"""
-(function () {
-  try {
-    if (window.__xoxss_init) { return; }
-    window.__xoxss_init = true;
-    window.__xoxss_hits = window.__xoxss_hits || [];
-    window.__xoxss_alerts = window.__xoxss_alerts || [];
-    window.__xoxss_sinks = window.__xoxss_sinks || [];
-    window.__xoxss_requests = window.__xoxss_requests || [];
-    window.__xoxss_errors = window.__xoxss_errors || [];
+from xoxss.core.cdp_hooks import build_cdp_instrumentation
 
-    var record = function (name, value, target) {
-      try {
-        if (window.__xoxss_sinks.length > 250) { return; }
-        var text = String(value);
-        if (text.length > 600) { text = text.slice(0, 600); }
-        window.__xoxss_sinks.push({
-          sink: name,
-          value: text,
-          dom_path: describeNode(target)
-        });
-      } catch (e) {}
-    };
-    var describeNode = function (node) {
-      try {
-        if (!node) { return ''; }
-        if (node.nodeType === 9) { return 'document'; }
-        if (!node.tagName && node.parentNode) { node = node.parentNode; }
-        if (!node || !node.tagName) { return ''; }
-        var parts = [];
-        var current = node;
-        var depth = 0;
-        while (current && current.nodeType === 1 && depth < 6) {
-          var part = current.tagName.toLowerCase();
-          if (current.id) {
-            var safeId = String(current.id).replace(/[^A-Za-z0-9_-]/g, '');
-            if (safeId) { part += '#' + safeId; parts.unshift(part); break; }
-          }
-          var parent = current.parentNode;
-          if (parent && parent.children && parent.children.length > 1) {
-            var index = 0;
-            for (var i = 0; i < parent.children.length; i++) {
-              if (parent.children[i] === current) { index = i + 1; break; }
-            }
-            if (index) { part += ':nth-child(' + index + ')'; }
-          }
-          parts.unshift(part);
-          current = parent;
-          depth++;
-        }
-        return parts.join(' > ');
-      } catch (e) { return ''; }
-    };
-    var recordRequest = function (value) {
-      try {
-        var text = String(value || '');
-        if (!/^https?:\/\//i.test(text)) { text = new URL(text, location.href).href; }
-        if (window.__xoxss_requests.length < 5000 && window.__xoxss_requests.indexOf(text) < 0) {
-          window.__xoxss_requests.push(text);
-        }
-      } catch (e) {}
-    };
-
-    try {
-      var originalFetch = window.fetch;
-      if (originalFetch) {
-        window.fetch = function (input) {
-          recordRequest(input && input.url ? input.url : input);
-          return originalFetch.apply(this, arguments);
-        };
-      }
-      var originalOpen = XMLHttpRequest.prototype.open;
-      XMLHttpRequest.prototype.open = function (method, url) {
-        recordRequest(url);
-        return originalOpen.apply(this, arguments);
-      };
-      var originalPushState = history.pushState;
-      history.pushState = function () {
-        var result = originalPushState.apply(this, arguments);
-        recordRequest(location.href);
-        return result;
-      };
-      var originalReplaceState = history.replaceState;
-      history.replaceState = function () {
-        var result = originalReplaceState.apply(this, arguments);
-        recordRequest(location.href);
-        return result;
-      };
-    } catch (e) {}
-
-    var _origAlert = window.alert;
-    var _origConfirm = window.confirm;
-    var _origPrompt = window.prompt;
-    window.alert = function (msg) {
-      try { window.__xoxss_alerts.push(String(msg)); } catch (e) {}
-      try { if (window.__xoxss_pw && _origAlert) { return _origAlert.call(window, msg); } } catch (e) {}
-    };
-    window.confirm = function (msg) {
-      try { window.__xoxss_alerts.push(String(msg)); } catch (e) {}
-      try { if (window.__xoxss_pw && _origConfirm) { return _origConfirm.call(window, msg); } } catch (e) {}
-      return true;
-    };
-    window.prompt = function (msg) {
-      try { window.__xoxss_alerts.push(String(msg)); } catch (e) {}
-      try { if (window.__xoxss_pw && _origPrompt) { return _origPrompt.call(window, msg); } } catch (e) {}
-      return null;
-    };
-    window.addEventListener('error', function (event) {
-      try { window.__xoxss_errors.push(String(event.message || '')); } catch (e) {}
-    });
-
-    try {
-      var innerDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
-      if (innerDesc && innerDesc.set) {
-        Object.defineProperty(Element.prototype, 'innerHTML', {
-          configurable: true,
-          get: function () { return innerDesc.get.call(this); },
-          set: function (value) { record('innerHTML', value, this); return innerDesc.set.call(this, value); }
-        });
-      }
-    } catch (e) {}
-
-    try {
-      var outerDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'outerHTML');
-      if (outerDesc && outerDesc.set) {
-        Object.defineProperty(Element.prototype, 'outerHTML', {
-          configurable: true,
-          get: function () { return outerDesc.get.call(this); },
-          set: function (value) { record('outerHTML', value, this); return outerDesc.set.call(this, value); }
-        });
-      }
-    } catch (e) {}
-
-    try {
-      var originalWrite = document.write;
-      document.write = function () {
-        record('document.write', Array.prototype.join.call(arguments, ''), document);
-        return originalWrite.apply(document, arguments);
-      };
-      var originalWriteln = document.writeln;
-      document.writeln = function () {
-        record('document.writeln', Array.prototype.join.call(arguments, ''), document);
-        return originalWriteln.apply(document, arguments);
-      };
-    } catch (e) {}
-
-    try {
-      var originalEval = window.eval;
-      window.eval = function (source) {
-        record('eval', source);
-        return originalEval(source);
-      };
-    } catch (e) {}
-
-    try {
-      var originalTimeout = window.setTimeout;
-      window.setTimeout = function (handler) {
-        if (typeof handler === 'string') { record('setTimeout', handler); }
-        return originalTimeout.apply(window, arguments);
-      };
-      var originalInterval = window.setInterval;
-      window.setInterval = function (handler) {
-        if (typeof handler === 'string') { record('setInterval', handler); }
-        return originalInterval.apply(window, arguments);
-      };
-    } catch (e) {}
-
-    try {
-      var originalInsert = Element.prototype.insertAdjacentHTML;
-      Element.prototype.insertAdjacentHTML = function (position, markup) {
-        record('insertAdjacentHTML', markup, this);
-        return originalInsert.apply(this, arguments);
-      };
-    } catch (e) {}
-
-    try {
-      var originalSetAttribute = Element.prototype.setAttribute;
-      Element.prototype.setAttribute = function (name, value) {
-        var attr = String(name || '').toLowerCase();
-        if (attr === 'srcdoc' || attr === 'style' || /^on[a-z]+$/.test(attr)) {
-          record('setAttribute:' + attr, value, this);
-        }
-        return originalSetAttribute.apply(this, arguments);
-      };
-      var originalFragment = Range.prototype.createContextualFragment;
-      Range.prototype.createContextualFragment = function (markup) {
-        record('createContextualFragment', markup, this.startContainer || null);
-        return originalFragment.apply(this, arguments);
-      };
-      var originalParse = DOMParser.prototype.parseFromString;
-      DOMParser.prototype.parseFromString = function (source, type) {
-        record('DOMParser.parseFromString:' + type, source);
-        return originalParse.apply(this, arguments);
-      };
-    } catch (e) {}
-  } catch (e) {}
-})();
-"""
+HOOK_JS = build_cdp_instrumentation()
 
 COLLECT_JS = r"""
 return {
@@ -244,6 +49,8 @@ return {
   sinks: window.__xoxss_sinks || [],
   errors: window.__xoxss_errors || [],
   requests: window.__xoxss_requests || [],
+  telemetry: window.__xoxss_telemetry || null,
+  verifications: (window.__xoxss_telemetry && window.__xoxss_telemetry.verified) || [],
   href: String(location.href || ''),
   title: String(document.title || ''),
   ready: String(document.readyState || '')
@@ -638,9 +445,11 @@ class BrowserEngine:
     def _match(data: Dict[str, Any], token: str) -> Optional[Dict[str, str]]:
         channels: List[str] = []
         executed: bool = False
+        verified: bool = False
         sink_name: str = ""
         dom_path: str = ""
         for key, label in (
+            ("verifications", "oracle-verified"),
             ("hits", "js-executed"),
             ("alerts", "alert"),
             ("dialogs", "alert"),
@@ -652,8 +461,10 @@ class BrowserEngine:
                 if token not in blob:
                     continue
                 channels.append(f"{label}: {_truncate(blob, 200)}")
-                if key in ("hits", "alerts", "dialogs"):
+                if key in ("verifications", "hits", "alerts", "dialogs"):
                     executed = True
+                if key == "verifications":
+                    verified = True
                 if key == "sinks" and isinstance(item, dict):
                     if not sink_name and item.get("sink"):
                         sink_name = str(item["sink"])
@@ -669,6 +480,7 @@ class BrowserEngine:
         return {
             "evidence": " | ".join(channels[:4]),
             "executed": "yes" if executed else "no",
+            "verified": "yes" if verified else "no",
             "in_dom": in_dom,
             "sink": sink_name,
             "dom_path": dom_path,

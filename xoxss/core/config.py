@@ -131,6 +131,14 @@ class ScanConfig:
     binary: Optional[str] = None
     user_agent: Optional[str] = None
 
+    # Hybrid detection pipeline
+    hybrid: bool = False
+    oracle_verify: bool = False
+    llm_provider: str = "none"
+    llm_api_key: Optional[str] = None
+    llm_model: Optional[str] = None
+    llm_endpoint: Optional[str] = None
+
     # Network
     threads: int = 10
     concurrency: int = 16

@@ -160,6 +160,20 @@ except Exception as _param_exc:  # pragma: no cover
     ParameterHarvester = None  # type: ignore
     ReflectionProbe = None  # type: ignore
 
+try:
+    from xoxss.analysis.dfg_slicer import DfgSlicer
+    from xoxss.analysis.context_mutator import ContextMutator
+    from xoxss.analysis.llm_triage import LLMTriageEngine
+    from xoxss.core.execution_oracle import ExecutionOracle, OracleVerdict
+    HAS_HYBRID = True
+except Exception as _hybrid_exc:  # pragma: no cover
+    HAS_HYBRID = False
+    DfgSlicer = None  # type: ignore
+    ContextMutator = None  # type: ignore
+    LLMTriageEngine = None  # type: ignore
+    ExecutionOracle = None  # type: ignore
+    OracleVerdict = None  # type: ignore
+
 
 from xoxss.reports.sarif import (  # noqa: E402
     build_sarif_document,
@@ -2735,6 +2749,29 @@ class XSSScanner(CrawlerMixin):
         self.detected_frameworks: Set[str] = set()
         self.file_upload_findings: List[Dict] = []
         self.graphql_endpoints: List[Dict] = []
+
+        # Hybrid detection pipeline
+        self.hybrid_enabled: bool = bool(getattr(args, "hybrid", False))
+        self.oracle_verify_enabled: bool = bool(getattr(args, "oracle_verify", False) or self.hybrid_enabled)
+        self.dfg_slicer = DfgSlicer() if (HAS_HYBRID and DfgSlicer is not None) else None
+        self.context_mutator = ContextMutator() if (HAS_HYBRID and ContextMutator is not None) else None
+        self.llm_triage = (
+            LLMTriageEngine(
+                provider=getattr(args, "llm_provider", "none") or "none",
+                api_key=getattr(args, "llm_api_key", None),
+                model=getattr(args, "llm_model", None),
+                endpoint=getattr(args, "llm_endpoint", None),
+            )
+            if (HAS_HYBRID and LLMTriageEngine is not None)
+            else None
+        )
+        self.oracle = (
+            ExecutionOracle(browser_pool=self.pool, timeout=getattr(args, "timeout", 15.0) or 15.0)
+            if (HAS_HYBRID and ExecutionOracle is not None)
+            else None
+        )
+        if self.hybrid_enabled:
+            self.console.info("Hybrid detection pipeline active (CDP hooks + AST/DFG slicer + execution oracle)", important=False)
         # Adaptive rate limiting is handled above via HttpEngine.enable_smart_rate(),
         # which installs an internal SmartRateLimiter and records every request;
         # replacing self.http.limiter here would bypass that mechanism.
@@ -3058,6 +3095,8 @@ class XSSScanner(CrawlerMixin):
                 self.pool = BrowserPool(self.console, self.args.browser_workers, self._browser_factory)
                 await self.pool.start()
                 browser_available = bool(self.pool.engines)
+                if self.oracle is not None:
+                    self.oracle.browser_pool = self.pool
 
             self._status_task = asyncio.create_task(self._status_loop())
             await self._start_oob()
@@ -3111,6 +3150,8 @@ class XSSScanner(CrawlerMixin):
                     with suppress(Exception):
                         await self.pool.stop()
                     self.pool = None
+                    if self.oracle is not None:
+                        self.oracle.browser_pool = None
                 with suppress(Exception):
                     await self.http.close()
 
@@ -5735,6 +5776,17 @@ class XSSScanner(CrawlerMixin):
                 for flow in flows:
                     self._record_taint_flow(script.url or url, flow)
 
+        if self.dfg_slicer is not None and self.hybrid_enabled:
+            for script in scripts:
+                if not script.content:
+                    continue
+                try:
+                    dfg_flows = self.dfg_slicer.analyze_script(script.content, script.url or url)
+                    for flow in dfg_flows:
+                        self._record_taint_flow(script.url or url, flow)
+                except Exception as exc:
+                    self.console.debug(f"DFG slice analysis failed: {exc}")
+
         candidates = static_dom_candidates(scripts)
         # Enhanced coverage: sinks the basic DOM map does not model (postMessage,
         # Web Speech, WebGL, SVG, CSS, worker), storage reads, and service
@@ -5859,6 +5911,7 @@ class XSSScanner(CrawlerMixin):
                     if not hit:
                         continue
                     executed = hit.get("executed") == "yes"
+                    verified = hit.get("verified") == "yes"
                     if not executed and not getattr(self.args, "report_reflections", False):
                         continue
                     # Browser-confirmed execution always carries a screenshot.
@@ -5869,9 +5922,14 @@ class XSSScanner(CrawlerMixin):
                         )
                     sink = str(hit.get("sink") or "")
                     dom_path = str(hit.get("dom_path") or "")
+                    is_confirmed = verified or executed
                     self.add_finding(
                         Finding(
-                            kind="DOM XSS (runtime sink)" if executed else "DOM XSS (sink taint)",
+                            kind=(
+                                "DOM XSS (oracle confirmed)"
+                                if verified
+                                else ("DOM XSS (runtime sink)" if executed else "DOM XSS (sink taint)")
+                            ),
                             url=vector,
                             parameter="fragment" if kind == "js" else "query/fragment",
                             method="GET",
@@ -5880,21 +5938,28 @@ class XSSScanner(CrawlerMixin):
                                 (f"sink={sink}" + (f" at {dom_path}" if dom_path else "") + "; ")
                                 if sink else ""
                             ) + hit.get("evidence", ""),
-                            confidence="confirmed" if executed else "low",
+                            confidence="confirmed" if is_confirmed else "low",
                             confidence_rationale=(
-                                "Attacker-controlled data reached an instrumented execution sink "
-                                "in a real browser."
-                                if executed
-                                else "Attacker-controlled data reached a DOM sink, but the "
-                                "instrumented sink did not confirm execution."
+                                "Execution strictly confirmed by Headless Execution Oracle (window.__xoxss_verify)."
+                                if verified
+                                else (
+                                    "Attacker-controlled data reached an instrumented execution sink in a real browser."
+                                    if executed
+                                    else "Attacker-controlled data reached a DOM sink, but the instrumented sink did not confirm execution."
+                                )
                             ),
                             context=f"dom/{kind}",
                             detail=(
-                                f"Executed via {sink}" if executed and sink else
-                                (
-                                    "Attacker-controlled data reached an instrumented DOM sink and executed"
-                                    if executed
-                                    else "Attacker-controlled data reached a DOM sink; execution not confirmed"
+                                f"Oracle confirmed execution via {sink}"
+                                if verified and sink
+                                else (
+                                    f"Executed via {sink}"
+                                    if executed and sink
+                                    else (
+                                        "Attacker-controlled data reached an instrumented DOM sink and executed"
+                                        if executed
+                                        else "Attacker-controlled data reached a DOM sink; execution not confirmed"
+                                    )
                                 )
                             ),
                             screenshot=screenshot,

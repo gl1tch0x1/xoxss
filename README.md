@@ -448,6 +448,17 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--file-upload` | File upload form discovery. |
 | `--postmessage` | `postMessage` handler analysis (origin validation). |
 
+### Hybrid Detection Pipeline & Verification
+
+| Option | Description |
+|---|---|
+| `--hybrid` | Enable the 5-layer Hybrid Detection Pipeline (CDP runtime instrumentation, AST/CFG/DFG static slicing, DOM context breakout mutation, and headless execution oracle). |
+| `--oracle-verify` | Strictly verify all candidate findings via headless execution oracle (`window.__xoxss_verify`) before reporting. |
+| `--llm-provider PROVIDER` | LLM triage provider: `openai`, `gemini`, `anthropic`, `ollama` (default: `none`). |
+| `--llm-api-key KEY` | API key for LLM semantic triage (or env vars `OPENAI_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`). |
+| `--llm-model MODEL` | Model identifier for LLM triage (e.g. `gpt-4o`, `gemini-2.5-flash`, `claude-3-5-sonnet-latest`, `llama3.2`). |
+| `--llm-endpoint URL` | Custom endpoint base URL (e.g. `http://localhost:11434` for Ollama). |
+
 > The `--ai*` options send a bounded reflection snippet, the parameter name and the
 > character matrix to the configured chat endpoint. Use them only when that data may
 > leave your environment; AI output never bypasses the deterministic evidence policy.

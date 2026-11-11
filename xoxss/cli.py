@@ -402,6 +402,39 @@ def build_parser(
         "--ai-timeout", type=float, default=60.0, help="AI request timeout in seconds (default: 60)"
     )
 
+    hybrid = parser.add_argument_group("hybrid pipeline", "CDP instrumentation, AST/CFG/DFG static slicing, and execution verification")
+    hybrid.add_argument(
+        "--hybrid",
+        action="store_true",
+        help="enable the hybrid detection pipeline: CDP runtime instrumentation + AST/CFG/DFG slicing + context mutation + execution oracle",
+    )
+    hybrid.add_argument(
+        "--oracle-verify",
+        action="store_true",
+        help="strictly verify candidate DOM and reflected findings with headless execution oracle before reporting",
+    )
+    hybrid.add_argument(
+        "--llm-provider",
+        choices=["none", "openai", "gemini", "anthropic", "ollama"],
+        default="none",
+        help="LLM provider for semantic triage and multi-step stored payload planning (default: none)",
+    )
+    hybrid.add_argument(
+        "--llm-api-key",
+        metavar="KEY",
+        help="API key for LLM triage (default: OPENAI_API_KEY, GEMINI_API_KEY, or ANTHROPIC_API_KEY env vars)",
+    )
+    hybrid.add_argument(
+        "--llm-model",
+        metavar="MODEL",
+        help="model identifier for LLM triage (e.g. gpt-4o, gemini-1.5-pro, claude-3-5-sonnet-20241022, llama3)",
+    )
+    hybrid.add_argument(
+        "--llm-endpoint",
+        metavar="URL",
+        help="custom LLM API base endpoint (e.g. http://localhost:11434 for Ollama or custom gateway)",
+    )
+
     browser = parser.add_argument_group("browser", "execution verification and authenticated browsing")
     browser.add_argument(
         "--browser",
