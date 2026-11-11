@@ -1,0 +1,42 @@
+name: Feature Request / Tamper Proposal
+description: Suggest a new feature, tamper script, payload bypass technique, or scanner enhancement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea for XOXSS? We welcome proposals for new detection engines, WAF bypass tamper modules, report formats, CLI ergonomics, and crawler improvements.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Motivation
+      description: Is this feature related to a specific challenge, limitation, or edge case?
+      placeholder: Currently, when target applications use Cloudflare/Akamai WAFs, payload encoding X is required to bypass rule Y...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution or Implementation
+      description: Detailed description of what you want to happen and how it might work in XOXSS.
+      placeholder: Add a new tamper script `--tamper unicode_escape` or extend the crawler to support...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or Workarounds Considered
+      description: Any other alternative solutions, existing tools, or workarounds you have considered.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to submit a pull request implementing this feature!

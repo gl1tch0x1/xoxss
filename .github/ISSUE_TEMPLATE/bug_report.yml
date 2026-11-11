@@ -1,0 +1,100 @@
+name: Bug Report
+description: Report a software bug, crash, or unexpected behavior in XOXSS.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue!
+        Before submitting, please make sure you are using the latest version of XOXSS (`git pull` or `pip install --upgrade xoxss`).
+        If you are reporting a security vulnerability in XOXSS itself, please see [SECURITY.md](https://github.com/gl1tch0x1/xoxss/blob/main/SECURITY.md) instead of creating a public issue.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of what the bug is.
+      placeholder: When scanning with `--crawl 2`, the scanner crashes with an unhandled exception...
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command Executed
+      description: The exact command you ran (please redact private domains, API keys, or sensitive cookies).
+      placeholder: xoxss -u "https://example.com/search?q=test" --browser playwright -v
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux (Debian / Ubuntu / Kali / Parrot)
+        - Linux (Arch / Fedora / CentOS / Other)
+        - macOS (Apple Silicon - M1/M2/M3)
+        - macOS (Intel)
+        - Windows 10 / 11
+        - Docker Container
+    validations:
+      required: true
+
+  - type: dropdown
+    id: python-version
+    attributes:
+      label: Python Version
+      options:
+        - "3.13"
+        - "3.12"
+        - "3.11"
+        - "3.10"
+        - "3.9"
+        - "3.14 (pre-release)"
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: xoxss-version
+    attributes:
+      label: XOXSS Version
+      description: Run `xoxss --version` or git commit SHA.
+      placeholder: "2.1.0 (commit 8f570fd)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Terminal Output / Traceback
+      description: Paste relevant terminal logs, stack traces, or output from `xoxss --doctor`.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Minimal steps to reproduce the issue.
+      placeholder: |
+        1. Start target service or mock fixture
+        2. Run 'xoxss -u ...'
+        3. Observe error
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate.
+          required: true
+        - label: I have verified that this is a bug in XOXSS, not a network/target accessibility issue.
+          required: true
+        - label: I have redacted any private credentials, tokens, or sensitive target domains.
+          required: true

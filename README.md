@@ -11,6 +11,8 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#requirements)
 ![Version](https://img.shields.io/badge/version-2.0.0-informational.svg)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
+[![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](SECURITY.md)
+[![Contributing](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![SARIF](https://img.shields.io/badge/report-SARIF%20v2.1.0-purple.svg)](#reports-and-exit-codes)
 [![Authorized testing only](https://img.shields.io/badge/use-authorized%20testing%20only-red.svg)](#security-and-legal)
 
@@ -59,6 +61,7 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
   <a href="#performance">Performance</a> •
   <a href="#troubleshooting">Troubleshooting</a> •
   <a href="#development">Development</a> •
+  <a href="#contributing">Contributing</a> •
   <a href="#limitations">Limitations</a> •
   <a href="#security-and-legal">Security &amp; legal</a> •
   <a href="#acknowledgements">Acknowledgements</a> •
@@ -1066,28 +1069,38 @@ source .venv/bin/activate           # Linux/macOS (Windows: .venv\Scripts\activa
 pip install -e ".[dev,interactsh]"
 pip install -e ".[playwright]" && playwright install chromium   # optional
 
-python -m pytest tests -q           # full suite
-python tests/integration_smoke.py   # import/CLI smoke
+# Code quality & verification
 python -m compileall -q xoxss xoxss.py
+ruff check xoxss benchmarks
+pyright
 
-# manual browser checks
-python tests/playwright_check.py
-python tests/playwright_confirm_smoke.py
+# Run local benchmark test suite
+python benchmarks/run_benchmark.py --quick                 # HTTP-only cases (fast)
+python benchmarks/run_benchmark.py                         # full suite with Playwright
 ```
 
-The suite covers reflection scoring, context classification, blind payloads, WAF
-matching, SARIF generation, encoders, AST taint, recon parsers, JS intelligence,
-OpenAPI expansion, OOB correlation, external-tool parsing, mass mode, god mode,
-parameter audit, runtime prototype pollution and a mock interactsh server.
-Browser-dependent tests skip when no browser is available. `pyrightconfig.json`
-configures the CLI entry point, typed configuration and SARIF exporter. CI runs
-Pyright, import/CLI checks, pytest and the integration smoke on Python 3.9 through
-3.13, without a browser.
+The benchmark corpus in `benchmarks/` covers reflection scoring, context classification,
+sanitizer bypasses, DOM source-to-sink taint tracking, and false-positive suppression
+against local loopback fixtures. `pyrightconfig.json` configures the static type checker
+for Python 3.9+ compatibility. CI runs Pyright, Ruff linting, and benchmark verification
+on all supported Python versions (3.9 through 3.14).
 
-Contributions: keep changes focused, explain security rationale, add or update tests
-(never weaken assertions), update this README for flag/report changes, and preserve
-authorized-testing safeguards — no stealth-only features, no destructive defaults, no
-unconfirmed finding promoted to `confirmed` without evidence.
+See [`benchmarks/README.md`](benchmarks/README.md) for details on benchmark cases.
+
+## Contributing
+
+We welcome community contributions, bug reports, false positive submissions, and feature proposals!
+Please review our [`CONTRIBUTING.md`](CONTRIBUTING.md) guide for details on development setup,
+coding standards, and our pull request process.
+
+- **Found a bug?** Open a [Bug Report](https://github.com/gl1tch0x1/xoxss/issues/new?template=bug_report.yml).
+- **Encountered a false positive?** Submit a [False Positive Report](https://github.com/gl1tch0x1/xoxss/issues/new?template=false_positive.yml).
+- **Proposing a feature or tamper?** Share your idea via [Feature Request](https://github.com/gl1tch0x1/xoxss/issues/new?template=feature_request.yml).
+- **Submitting code?** Check the [Pull Request Template](.github/PULL_REQUEST_TEMPLATE.md) before opening a PR.
+
+Contributions: keep changes focused, explain security rationale, maintain zero false positive tolerance
+for benign reflections, update docs for flag/report changes, and preserve authorized-testing safeguards —
+no stealth-only features, no destructive defaults, no unconfirmed finding promoted without evidence.
 
 ## Limitations
 
@@ -1113,6 +1126,7 @@ unconfirmed finding promoted to `confirmed` without evidence.
 
 ## Security and legal
 
+- **Vulnerability Disclosure:** If you discover a security vulnerability in XOXSS itself, please report it privately according to our [Security Policy (SECURITY.md)](SECURITY.md). Do not report security vulnerabilities in public issues.
 - Use XOXSS only against systems you own or have explicit written permission to test.
 - Respect scope files, rate limits and program rules. A scanner that ignores scope is a
   liability, not a tool.

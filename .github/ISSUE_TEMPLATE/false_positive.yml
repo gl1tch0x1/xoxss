@@ -1,0 +1,91 @@
+name: False Positive Report
+description: Report a finding that XOXSS flagged as vulnerable, but is not actually exploitable or reflective.
+title: "[False Positive]: "
+labels: ["false-positive", "scanner"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        XOXSS is designed to minimize false positives through context analysis, AST validation, and headless browser DOM execution checks.
+        If XOXSS reported a High or Medium severity finding on a payload that is completely inert, encoded, or unexecutable, please help us improve detection accuracy by filling out this form.
+
+  - type: dropdown
+    id: vulnerability-type
+    attributes:
+      label: Reported Vulnerability Type
+      description: What type of vulnerability did XOXSS flag?
+      options:
+        - Reflected XSS (HTML Body / Context)
+        - Reflected XSS (Attribute Context)
+        - Reflected XSS (Script / Event Handler Context)
+        - DOM-based XSS (Source-to-Sink)
+        - Stored XSS Candidate
+        - Server-Side Template Injection (SSTI)
+        - Header / Cookie Reflection
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: payload
+    attributes:
+      label: Injected Payload
+      description: The payload that triggered the finding.
+      placeholder: "\"><svg/onload=alert(1)>"
+    validations:
+      required: true
+
+  - type: textarea
+    id: why-false-positive
+    attributes:
+      label: Why is this a False Positive?
+      description: Explain why the finding cannot execute JavaScript or evaluate template syntax.
+      placeholder: |
+        - The characters '<' and '>' are HTML-entity encoded to `&lt;` and `&gt;` in the response.
+        - The payload is reflected inside a comment or inside a dead code block.
+        - The response Content-Type is `application/json` and no browser executes it.
+        - The HTTP status code is 404/500 and the application does not render user HTML.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: browser-validation
+    attributes:
+      label: Was Browser Verification Enabled?
+      description: Did you run XOXSS with `--browser playwright` or `--browser selenium`?
+      options:
+        - "No (HTTP / heuristic only)"
+        - "Yes - Playwright (Headless Chromium)"
+        - "Yes - Selenium (Chrome / Firefox)"
+    validations:
+      required: true
+
+  - type: input
+    id: command
+    attributes:
+      label: Command Executed
+      description: The scan command used (redact proprietary targets).
+      placeholder: xoxss -u "https://target.local/page?param=val" --browser playwright
+    validations:
+      required: true
+
+  - type: textarea
+    id: reflection-snippet
+    attributes:
+      label: Raw Response / DOM Excerpt
+      description: Paste the sanitized reflection snippet or the relevant HTML surrounding the reflected payload (redact sensitive data).
+      render: html
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I verified manually in a browser (DevTools / Console) that the payload did NOT execute.
+          required: true
+        - label: I verified that the finding is not marked as Low confidence or informational note.
+          required: true
+        - label: I have redacted sensitive cookies, hostnames, and authorization tokens.
+          required: true

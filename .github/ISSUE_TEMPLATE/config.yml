@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a Security Vulnerability
+    url: https://github.com/gl1tch0x1/xoxss/security/advisories/new
+    about: Please report security vulnerabilities in XOXSS privately rather than through public issues.
+  - name: GitHub Discussions
+    url: https://github.com/gl1tch0x1/xoxss/discussions
+    about: Ask questions, share custom tamper scripts, and discuss scanning strategies.
+  - name: Documentation & Usage Guide
+    url: https://github.com/gl1tch0x1/xoxss#readme
+    about: Read the official documentation and command-line options.
