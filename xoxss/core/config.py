@@ -2,11 +2,13 @@
 Configuration management for XOXSS scanner.
 """
 
+from __future__ import annotations
+
 import dataclasses
 from dataclasses import dataclass, field
+from enum import Enum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
-from enum import Enum
 
 
 class ScanMode(Enum):
@@ -36,7 +38,7 @@ class BrowserType(Enum):
 class ScanConfig:
     """Comprehensive scan configuration."""
     # Target
-    target: str
+    target: str = ""
     target_list: Optional[str] = None
 
     # Discovery
@@ -88,6 +90,12 @@ class ScanConfig:
     mutation_probe_limit: int = 12
     adaptive_payloads: bool = False
     param_batch_size: int = 100
+    lazy_payloads: bool = True
+    list_encoders: bool = False
+    cookie_test_limit: int = 5
+    payload_dir: Optional[str] = None
+    payload_files: List[str] = field(default_factory=list)
+    _payload_engine: Optional[Any] = None
 
     # Advanced Detection
     polyglot: bool = False
@@ -105,7 +113,10 @@ class ScanConfig:
     file_upload: bool = False
     postmessage: bool = False
     ast_analysis: bool = False
-    # AI fallback (candidate-only; evidence still comes from reflection/browser)
+    dom_source_probes: bool = False
+    ws_active: bool = False
+
+    # AI fallback
     ai: bool = False
     ai_only: bool = False
     ai_key: Optional[str] = None
@@ -124,8 +135,10 @@ class ScanConfig:
     # Browser
     browser: BrowserType = BrowserType.FIREFOX
     headless: bool = False
+    show_browser: bool = False
     no_browser: bool = False
     browser_workers: int = 1
+    browser_discovery_pages: int = 10
     confirm: VerificationStrategy = VerificationStrategy.AUTO
     screenshot: bool = False
     binary: Optional[str] = None
@@ -142,6 +155,7 @@ class ScanConfig:
     # Network
     threads: int = 10
     concurrency: int = 16
+    per_host_concurrency: int = 4
     timeout: float = 20.0
     retries: int = 2
     rate_limit: float = 0.0
@@ -150,8 +164,24 @@ class ScanConfig:
     headers: Dict[str, str] = field(default_factory=dict)
     cookies: Dict[str, str] = field(default_factory=dict)
     cookie_file: Optional[str] = None
+    auth_state: Optional[str] = None
+    http2: bool = False
+    impersonate: Optional[str] = None
+    max_response_bytes: int = 5242880
 
-    # Output
+    # Modes & Presets
+    god: bool = False
+    profile: str = "balanced"
+    mass: bool = False
+    mass_params: str = ""
+    mass_payloads: int = 4
+    param_audit: bool = False
+    max_param_targets: int = 100
+    doctor: bool = False
+    replay: Optional[str] = None
+    replay_report: Optional[str] = None
+
+    # Output & Persistence
     output: Optional[str] = None
     report: str = "all"
     report_dir: str = ".xoxss/reports"
@@ -159,16 +189,15 @@ class ScanConfig:
     quiet: bool = False
     no_color: bool = False
     fail_on_findings: bool = False
-
-    # Persistence
+    fail_on: Optional[str] = None
+    events_jsonl: Optional[str] = None
+    jsonl: Optional[str] = None
     state_dir: str = ".xoxss"
     no_state: bool = False
     no_resume: bool = False
 
     def __post_init__(self):
         """Validate and normalize configuration."""
-        # Programmatic users often pass plain strings for the enum fields;
-        # coerce instead of failing with a type error in deep comparisons.
         if isinstance(self.browser, str):
             try:
                 self.browser = BrowserType(self.browser)
@@ -210,42 +239,29 @@ class ScanConfig:
             raise ValueError("param_batch_size must be between 1 and 100")
 
     def to_namespace(self) -> SimpleNamespace:
-        """Return a plain ``argparse``-compatible namespace for ``XSSScanner``.
-
-        ``XSSScanner`` reads its options from an ``argparse.Namespace``.  This
-        adapter makes :class:`ScanConfig` a supported programmatic entry point
-        without leaking enums (or dataclass proxying) into scanner internals::
-
-            from xoxss.core.config import ScanConfig
-            from xoxss.scanner import XSSScanner, Console
-
-            config = ScanConfig(target="https://example.test", crawl=True)
-            scanner = XSSScanner(config.target, config.to_namespace(), Console())
-
-        Unknown/extra fields are absent, and the scanner reads optional
-        settings through ``getattr`` defaults, exactly as it does for a
-        namespace produced by the CLI.
-        """
+        """Return a plain argparse-compatible namespace for XSSScanner."""
         values = dataclasses.asdict(self)
-        values["browser"] = self.browser.value
-        values["confirm"] = self.confirm.value
+        values["browser"] = self.browser.value if isinstance(self.browser, BrowserType) else self.browser
+        values["confirm"] = self.confirm.value if isinstance(self.confirm, VerificationStrategy) else self.confirm
         return SimpleNamespace(**values)
 
     @classmethod
     def from_namespace(cls, namespace: Any) -> "ScanConfig":
-        """Build a validated config from an ``argparse.Namespace``-like object.
-
-        Unknown attributes are ignored so this can be used with presets that
-        add CLI-only fields (``mass``, ``doctor``, ...).  ``target`` falls back
-        to the namespace's ``target`` attribute or an empty string for callers
-        that supply the URL separately.
-        """
-        known = {field.name for field in dataclasses.fields(cls)}
-        values = {
-            name: getattr(namespace, name)
-            for name in known
-            if hasattr(namespace, name)
-        }
-        values.setdefault("target", getattr(namespace, "target", ""))
+        """Build a validated config from an argparse.Namespace-like object."""
+        known = {f.name for f in dataclasses.fields(cls)}
+        values: Dict[str, Any] = {}
+        for name in known:
+            if hasattr(namespace, name):
+                val = getattr(namespace, name)
+                if val is not None:
+                    values[name] = val
+        values.setdefault("target", getattr(namespace, "target", "") or "")
         return cls(**values)
 
+
+__all__ = [
+    "ScanMode",
+    "VerificationStrategy",
+    "BrowserType",
+    "ScanConfig",
+]

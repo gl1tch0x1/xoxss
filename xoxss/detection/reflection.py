@@ -62,6 +62,10 @@ class ReflectionInfo:
     distortion_percentage: float = 0.0
 
 
+# Backward-compatible alias to distinguish from scan.reflection.ReflectionInfo
+DetectionReflectionInfo = ReflectionInfo
+
+
 class ReflectionAnalyzer:
     """
     Advanced reflection analyzer for XSS detection.
