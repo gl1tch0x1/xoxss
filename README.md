@@ -885,7 +885,7 @@ flowchart TD
     DYN --> RESP["Compare batch response<br/>against controls"]
     RESP --> HIT{"Unique marker reflected?"}
     HIT -->|yes| ATTR["Attribute reflection to exact parameter"]
-    HIT -->|no| DELTA{"Stable response delta?"]
+    HIT -->|no| DELTA{"Stable response delta?"}
     DELTA -->|yes| SPLIT["Bisect candidate batch"]
     SPLIT --> B
     DELTA -->|no| MISS["Mark candidates unreflected"]
