@@ -18,6 +18,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Sequence, Set, Tuple
 
+from xoxss.analysis.framework_sinks import (
+    is_framework_internal_sink,
+    is_sanitizer_barrier,
+    is_static_or_feature_detection,
+    is_third_party_analytics,
+)
+
 
 SOURCE_PATTERNS: Dict[str, str] = {
     "location.hash": r"\b(?:window\.|document\.|self\.|top\.)?location\s*\.\s*hash\b",
@@ -29,13 +36,14 @@ SOURCE_PATTERNS: Dict[str, str] = {
     "document.referrer": r"\bdocument\s*\.\s*referrer\b",
     "document.cookie": r"\bdocument\s*\.\s*cookie\b",
     "window.name": r"\bwindow\s*\.\s*name\b",
-    "localStorage": r"\b(?:window\s*\.\s*)?localStorage\b",
-    "sessionStorage": r"\b(?:window\s*\.\s*)?sessionStorage\b",
+    "localStorage": r"\b(?:window\s*\.\s*)?localStorage\s*(?:\.\s*(?:getItem|key)\s*\(|\[)",
+    "sessionStorage": r"\b(?:window\s*\.\s*)?sessionStorage\s*(?:\.\s*(?:getItem|key)\s*\(|\[)",
     "history.state": r"\bhistory\s*\.\s*state\b",
     "postMessage.data": r"\b(?:event|e|evt|message)\s*\.\s*data\b",
     "URLSearchParams": r"\bURLSearchParams\b",
     "document.location": r"\bdocument\s*\.\s*location\b",
     "window.location": r"\bwindow\s*\.\s*location\b",
+    "indexedDB": r"\b(?:window\s*\.\s*)?indexedDB\s*\.\s*open\b",
 }
 
 # Sinks are (name, regex, context, needs_string_argument).
@@ -176,40 +184,53 @@ def _collect_assignments(code: str) -> Dict[str, List[Tuple[str, int, int, str]]
     return assignments
 
 
-def _tainted_variables(code: str, assignments: Dict[str, List[Tuple[str, int, int, str]]]) -> Dict[str, Tuple[str, int]]:
+SAFE_MINIFIED_NAMES: Set[str] = {
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+    "id", "db", "el", "fn", "cb", "obj", "key", "val", "res", "req",
+    "err", "doc", "win", "evt", "msg", "ctx", "ref", "idx", "num", "str",
+    "node", "item", "data", "it", "to", "at", "in", "of", "on", "up"
+}
+
+
+def _tainted_variables(code: str, assignments: Dict[str, List[Tuple[str, int, int, str]]]) -> Dict[str, Tuple[str, int, int]]:
     """Propagate taint through simple assignments/aliases.
 
-    Returns ``{variable: (source, line)}`` for every tainted alias.
+    Returns ``{variable: (source, line, pos)}`` for every tainted alias.
     """
-    tainted: Dict[str, Tuple[str, int]] = {}
+    tainted: Dict[str, Tuple[str, int, int]] = {}
     source_patterns = list(SOURCE_PATTERNS.items())
 
     for name, entries in assignments.items():
-        for expr, line, _pos, _op in entries:
+        for expr, line, pos, _op in entries:
             for source_name, pattern in source_patterns:
                 if re.search(pattern, expr, flags=re.I):
-                    tainted.setdefault(name, (source_name, line))
+                    tainted.setdefault(name, (source_name, line, pos))
                     break
 
     # Propagate through an explicit dependency graph. Unlike a fixed number of
     # passes, a work queue handles long alias chains in linear time.
-    dependencies: Dict[str, List[Tuple[str, int]]] = {}
+    # CRITICAL: Do NOT propagate single-character or common minified names
+    # globally, as they collide across thousands of distinct closures in bundles.
+    dependencies: Dict[str, List[Tuple[str, int, int]]] = {}
     assignment_names = set(assignments)
     for target, entries in assignments.items():
-        for expr, line, _pos, _op in entries:
+        if target in SAFE_MINIFIED_NAMES:
+            continue
+        for expr, line, pos, _op in entries:
             for identifier in set(re.findall(r"[A-Za-z_$][\w$]*", expr)):
-                if identifier in assignment_names and identifier != target:
-                    dependencies.setdefault(identifier, []).append((target, line))
+                if identifier in assignment_names and identifier != target and identifier not in SAFE_MINIFIED_NAMES:
+                    dependencies.setdefault(identifier, []).append((target, line, pos))
 
     pending = list(tainted)
     visited = set(pending)
     while pending:
         source_var = pending.pop()
-        source_name, source_line = tainted[source_var]
-        for target, line in dependencies.get(source_var, ()):
+        source_name, source_line, source_pos = tainted[source_var]
+        for target, line, pos in dependencies.get(source_var, ()):
             if target in tainted:
                 continue
-            tainted[target] = (source_name, line or source_line)
+            tainted[target] = (source_name, line or source_line, pos or source_pos)
             if target not in visited:
                 pending.append(target)
                 visited.add(target)
@@ -259,10 +280,22 @@ def analyze_javascript_regex(code: str, url: str = "") -> List[TaintFlow]:
     flows: List[TaintFlow] = []
     seen: Set[str] = set()
 
+    is_third_party = is_third_party_analytics(url, cleaned)
+
     for sink_name, pattern, context, needs_string in SINK_PATTERNS:
         for match in re.finditer(pattern, cleaned, flags=re.I):
             expr = (match.group(1) if match.groups() else "").strip()
             if not expr:
+                continue
+
+            # Guard 1: Static string literal or feature-detection probe (zero attacker input)
+            if is_static_or_feature_detection(expr):
+                continue
+
+            snippet = _snippet(cleaned, match.start())
+
+            # Guard 2: Framework runtime internal sink (Vue 3, Alpine, React, jQuery internals)
+            if is_framework_internal_sink(cleaned, snippet, match.start()):
                 continue
 
             direct_source = ""
@@ -275,8 +308,15 @@ def analyze_javascript_regex(code: str, url: str = "") -> List[TaintFlow]:
             if not direct_source:
                 for name in taint_names:
                     if _word_in(name, expr):
+                        # Guard 3: Minified variable name collision
+                        # If the name is short (e.g. 'e', 'id', 'db'), verify lexical proximity (within 800 chars)
+                        if name in SAFE_MINIFIED_NAMES:
+                            assign_entries = assignments.get(name, [])
+                            if not any(0 <= match.start() - entry[2] <= 800 for entry in assign_entries):
+                                continue
                         alias = name
                         break
+
             if not direct_source and not alias:
                 continue
 
@@ -285,37 +325,70 @@ def analyze_javascript_regex(code: str, url: str = "") -> List[TaintFlow]:
                 continue
 
             sanitized, sanitizer = _sanitizer_in(expr)
+            if not sanitized:
+                barrier, barrier_name = is_sanitizer_barrier(expr)
+                if barrier:
+                    sanitized, sanitizer = True, barrier_name
+
             if alias and not sanitized:
                 # Inspect the assignments that produced the alias.
                 chain: List[str] = [alias]
                 for entry_expr, _line, _pos, _op in assignments.get(alias, []):
                     if _sanitizer_in(entry_expr)[0]:
                         sanitized, sanitizer = _sanitizer_in(entry_expr)
+                    else:
+                        barrier, barrier_name = is_sanitizer_barrier(entry_expr)
+                        if barrier:
+                            sanitized, sanitizer = True, barrier_name
                     for other in taint_names:
                         if other != alias and _word_in(other, entry_expr) and other not in chain:
                             chain.append(other)
 
-            source_name = direct_source or (tainted.get(alias, ("unknown", 0))[0])
+            source_name = direct_source
+            if not source_name and alias:
+                preceding_entries = [e for e in assignments.get(alias, []) if e[2] < match.start()]
+                if not preceding_entries:
+                    continue
+                last_assign = preceding_entries[-1]
+                last_expr = last_assign[0]
+
+                # If the variable was reassigned to a static literal or empty value, it is safe
+                if is_static_or_feature_detection(last_expr):
+                    continue
+
+                for s_name, s_pat in SOURCE_PATTERNS.items():
+                    if re.search(s_pat, last_expr, flags=re.I):
+                        source_name = s_name
+                        break
+
+                if not source_name and alias not in SAFE_MINIFIED_NAMES:
+                    for t_name in taint_names:
+                        if _word_in(t_name, last_expr):
+                            source_name = tainted.get(t_name, ("unknown", 0, 0))[0]
+                            if source_name and source_name != "unknown":
+                                break
+
             if not source_name or source_name == "unknown":
                 continue
 
             line = _line_of(cleaned, match.start())
-            snippet = _snippet(cleaned, match.start())
+            flow_confidence = (
+                0.2
+                if sanitized or is_third_party
+                else (0.9 if direct_source else 0.72)
+            )
+
             flow = TaintFlow(
                 source=source_name,
                 sink=sink_name,
-                context=context,
+                context="third-party-analytics" if is_third_party else context,
                 line=line,
                 snippet=snippet,
                 url=url,
                 sanitized=sanitized,
                 sanitizer=sanitizer,
                 path=[alias] if alias else [],
-                confidence=(
-                    0.35
-                    if sanitized
-                    else (0.9 if direct_source else 0.72)
-                ),
+                confidence=flow_confidence,
             )
             if flow.key() not in seen:
                 seen.add(flow.key())

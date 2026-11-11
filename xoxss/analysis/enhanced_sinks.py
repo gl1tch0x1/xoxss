@@ -8,6 +8,11 @@ from typing import List
 from dataclasses import dataclass
 from enum import Enum
 
+from xoxss.analysis.framework_sinks import (
+    is_framework_internal_sink,
+    is_static_or_feature_detection,
+)
+
 
 class EnhancedSink(Enum):
     """Additional XSS sinks beyond the basic ones."""
@@ -81,15 +86,14 @@ class EnhancedSinkTracker:
             r"-moz-binding\s*:",
         ],
         EnhancedSink.CSS_VAR_INJECTION: [
-            r"var\s*\(",
-            r"setProperty\s*\(",
+            r"style\s*=\s*['\"][^'\"]*var\s*\([^)]*javascript:",
+            r"setProperty\s*\(\s*['\"]--[^'\"]+['\"]\s*,\s*[^)]*javascript:",
         ],
         EnhancedSink.WORKER_IMPORTSCRIPTS: [
-            r"importScripts\s*\(",
+            r"\bimportScripts\s*\(",
         ],
         EnhancedSink.IFRAME_SANDBOX: [
-            r"sandbox\s*=",
-            r"allow-scripts",
+            r"<iframe[^>]*sandbox\s*=\s*['\"][^'\"]*allow-scripts",
         ],
         EnhancedSink.OBJECT_SRCDOC: [
             r"<object[^>]*srcdoc\s*=",
@@ -98,27 +102,26 @@ class EnhancedSinkTracker:
             r"<embed[^>]*srcdoc\s*=",
         ],
         EnhancedSink.DATA_URI_SCRIPT: [
-            r"data:text/javascript",
-            r"data:application/javascript",
+            r"['\"]data:(?:text|application)/javascript",
         ],
         EnhancedSink.JAVASCRIPT_URI: [
-            r"javascript:",
+            r"['\"]javascript:[^'\"]+",
         ],
         EnhancedSink.DOCUMENT_REFERRER: [
-            r"document\.referrer",
+            r"\bdocument\.referrer\b",
         ],
         EnhancedSink.OPENER: [
-            r"window\.opener",
+            r"\bwindow\.opener\s*\.\s*(?:location|eval|document\.write)",
         ],
         EnhancedSink.NAME: [
-            r"window\.name",
+            r"(?:eval|Function|document\.write|\.innerHTML\s*=)[^;]*\bwindow\.name\b",
         ],
         EnhancedSink.WEBSQL_EXECUTE: [
-            r"executeSql\s*\(",
+            r"\.executeSql\s*\(\s*['\"]SELECT\b",
         ],
         EnhancedSink.INDEXEDDB_EXECUTE: [
-            r"add\s*\(",
-            r"put\s*\(",
+            r"\.objectStore\s*\([^)]*\)\s*\.\s*(?:add|put)\s*\(",
+            r"\bIDBObjectStore\.prototype\.(?:add|put)\b",
         ],
     }
 
@@ -127,29 +130,47 @@ class EnhancedSinkTracker:
 
     def analyze(self, content: str, content_type: str = "text/html") -> List[SinkMatch]:
         """
-        Analyze content for enhanced sinks.
-
-        Args:
-            content: HTML or JavaScript content
-            content_type: Content type (text/html, application/javascript, etc.)
-
-        Returns:
-            List of matched sinks
+        Analyze content for enhanced sinks with bounded snippet extraction
+        and framework runtime suppression.
         """
         self._matches = []
-        lines = content.split('\n')
+        if not content:
+            return self._matches
 
-        for line_num, line in enumerate(lines, 1):
-            for sink, patterns in self.SINK_PATTERNS.items():
-                for pattern in patterns:
-                    if re.search(pattern, line, re.IGNORECASE):
-                        self._matches.append(SinkMatch(
-                            sink=sink,
-                            line=line_num,
-                            code=line.strip(),
-                            context=content_type,
-                            confidence=0.7
-                        ))
+        # Check by regex matches across the content rather than entire lines
+        # to prevent megabyte-long minified lines from exploding snippets
+        seen_keys = set()
+        for sink, patterns in self.SINK_PATTERNS.items():
+            for pattern in patterns:
+                for match in re.finditer(pattern, content, re.IGNORECASE):
+                    start = match.start()
+                    line_num = content.count('\n', 0, start) + 1
+                    snippet_start = max(0, start - 60)
+                    snippet_end = min(len(content), match.end() + 100)
+                    snippet = content[snippet_start:snippet_end].replace('\n', ' ').strip()
+
+                    # Guard against framework internals and static/feature checks
+                    if is_framework_internal_sink(content, snippet, start):
+                        continue
+                    if is_static_or_feature_detection(snippet):
+                        continue
+
+                    key = (sink, line_num, snippet[:80])
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    self._matches.append(SinkMatch(
+                        sink=sink,
+                        line=line_num,
+                        code=snippet,
+                        context=content_type,
+                        confidence=0.7
+                    ))
+                    if len(self._matches) >= 50:
+                        break
+                if len(self._matches) >= 50:
+                    break
 
         return self._matches
 

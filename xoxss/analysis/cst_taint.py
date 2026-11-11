@@ -18,6 +18,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from xoxss.analysis.ast_taint import TaintFlow
+from xoxss.analysis.framework_sinks import (
+    is_framework_internal_sink,
+    is_sanitizer_barrier,
+    is_static_or_feature_detection,
+    is_third_party_analytics,
+)
 
 try:  # pragma: no cover - exercised only when the optional dependency exists
     from tree_sitter import Language, Parser  # type: ignore
@@ -43,13 +49,14 @@ _SOURCE_PATTERNS: List[Tuple[str, re.Pattern]] = [
     ("document.referrer", re.compile(r"^document\.referrer$")),
     ("document.cookie", re.compile(r"^document\.cookie$")),
     ("window.name", re.compile(r"^window\.name$")),
-    ("localStorage", re.compile(r"^(?:(?:window)\.)?localStorage(?:\[|\.|$)")),
-    ("sessionStorage", re.compile(r"^(?:(?:window)\.)?sessionStorage(?:\[|\.|$)")),
+    ("localStorage", re.compile(r"^(?:(?:window)\.)?localStorage(?:\.(?:getItem|key)|\[)")),
+    ("sessionStorage", re.compile(r"^(?:(?:window)\.)?sessionStorage(?:\.(?:getItem|key)|\[)")),
     ("history.state", re.compile(r"^history\.state$")),
     ("postMessage.data", re.compile(r"^(?:event|e|evt|message)\.data$")),
     ("URLSearchParams", re.compile(r"^(?:new\s+)?URLSearchParams$")),
     ("document.location", re.compile(r"^document\.location$")),
     ("window.location", re.compile(r"^window\.location$")),
+    ("indexedDB", re.compile(r"^(?:(?:window)\.)?indexedDB\.open$")),
 ]
 
 _SANITIZERS: List[Tuple[str, re.Pattern]] = [
@@ -528,20 +535,30 @@ class _CstAnalyzer:
             return
         line = _line(node)
         snippet = _snippet(self.code, node)
+
+        # Guard 1: Static string literal or feature-detection probe
+        if is_static_or_feature_detection(snippet):
+            return
+
+        # Guard 2: Framework runtime internal sink (Vue, Alpine, React, jQuery)
+        if is_framework_internal_sink(self.code, snippet, node.start_byte):
+            return
+
+        is_third_party = is_third_party_analytics(self.url, self.code)
         path = list(taint.path or [])
         if alias and alias not in path:
             path.insert(0, alias)
         flow = TaintFlow(
             source=taint.source,
             sink=sink,
-            context=context,
+            context="third-party-analytics" if is_third_party else context,
             line=line,
             snippet=snippet,
             url=self.url,
             sanitized=taint.sanitized,
             sanitizer=taint.sanitizer,
             path=path,
-            confidence=0.35 if taint.sanitized else (0.9 if not path else 0.75),
+            confidence=0.2 if (taint.sanitized or is_third_party) else (0.9 if not path else 0.75),
         )
         if flow.key() not in self.seen:
             self.seen.add(flow.key())

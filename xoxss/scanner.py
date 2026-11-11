@@ -2165,27 +2165,55 @@ def extract_scripts(base_url: str, html_text: str) -> List[DomScript]:
 
 
 def static_dom_candidates(scripts: Sequence[DomScript]) -> List[Dict[str, str]]:
+    from xoxss.analysis.framework_sinks import (
+        is_framework_internal_sink,
+        is_sanitizer_barrier,
+        is_static_or_feature_detection,
+        is_third_party_analytics,
+    )
+
     candidates: List[Dict[str, str]] = []
     for script in scripts:
         content = script.content or ""
-        lowered = content.lower()
         if not content:
             continue
+        if is_third_party_analytics(script.url or "", content):
+            continue
+
         for sink_name, sink_re in DOM_SINKS:
             for match in re.finditer(sink_re, content, re.IGNORECASE):
-                window = lowered[max(0, match.start() - 700): match.start()]
-                source = next((src for src in DOM_SOURCES if src in window), "")
-                if source:
-                    snippet = re.sub(r"\s+", " ", content[max(0, match.start() - 80): match.end() + 120])
-                    candidates.append(
-                        {
-                            "source": source,
-                            "sink": sink_name,
-                            "script": script.url,
-                            "snippet": snippet,
-                        }
-                    )
-                    break  # one candidate per sink occurrence
+                snippet = re.sub(r"\s+", " ", content[max(0, match.start() - 80): match.end() + 120])
+
+                # Guard 1: Static string literal or feature-detection probe
+                if is_static_or_feature_detection(snippet):
+                    continue
+
+                # Guard 2: Framework runtime internal sink (Vue, Alpine, React, jQuery)
+                if is_framework_internal_sink(content, snippet, match.start()):
+                    continue
+
+                # Guard 3: Strict provenance & data flow binding (bounded local window)
+                local_window = content[max(0, match.start() - 300): match.end() + 120]
+                lowered_window = local_window.lower()
+
+                source = next((src for src in DOM_SOURCES if src in lowered_window), "")
+                if not source:
+                    continue
+
+                # Guard 4: Active sanitizers
+                sanitized, _ = is_sanitizer_barrier(local_window)
+                if sanitized:
+                    continue
+
+                candidates.append(
+                    {
+                        "source": source,
+                        "sink": sink_name,
+                        "script": script.url,
+                        "snippet": snippet,
+                    }
+                )
+                break  # one candidate per sink occurrence
     return candidates
 
 
@@ -3911,6 +3939,15 @@ class XSSScanner(CrawlerMixin):
         sanitized = bool(getattr(flow, "sanitized", False))
         if sanitized and not getattr(self.args, "report_reflections", False):
             return
+        context = str(getattr(flow, "context", "dom") or "dom")
+        if context == "third-party-analytics" and not getattr(self.args, "report_reflections", False):
+            return
+
+        snippet = str(getattr(flow, "snippet", "") or "")
+        from xoxss.analysis.framework_sinks import is_framework_internal_sink, is_static_or_feature_detection
+        if is_framework_internal_sink("", snippet) or is_static_or_feature_detection(snippet):
+            return
+
         if sum(1 for finding in self.findings if "ast" in finding.tags) >= 50:
             return
         score = float(getattr(flow, "confidence", 0.7) or 0.0)
@@ -5603,14 +5640,19 @@ class XSSScanner(CrawlerMixin):
                         "key": vector.key,
                         "persistent": vector.persistent,
                         "description": vector.description,
+                        "source_api": vector.source_api,
+                        "sink_api": vector.sink_api,
+                        "sink_snippet": vector.sink_snippet,
+                        "attacker_reachable": vector.attacker_reachable,
+                        "sanitized": vector.sanitized,
                     }
                     if finding not in self.storage_findings:
                         self.storage_findings.append(finding)
                     add(
-                        vector.storage_type.value,
-                        "storage-sink",
+                        vector.source_api or vector.storage_type.value,
+                        vector.sink_api or "storage-sink",
                         script.url or url,
-                        vector.description,
+                        vector.sink_snippet or vector.description,
                     )
         return candidates
 

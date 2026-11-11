@@ -231,3 +231,164 @@ class FrameworkSinkExploiter:
 
         total_confidence = sum(b.confidence for b in bypasses)
         return round(total_confidence / len(bypasses), 2)
+
+
+# ---------------------------------------------------------------------------
+# Framework Runtime & False-Positive Elimination Guards
+# ---------------------------------------------------------------------------
+
+_FRAMEWORK_INTERNAL_PATTERNS = [
+    # Vue 3 runtime internals (insertStaticContent, patchProp, hostSetElementText, v-html directive runtime)
+    re.compile(r"\b(?:insertStaticContent|patchProp|hostSetElementText|setElementText)\b"),
+    re.compile(r"\bcreateVNode\s*\(|_createElementVNode\s*\("),
+    re.compile(r"\b[A-Za-z0-9_$]+\.innerHTML\s*=\s*[A-Za-z0-9_$]+\s*\([^)]*\)"),  # Minified template compiler: Af.innerHTML = Ef(...)
+    # Alpine.js runtime internals (x-html directive registration, evaluateLater wrapper)
+    re.compile(r"\b(?:Alpine\.)?directive\s*\(\s*['\"]html['\"]"),
+    re.compile(r"\bD\s*\(\s*['\"]html['\"]"),  # Minified Alpine: D('html', (e, ...))
+    re.compile(r"\b['\"]html['\"],\s*\([A-Za-z0-9_$,\s{}:]+\)\s*=>"),
+    re.compile(r"\b(?:evaluateLater|mutateDom)\b"),
+    # React runtime internals (setInnerHTML, dangerouslySetInnerHTML definition in react-dom)
+    re.compile(r"\bfunction\s+setInnerHTML\s*\("),
+    re.compile(r"\bsetValueForProperty\b"),
+    re.compile(r"\bsetInitialProperties\b"),
+    re.compile(r"__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED"),
+    # jQuery runtime internals (core method definitions on prototype)
+    re.compile(r"jQuery\.fn\.(?:html|append|prepend|before|after|replaceWith)\s*="),
+    re.compile(r"jQuery\.fn\.extend\s*\("),
+    # Angular runtime internals (DomSanitizer implementation, SecurityContext)
+    re.compile(r"\bDomSanitizerImpl\b"),
+    re.compile(r"\bSecurityContext\.(?:HTML|SCRIPT|STYLE)\b"),
+    re.compile(r"\b_sanitizeHtml\b"),
+    # Svelte runtime internals
+    re.compile(r"\bfunction\s+set_data\s*\("),
+    re.compile(r"\bclaim_element\s*\("),
+]
+
+_STATIC_FEATURE_TEST_PATTERNS = [
+    # Empty assignments
+    re.compile(r"^\s*['\"`]?[ \t\r\n]*['\"`]?\s*$"),
+    re.compile(r"^\s*(?:null|undefined|false|0)\s*$"),
+    # Static string literals (single or double quoted, no variables)
+    re.compile(r"^\s*['\"][^'\"]*['\"]\s*$"),
+    # Static template literals without ${...} interpolations
+    re.compile(r"^\s*`[^`$]*`\s*$"),
+    # Polyfill / browser feature detection idiom (createElement('div').innerHTML = '<svg>')
+    re.compile(r"document\.createElement\s*\(\s*['\"](?:div|template|table|svg|a|span)['\"]\s*\)"),
+    re.compile(r"\.innerHTML\s*=\s*['\"]<(?:svg|table|div|link|input|form|xyz|a|tbody|tr)[^'\"]*['\"]"),
+    re.compile(r"\b(?:checkClone|leadingWhitespace|support\.[a-zA-Z0-9_$]+)\b"),
+]
+
+_SANITIZER_PATTERNS = [
+    ("DOMPurify", re.compile(r"\bDOMPurify\s*\.\s*sanitize\b")),
+    ("sanitizeHtml", re.compile(r"\bsanitizeHtml\s*\(|\bsanitize\s*\(")),
+    ("validator.escape", re.compile(r"\bvalidator\s*\.\s*escape\b")),
+    ("escapeHtml", re.compile(r"\bescape(?:Html|HTML)\b")),
+    ("encodeURIComponent", re.compile(r"\bencodeURIComponent\s*\(")),
+    ("encodeURI", re.compile(r"\bencodeURI\s*\(")),
+    ("TrustedTypes", re.compile(r"\bTrustedTypes\b|\bcreatePolicy\s*\(")),
+    ("filterXSS", re.compile(r"\bfilterXSS\s*\(|\bxss\s*\(")),
+]
+
+_THIRD_PARTY_ANALYTICS_DOMAINS = (
+    "googletagmanager.com",
+    "google-analytics.com",
+    "analytics.google.com",
+    "cdn.segment.com",
+    "widget.intercom.io",
+    "js.intercomcdn.com",
+    "connect.facebook.net",
+    "static.hotjar.com",
+    "script.hotjar.com",
+    "static.cloudflareinsights.com",
+    "browser.sentry-cdn.com",
+    "cdn.amplitude.com",
+    "api.mixpanel.com",
+    "cdn.mxpnl.com",
+    "bat.bing.com",
+    "clarity.ms",
+    "ads.linkedin.com",
+    "snap.licdn.com",
+    "analytics.tiktok.com",
+    "ct.pinterest.com",
+    "static.criteo.net",
+    "datadoghq-browser-agent.com",
+    "js-agent.newrelic.com",
+    "rum.browser-intake-datadoghq.com",
+)
+
+_THIRD_PARTY_CONTENT_SIGNATURES = [
+    re.compile(r"window\.dataLayer\s*=\s*window\.dataLayer\s*\|\|\s*\[\]"),
+    re.compile(r"gtag\s*\(\s*['\"]config['\"]"),
+    re.compile(r"fbq\s*\(\s*['\"]init['\"]"),
+    re.compile(r"analytics\.load\s*\("),
+    re.compile(r"window\.Intercom\s*\("),
+    re.compile(r"hj\s*=\s*window\.hj\s*\|\|\s*function"),
+]
+
+
+def is_framework_internal_sink(code: str, snippet: str = "", offset: int = -1) -> bool:
+    """
+    Check if a DOM sink assignment is part of an internal framework runtime wrapper
+    (Vue 3, Alpine.js, React, jQuery, Angular, Svelte) rather than an application-level vulnerability.
+    """
+    target = snippet or code
+    if offset >= 0 and code:
+        start = max(0, offset - 400)
+        end = min(len(code), offset + 400)
+        target = code[start:end]
+
+    for pat in _FRAMEWORK_INTERNAL_PATTERNS:
+        if pat.search(target):
+            return True
+    return False
+
+
+def is_static_or_feature_detection(expr_or_snippet: str) -> bool:
+    """
+    Check if an assigned expression is a compile-time string literal, empty string,
+    or browser polyfill feature detection check (zero external input).
+    """
+    expr = expr_or_snippet.strip()
+    if not expr:
+        return True
+
+    # If snippet has an assignment, extract the right-hand side
+    if "=" in expr and not expr.startswith("="):
+        parts = expr.split("=", 1)
+        # Check if LHS was innerHTML or outerHTML
+        if re.search(r"\b(?:innerHTML|outerHTML)\s*$", parts[0]):
+            expr = parts[1].strip().rstrip(";").strip()
+
+    for pat in _STATIC_FEATURE_TEST_PATTERNS:
+        if pat.search(expr):
+            return True
+
+    return False
+
+
+def is_sanitizer_barrier(expr_or_code: str) -> Tuple[bool, str]:
+    """
+    Detect whether an expression passes through a recognized sanitizer or encoding barrier.
+    """
+    for name, pat in _SANITIZER_PATTERNS:
+        if pat.search(expr_or_code):
+            return True, name
+    return False, ""
+
+
+def is_third_party_analytics(url: str, content: str = "") -> bool:
+    """
+    Check whether a script is a known third-party tracking, analytics, or tag-manager script.
+    """
+    if url:
+        lowered = url.lower()
+        if any(domain in lowered for domain in _THIRD_PARTY_ANALYTICS_DOMAINS):
+            return True
+
+    if content:
+        for pat in _THIRD_PARTY_CONTENT_SIGNATURES:
+            if pat.search(content):
+                return True
+
+    return False
+
