@@ -59,10 +59,10 @@ class LLMTriageEngine:
 
     def __init__(
         self,
-        provider: str = "",
-        api_key: str = "",
-        model: str = "",
-        endpoint: str = "",
+        provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        endpoint: Optional[str] = None,
         timeout: float = 12.0,
     ) -> None:
         try:

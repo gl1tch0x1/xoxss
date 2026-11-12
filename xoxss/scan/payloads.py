@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -18,7 +19,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from xoxss.core.http import USER_AGENT
-from xoxss.utils.console import Console, truncate
+from xoxss.utils.console import Console, js_marker, truncate
+
+_DIALOG_CALL_RE = re.compile(
+    r"\b(?P<fn>alert|confirm|prompt)\s*\(\s*(?:['\"]?1['\"]?|[^)]*?)\s*\)",
+    re.IGNORECASE,
+)
 
 PAYLOAD_SOURCES: Tuple[str, ...] = (
     "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt",
@@ -535,21 +541,115 @@ class PayloadEngine:
             kind = "remote" if remote else "custom"
             self.console.ok(f"Loaded {added} {kind} payload(s) from {path}", important=False)
 
-    def payloads_for(self, context: str, limit: int = 6) -> List[str]:
-        """Return prioritized payloads for context up to limit."""
-        pool: List[str] = list(self.payloads.get(context, self.payloads["generic"]))
-        if context != "generic":
-            for fallback in self.payloads["generic"]:
-                if fallback not in pool:
-                    pool.append(fallback)
-        if self.lazy_payloads:
-            lazy_candidates = self._lazy_by_context.get(context, self._lazy_by_context.get("generic", []))
-            for p in lazy_candidates:
-                if p not in pool:
-                    pool.append(p)
-                if len(pool) >= limit * 2:
-                    break
-        return pool[:limit]
+    def _register(self, context: str, payload: str) -> bool:
+        slot = (context, payload)
+        if slot in self._seen_slots:
+            return False
+        self._seen_slots.add(slot)
+        self._seen.add(payload)
+        self.payloads.setdefault(context, []).append(payload)
+        return True
+
+    def probe(self, token: str) -> str:
+        return f"{token} <>\"'`()=/\\\\"
+
+    def _lazy_pool_for(self, context: str) -> List[str]:
+        cached = self._lazy_pool_cache.get(context)
+        if cached is not None:
+            return cached
+        contexts: List[str] = []
+        if context in self._lazy_by_context:
+            contexts.append(context)
+        if "generic" in self._lazy_by_context:
+            contexts.append("generic")
+        seen: Set[str] = set(self._seen)
+        pool: List[str] = []
+        for ctx in contexts:
+            for template in self._lazy_by_context.get(ctx, []):
+                if template in seen:
+                    continue
+                seen.add(template)
+                pool.append(template)
+        self._lazy_pool_cache[context] = pool
+        return pool
+
+    def payloads_for(self, context: str, limit: Optional[int] = None) -> List[str]:
+        contexts = [context] if context in self.payloads else []
+        for fallback in ("generic", "html"):
+            if fallback not in contexts:
+                contexts.append(fallback)
+        seen: Set[str] = set()
+        base: List[str] = []
+        for ctx in contexts:
+            for template in self.payloads.get(ctx, []):
+                if template in seen or template in self._remote_set:
+                    continue
+                seen.add(template)
+                base.append(template)
+
+        lazy_pool = self._lazy_pool_for(context)
+
+        if limit is None:
+            return (
+                base
+                + [payload for payload in self.remote_payloads if payload not in seen]
+                + lazy_pool
+            )
+
+        limit = max(1, limit)
+        used: Set[str] = set()
+        result: List[str] = []
+
+        def take(pool: Sequence[str], quota: int) -> None:
+            if quota <= 0:
+                return
+            candidates = [item for item in pool if item not in used and item not in result]
+            if not candidates:
+                return
+            chosen = random.sample(candidates, quota) if len(candidates) > quota else candidates
+            for item in chosen:
+                if item not in used:
+                    used.add(item)
+                    result.append(item)
+
+        if lazy_pool:
+            # 50% curated, 30% LazyXss, 20% downloaded corpus.  At least one
+            # curated payload is always kept so small limits stay reliable.
+            base_quota = max(1, limit // 2)
+            lazy_quota = min(max(1, int(limit * 0.3)), max(0, limit - base_quota))
+            remote_quota = max(0, limit - base_quota - lazy_quota)
+            if not self.remote_payloads:
+                lazy_quota += remote_quota
+                remote_quota = 0
+            take(base[:base_quota], base_quota)
+            take(lazy_pool, lazy_quota)
+            take(self.remote_payloads, remote_quota)
+            # Fill any shortfall (small pools, duplicates) from the remaining
+            # curated payloads first, then the extended pools.
+            take(base[base_quota:], limit - len(result))
+            take(lazy_pool, limit - len(result))
+            take(self.remote_payloads, limit - len(result))
+        else:
+            remote_quota = max(1, limit // 3) if self.remote_payloads else 0
+            base_quota = max(0, limit - remote_quota)
+            take(base, base_quota)
+            take(self.remote_payloads, remote_quota)
+            take(base[base_quota:], limit - len(result))
+        return result[:limit]
+
+    def render(self, template: str, token: str, context: str = "") -> str:
+        marker = js_marker(token)
+        codes = ",".join(str(ord(ch)) for ch in token)
+        # Substitute alert(1) and generic dialog calls with the unique per-payload marker
+        template = _DIALOG_CALL_RE.sub(
+            lambda m: f"{m.group('fn')}(String.fromCharCode({codes}))",
+            template,
+        )
+        if "{m}" in template:
+            return template.replace("{m}", marker)
+        if "{t}" in template:
+            return template.replace("{t}", token)
+        return embed_marker(template, marker, context)
 
 
 __all__ = [

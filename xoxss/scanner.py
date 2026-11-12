@@ -220,6 +220,7 @@ from xoxss.core.evidence import (
     request_to_dict,
     response_excerpt,
 )
+from xoxss.core.browser import BrowserEngine, BrowserPool, PlaywrightEngine
 from xoxss.core.config import ScanConfig, load_dotenv
 from xoxss.core.finding import (
     CONFIDENCE_LEVELS,
@@ -693,7 +694,7 @@ class XSSScanner(CrawlerMixin):
         self.context_mutator = ContextMutator() if (HAS_HYBRID and ContextMutator is not None) else None
         self.llm_triage = (
             LLMTriageEngine(
-                provider=getattr(args, "llm_provider", "none") or "none",
+                provider=str(getattr(args, "llm_provider", "") or "none"),
                 api_key=getattr(args, "llm_api_key", None),
                 model=getattr(args, "llm_model", None),
                 endpoint=getattr(args, "llm_endpoint", None),
