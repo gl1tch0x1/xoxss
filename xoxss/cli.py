@@ -621,9 +621,11 @@ def build_parser(
 
     persistence = parser.add_argument_group("persistence", "resume checkpoints and scan state")
     persistence.add_argument(
+        "--env",
         "--config",
+        dest="config",
         metavar="PATH",
-        help="path to custom .env or .config file (default: auto-discovers .env and .config in working directory and user home)",
+        help="path to custom .env file (default: auto-discovers .env in working directory and user home)",
     )
     persistence.add_argument("--state-dir", default=default_state_dir, help="state/report root (default: .xoxss)")
     persistence.add_argument("--no-state", action="store_true", help="disable checkpoints")

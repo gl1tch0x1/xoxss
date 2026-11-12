@@ -12,19 +12,19 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 
-def load_dotenv_or_config(
+def load_dotenv(
     custom_path: Optional[str | Path] = None,
     override: bool = False,
 ) -> Dict[str, str]:
     """
-    Search and load environment variables from .env or .config files.
+    Search and load environment variables from .env files.
 
     Order of discovery:
     1. custom_path (if provided)
-    2. os.environ.get("XOXSS_CONFIG") or os.environ.get("XOXSS_ENV")
-    3. Current working directory: .env, .config
-    4. Project/repository root: .env, .config
-    5. User home: ~/.xoxss/.env, ~/.config/xoxss/config
+    2. os.environ.get("XOXSS_ENV") or os.environ.get("XOXSS_CONFIG")
+    3. Current working directory: .env
+    4. Project/repository root: .env
+    5. User home: ~/.xoxss/.env
     """
     import os
 
@@ -34,7 +34,7 @@ def load_dotenv_or_config(
     if custom_path:
         paths_to_check.append(Path(custom_path))
 
-    for env_var in ("XOXSS_CONFIG", "XOXSS_ENV"):
+    for env_var in ("XOXSS_ENV", "XOXSS_CONFIG"):
         val = os.environ.get(env_var)
         if val:
             paths_to_check.append(Path(val))
@@ -47,11 +47,8 @@ def load_dotenv_or_config(
 
     candidates = [
         cwd / ".env",
-        cwd / ".config",
         repo_root / ".env",
-        repo_root / ".config",
         Path.home() / ".xoxss" / ".env",
-        Path.home() / ".config" / "xoxss" / "config",
     ]
     for c in candidates:
         if c not in paths_to_check:
@@ -83,6 +80,10 @@ def load_dotenv_or_config(
             continue
 
     return loaded
+
+
+# Backward compatibility alias
+load_dotenv_or_config = load_dotenv
 
 
 class ScanMode(Enum):
@@ -274,9 +275,9 @@ class ScanConfig:
     def __post_init__(self):
         """Validate and normalize configuration."""
         if self.config:
-            load_dotenv_or_config(self.config, override=True)
+            load_dotenv(self.config, override=True)
         else:
-            load_dotenv_or_config()
+            load_dotenv()
         if isinstance(self.browser, str):
             try:
                 self.browser = BrowserType(self.browser)
@@ -343,5 +344,6 @@ __all__ = [
     "VerificationStrategy",
     "BrowserType",
     "ScanConfig",
+    "load_dotenv",
     "load_dotenv_or_config",
 ]

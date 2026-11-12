@@ -511,7 +511,7 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--log-file PATH` | Write the full human-readable text log to a file. `-o, --output` remains a deprecated alias. |
 | `--report LIST` | `json`, `md`, `html`, `sarif`, combinations, `all`, or `none` (default `all`). |
 | `--report-dir DIR` / `--state-dir DIR` | Report root / checkpoint root (default `.xoxss`). |
-| `--config PATH` | Custom `.env` or `.config` file path (auto-discovers `.env` and `.config`). |
+| `--env PATH` / `--config PATH` | Custom `.env` file path (auto-discovers `.env`). |
 | `--events-jsonl PATH` | Append versioned JSONL target, discovery, finding, and completion events for automation. |
 | `--no-state` / `--no-resume` | Disable checkpoints / reset and start over. |
 | `--verbose` / `--quiet` / `--no-color` | Debug output / findings-only / disable ANSI colours. |
@@ -858,10 +858,10 @@ Temporary remote payloads live in a unique directory under the system temp direc
 
 ## Configuration
 
-XOXSS automatically discovers and loads settings and sensitive API keys from `.env` or
-`.config` files located in the current working directory, repository root, or user home
-directory (`~/.xoxss/.env`). You can also specify an explicit configuration file via
-`--config PATH`.
+XOXSS automatically discovers and loads settings and sensitive API keys from a `.env`
+file located in the current working directory, repository root, or user home
+directory (`~/.xoxss/.env`). You can also specify an explicit path via `--env PATH`
+(or `--config PATH`).
 
 A template with all supported keys and documentation is bundled as [`.env.example`](.env.example):
 

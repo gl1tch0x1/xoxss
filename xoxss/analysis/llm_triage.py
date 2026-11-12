@@ -66,8 +66,8 @@ class LLMTriageEngine:
         timeout: float = 12.0,
     ) -> None:
         try:
-            from xoxss.core.config import load_dotenv_or_config
-            load_dotenv_or_config()
+            from xoxss.core.config import load_dotenv
+            load_dotenv()
         except Exception:
             pass
 
