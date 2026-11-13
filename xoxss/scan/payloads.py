@@ -4,6 +4,7 @@ Payload corpora, remote payload downloading, caching, classification, and marker
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -19,12 +20,80 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from xoxss.core.http import USER_AGENT
+from xoxss.detection.payload import (
+    CATALOG_SOURCE,
+    catalog_by_context,
+    catalog_counts,
+    catalog_total,
+)
 from xoxss.utils.console import Console, js_marker, truncate
 
-_DIALOG_CALL_RE = re.compile(
-    r"\b(?P<fn>alert|confirm|prompt)\s*\(\s*(?:['\"]?1['\"]?|[^)]*?)\s*\)",
-    re.IGNORECASE,
-)
+_DIALOG_NAME_RE = re.compile(r"\b(?P<fn>alert|confirm|prompt)\b", re.IGNORECASE)
+
+
+def _matching_paren(text: str, start: int) -> Optional[int]:
+    """Return the index of the ``)`` that closes ``text[start]``.
+
+    Quotes and escapes are skipped so nested calls such as
+    ``alert(String.fromCharCode(88, 83, 83))`` close on the right paren.
+    """
+    depth = 0
+    quote = ""
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in "'\"`":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _rewrite_dialog_calls(payload: str, call: str) -> str:
+    """Replace ``alert``/``confirm``/``prompt`` calls with a marker call.
+
+    Balanced-parenthesis scanning keeps nested expressions intact, unlike a
+    flat regex, so catalog vectors that already use ``String.fromCharCode`` do
+    not acquire an extra ``)``.
+    """
+    pieces: List[str] = []
+    cursor = 0
+    while cursor < len(payload):
+        match = _DIALOG_NAME_RE.search(payload, cursor)
+        if match is None:
+            pieces.append(payload[cursor:])
+            break
+        end = match.end()
+        probe = end
+        while probe < len(payload) and payload[probe].isspace():
+            probe += 1
+        closing: Optional[int] = None
+        if probe < len(payload) and payload[probe] == "(":
+            closing = _matching_paren(payload, probe)
+        elif probe < len(payload) and payload[probe] == "`":
+            tick = payload.find("`", probe + 1)
+            if tick != -1:
+                closing = tick
+        if closing is None:
+            pieces.append(payload[cursor:end])
+            cursor = end
+            continue
+        pieces.append(payload[cursor:match.start()])
+        pieces.append(f"{match.group('fn')}({call})")
+        cursor = closing + 1
+    return "".join(pieces)
 
 PAYLOAD_SOURCES: Tuple[str, ...] = (
     "https://raw.githubusercontent.com/danielmiessler/SecLists/master/Fuzzing/XSS/robot-friendly/XSS-Jhaddix.txt",
@@ -375,13 +444,16 @@ class PayloadEngine:
         remote_files: Optional[Sequence[str]] = None,
         corpus_dirs: Optional[Sequence[str]] = None,
         lazy_payloads: bool = True,
+        catalog_payloads: bool = True,
     ) -> None:
         self.console = console
         self.payloads: Dict[str, List[str]] = {key: list(value) for key, value in DEFAULT_PAYLOADS.items()}
         self.remote_payloads: List[str] = []
         self.lazy_payloads: List[str] = []
+        self.catalog: Dict[str, List[str]] = {}
         self._lazy_by_context: Dict[str, List[str]] = {}
         self._lazy_pool_cache: Dict[str, List[str]] = {}
+        self._base_cache: Dict[str, Tuple[str, ...]] = {}
         self._remote_set: Set[str] = set()
         self._seen: Set[str] = {payload for values in self.payloads.values() for payload in values}
         self._seen_slots: Set[Tuple[str, str]] = {
@@ -389,6 +461,16 @@ class PayloadEngine:
             for context, values in self.payloads.items()
             for payload in values
         }
+        if catalog_payloads:
+            for context in self.payloads:
+                pool = catalog_by_context(context, auto_only=True, fallback=False)
+                if pool:
+                    self.catalog[context] = pool
+            if self.catalog:
+                self.console.debug(
+                    f"Bundled payload catalog: {catalog_total()} vector(s) in "
+                    f"{len(catalog_counts())} families ({CATALOG_SOURCE})"
+                )
         if extra_file:
             for path in extra_file.split(os.pathsep):
                 if path.strip():
@@ -399,6 +481,35 @@ class PayloadEngine:
             self._load_file(path, remote=True, quiet=True)
         if lazy_payloads:
             self._load_lazy_corpus()
+
+    def clone(self) -> "PayloadEngine":
+        """Copy the engine so a target can register payloads in isolation.
+
+        The engine is cached on the argument namespace and reused for every
+        target in a run, but framework bypasses are registered per target.
+        Sharing the mutable pools would leak target A's bypasses into target B,
+        so each scanner gets its own structural copy of the pool containers
+        (the payload strings themselves are shared and never mutated).
+        """
+        clone = copy.copy(self)
+        clone.payloads = {context: list(values) for context, values in self.payloads.items()}
+        clone.remote_payloads = list(self.remote_payloads)
+        clone.lazy_payloads = list(self.lazy_payloads)
+        clone.catalog = {context: list(values) for context, values in self.catalog.items()}
+        clone._lazy_by_context = {
+            context: list(values) for context, values in self._lazy_by_context.items()
+        }
+        clone._lazy_pool_cache = {}
+        clone._base_cache = {}
+        clone._remote_set = set(self._remote_set)
+        clone._seen = set(self._seen)
+        clone._seen_slots = set(self._seen_slots)
+        return clone
+
+    def _invalidate_pools(self) -> None:
+        """Drop derived pools after the underlying corpus changes."""
+        self._base_cache.clear()
+        self._lazy_pool_cache.clear()
 
     def _load_lazy_corpus(self, limit: int = 12000) -> None:
         path = LAZY_PAYLOAD_FILE
@@ -496,6 +607,8 @@ class PayloadEngine:
             self._seen.add(payload)
             self.payloads[context].append(payload)
             added += 1
+        if added:
+            self._invalidate_pools()
         if added and not quiet:
             self.console.ok(f"Loaded {added} payload(s) from JSON {path}", important=False)
         return added
@@ -537,6 +650,8 @@ class PayloadEngine:
         except OSError as exc:
             self.console.warn(f"Could not read payload file {path}: {exc}")
             return
+        if added:
+            self._invalidate_pools()
         if added and not quiet:
             kind = "remote" if remote else "custom"
             self.console.ok(f"Loaded {added} {kind} payload(s) from {path}", important=False)
@@ -548,6 +663,7 @@ class PayloadEngine:
         self._seen_slots.add(slot)
         self._seen.add(payload)
         self.payloads.setdefault(context, []).append(payload)
+        self._invalidate_pools()
         return True
 
     def probe(self, token: str) -> str:
@@ -573,7 +689,16 @@ class PayloadEngine:
         self._lazy_pool_cache[context] = pool
         return pool
 
-    def payloads_for(self, context: str, limit: Optional[int] = None) -> List[str]:
+    def _base_pool(self, context: str) -> Tuple[str, ...]:
+        """Curated templates for ``context`` plus its fallbacks, cached.
+
+        Rebuilding this list per injection point dominated ``payloads_for``
+        once an operator supplied a large corpus, so the result is cached and
+        invalidated whenever the corpus changes.
+        """
+        cached = self._base_cache.get(context)
+        if cached is not None:
+            return cached
         contexts = [context] if context in self.payloads else []
         for fallback in ("generic", "html"):
             if fallback not in contexts:
@@ -586,13 +711,18 @@ class PayloadEngine:
                     continue
                 seen.add(template)
                 base.append(template)
+        pool = tuple(base)
+        self._base_cache[context] = pool
+        return pool
 
+    def payloads_for(self, context: str, limit: Optional[int] = None) -> List[str]:
+        base = list(self._base_pool(context))
         lazy_pool = self._lazy_pool_for(context)
 
         if limit is None:
             return (
                 base
-                + [payload for payload in self.remote_payloads if payload not in seen]
+                + [payload for payload in self.remote_payloads if payload not in self._seen]
                 + lazy_pool
             )
 
@@ -601,18 +731,59 @@ class PayloadEngine:
         result: List[str] = []
 
         def take(pool: Sequence[str], quota: int) -> None:
-            if quota <= 0:
+            """Append up to ``quota`` distinct, unused entries from ``pool``.
+
+            Large pools (LazyXss holds ~7k vectors) used to be filtered into a
+            fresh candidate list on every call, which is quadratic once the
+            same pool is drawn from several times per injection point.  Sample
+            indices instead and fall back to a full scan only when the sample
+            comes up short.
+            """
+            if quota <= 0 or not pool:
                 return
-            candidates = [item for item in pool if item not in used and item not in result]
-            if not candidates:
-                return
-            chosen = random.sample(candidates, quota) if len(candidates) > quota else candidates
-            for item in chosen:
-                if item not in used:
+            size = len(pool)
+            quota = min(quota, size)
+            picked = 0
+            if size > quota * 4:
+                for index in random.sample(range(size), min(size, quota * 4)):
+                    item = pool[index]
+                    if item in used:
+                        continue
                     used.add(item)
                     result.append(item)
+                    picked += 1
+                    if picked >= quota:
+                        return
+            for item in pool:
+                if picked >= quota:
+                    return
+                if item in used:
+                    continue
+                used.add(item)
+                result.append(item)
+                picked += 1
 
-        if lazy_pool:
+        catalog_pool = self.catalog.get(context, [])
+        if catalog_pool:
+            # Curated payloads stay first, the bundled repo catalog gets a
+            # meaningful share, and LazyXss/downloaded corpora fill the rest.
+            base_quota = max(1, limit // 2)
+            catalog_quota = max(1, int(limit * 0.3)) if limit >= 3 else 0
+            remaining = max(0, limit - base_quota - catalog_quota)
+            lazy_quota = min(remaining, max(1, int(limit * 0.15))) if lazy_pool else 0
+            remote_quota = remaining - lazy_quota if self.remote_payloads else 0
+            if not self.remote_payloads:
+                lazy_quota = remaining
+            take(base[:base_quota], base_quota)
+            take(catalog_pool, catalog_quota)
+            take(lazy_pool, lazy_quota)
+            take(self.remote_payloads, remote_quota)
+            # Fill any shortfall (small pools, duplicates) in priority order.
+            take(base[base_quota:], limit - len(result))
+            take(catalog_pool, limit - len(result))
+            take(lazy_pool, limit - len(result))
+            take(self.remote_payloads, limit - len(result))
+        elif lazy_pool:
             # 50% curated, 30% LazyXss, 20% downloaded corpus.  At least one
             # curated payload is always kept so small limits stay reliable.
             base_quota = max(1, limit // 2)
@@ -640,11 +811,9 @@ class PayloadEngine:
     def render(self, template: str, token: str, context: str = "") -> str:
         marker = js_marker(token)
         codes = ",".join(str(ord(ch)) for ch in token)
-        # Substitute alert(1) and generic dialog calls with the unique per-payload marker
-        template = _DIALOG_CALL_RE.sub(
-            lambda m: f"{m.group('fn')}(String.fromCharCode({codes}))",
-            template,
-        )
+        # Substitute dialog calls (including nested fromCharCode forms) with
+        # the unique per-payload marker.
+        template = _rewrite_dialog_calls(template, f"String.fromCharCode({codes})")
         if "{m}" in template:
             return template.replace("{m}", marker)
         if "{t}" in template:

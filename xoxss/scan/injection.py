@@ -10,7 +10,7 @@ import json
 import re
 import shlex
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from xoxss.core.evidence import SENSITIVE_KEY_RE

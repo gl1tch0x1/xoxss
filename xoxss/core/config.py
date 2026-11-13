@@ -107,6 +107,7 @@ class BrowserType(Enum):
     CHROME = "chrome"
     CHROMIUM = "chromium"
     EDGE = "edge"
+    PLAYWRIGHT = "playwright"
 
 
 @dataclass
@@ -167,7 +168,9 @@ class ScanConfig:
     adaptive_payloads: bool = False
     param_batch_size: int = 100
     lazy_payloads: bool = True
+    payload_catalog: bool = True
     list_encoders: bool = False
+    list_payload_catalog: bool = False
     cookie_test_limit: int = 5
     payload_dir: Optional[str] = None
     payload_files: List[str] = field(default_factory=list)

@@ -7,8 +7,7 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from xoxss.core.evidence import (
@@ -21,11 +20,7 @@ from xoxss.scan.reflection import (
     browser_prequalified,
     http_executable,
 )
-
-
-def now_iso() -> str:
-    """Return current UTC time in ISO format."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+from xoxss.utils.helpers import now_iso
 
 
 # Validation outcomes (execution-based validation pipeline)

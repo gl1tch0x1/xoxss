@@ -447,10 +447,13 @@ class ContextDetector:
                 return ContextType.JSON_VALUE
             return ContextType.JSON_STRING
 
-        # URL-ish reflections (href/src/script contents with a scheme).
-        if re.search(r"(?:javascript|data):[^\s\"'<>]*$", low):
-            return ContextType.DATA_URI
-
+        # ``javascript:``/``data:`` are only live inside a URL-bearing
+        # attribute value, and quoted/unquoted attribute positions are already
+        # resolved above.  A bare scheme in a text node is inert, so matching
+        # it here turned escaped output such as
+        # ``&lt;img onerror=javascript:...&gt;`` into a phantom data-URI sink.
+        # ``ContextType.DATA_URI`` is retained for callers that classify URL
+        # attributes directly.
         return ContextType.HTML_BODY
 
     def _calculate_confidence(self, context_type: ContextType) -> float:

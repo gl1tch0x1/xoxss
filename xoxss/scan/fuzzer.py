@@ -15,24 +15,10 @@ import random
 import re
 import string
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
-class HttpLike(Protocol):  # pragma: no cover
-    async def get(
-        self,
-        url: str,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        allow_redirects: bool = True,
-        cache: bool = False,
-    ) -> Any: ...
-
-
-class ConsoleLike(Protocol):  # pragma: no cover
-    def info(self, message: str, important: bool = False) -> None: ...
-    def debug(self, message: str) -> None: ...
-    def warn(self, message: str, important: bool = True) -> None: ...
+from xoxss.core.protocols import ConsoleLike, HttpLike
 
 
 DIR_WORDS: Tuple[str, ...] = (

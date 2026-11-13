@@ -28,13 +28,10 @@ import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, urlsplit
 
-class ConsoleLike(Protocol):  # pragma: no cover
-    def info(self, message: str, important: bool = False) -> None: ...
-    def warn(self, message: str, important: bool = True) -> None: ...
-    def debug(self, message: str) -> None: ...
+from xoxss.core.protocols import ConsoleLike
 
 
 MAX_OUTPUT = 8_000_000

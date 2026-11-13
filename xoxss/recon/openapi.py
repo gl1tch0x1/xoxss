@@ -12,24 +12,10 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
 
-class HttpLike(Protocol):  # pragma: no cover
-    async def get(
-        self,
-        url: str,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        allow_redirects: bool = True,
-        cache: bool = False,
-    ) -> Any: ...
-
-
-class ConsoleLike(Protocol):  # pragma: no cover
-    def info(self, message: str, important: bool = False) -> None: ...
-    def debug(self, message: str) -> None: ...
-    def warn(self, message: str, important: bool = True) -> None: ...
+from xoxss.core.protocols import ConsoleLike, HttpLike
 
 
 SPEC_PATHS: Tuple[str, ...] = (

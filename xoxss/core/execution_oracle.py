@@ -13,13 +13,12 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from xoxss.core.cdp_hooks import (
     CLEAR_TELEMETRY_JS,
     COLLECT_TELEMETRY_JS,
     CdpTelemetryParser,
-    build_cdp_instrumentation,
 )
 
 

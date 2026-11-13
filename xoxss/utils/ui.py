@@ -20,6 +20,8 @@ import os
 import sys
 from typing import Iterable, List, Optional, Sequence
 
+from xoxss.utils.helpers import strip_ansi
+
 __all__ = [
     "enabled", "disable", "enable_for", "paint", "rule", "panel", "bar",
     "glyphs", "SPINNER", "paint_ramp", "strip_ansi", "safe_width",
@@ -82,19 +84,6 @@ def paint(text: str, *codes: str) -> str:
     if not _ENABLE or not codes:
         return text
     return "".join(codes) + text + RESET
-
-
-def strip_ansi(text: str) -> str:
-    out = []
-    i = 0
-    while i < len(text):
-        if text[i] == "\033":
-            j = text.find("m", i)
-            i = j + 1 if j != -1 else len(text)
-        else:
-            out.append(text[i])
-            i += 1
-    return "".join(out)
 
 
 def safe_width() -> int:

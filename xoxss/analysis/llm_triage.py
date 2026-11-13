@@ -17,8 +17,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-from urllib.error import URLError
+from typing import List, Optional
 from urllib.request import Request, urlopen
 
 

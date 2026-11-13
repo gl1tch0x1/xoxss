@@ -19,18 +19,12 @@ import shutil
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Optional
+
+from xoxss.core.protocols import ConsoleLike
 
 #: Whether the optional Playwright backend can be imported in this environment.
 HAS_PLAYWRIGHT = importlib.util.find_spec("playwright") is not None
-
-
-class ConsoleLike(Protocol):
-    def ok(self, message: str, important: bool = True) -> None: ...
-    def info(self, message: str, important: bool = True) -> None: ...
-    def warn(self, message: str, important: bool = True) -> None: ...
-    def error(self, message: str, important: bool = True) -> None: ...
-    def debug(self, message: str) -> None: ...
 
 
 def _truncate(text: Any, limit: int = 200) -> str:
@@ -38,7 +32,7 @@ def _truncate(text: Any, limit: int = 200) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "\u2026"
 
 
-from xoxss.core.cdp_hooks import build_cdp_instrumentation
+from xoxss.core.cdp_hooks import build_cdp_instrumentation  # noqa: E402
 
 HOOK_JS = build_cdp_instrumentation()
 

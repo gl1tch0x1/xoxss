@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from xoxss.analysis.ast_taint import TaintFlow
 from xoxss.analysis.framework_sinks import (
     is_framework_internal_sink,
-    is_sanitizer_barrier,
     is_static_or_feature_detection,
     is_third_party_analytics,
 )

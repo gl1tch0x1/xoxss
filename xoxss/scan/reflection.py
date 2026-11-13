@@ -145,6 +145,24 @@ def analyze_reflection(
             verbatim and any(char in payload_chars for char in chars)
         )
 
+    # A URL context is only live when the reflected value really lands in a
+    # URL-bearing attribute: it must survive verbatim (or keep a
+    # ``javascript:``/``data:`` scheme that was not entity-encoded) and either
+    # carry such a scheme or retain a delimiter that can break out of the
+    # attribute.  Treating every URL-context reflection as executable let
+    # escaped text nodes ending in ``javascript:alert(...)`` become
+    # high-confidence findings without any usable injection point.
+    url_scheme = bool(re.search(r"(?:javascript|data):", sent_payload or "", re.I))
+    received = body[index: index + len(sent_payload) + 64]
+    scheme_survived = bool(
+        url_scheme
+        and not entity_encoded
+        and re.search(r"(?:javascript|data):", received, re.I)
+    )
+    url_executable = bool(
+        (verbatim or scheme_survived) and (url_scheme or raw_set & set("\"'`<>"))
+    )
+
     executable = {
         "html": survived("<"),
         "attr_double": survived('"'),
@@ -155,7 +173,7 @@ def analyze_reflection(
         "comment": comment_breakout and survived("<"),
         "textarea": textarea_breakout and survived("<"),
         "json": survived('<"\\'),
-        "url": True,
+        "url": url_executable,
     }.get(context, False)
 
     inert_reason = ""

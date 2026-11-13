@@ -23,36 +23,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import copy
 import hashlib
-import html
 import json
 import os
-import random
 import re
 import shutil
 import shlex
-import string
 import sys
-import tempfile
-import textwrap
-import threading
 import time
 import traceback
-import urllib.parse
-import urllib.request
-import uuid
 import warnings
 from collections import Counter
 from contextlib import suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Set, Tuple, Union, cast
 from urllib.parse import (
     parse_qsl,
-    quote,
     urlencode,
     urljoin,
     urlsplit,
@@ -69,11 +58,21 @@ try:
         build_proto_probes,
         gadget_exploit_names,
     )
-    from xoxss.detection.payload import build_blind_payloads
+    from xoxss.detection.payload import (
+        CATALOG_SOURCE,
+        PAYLOAD_CATALOG,
+        build_blind_payloads,
+        catalog_counts,
+        catalog_total,
+    )
     HAS_ADVANCED = True
 except Exception:
     HAS_ADVANCED = False
     build_blind_payloads = None  # type: ignore
+    CATALOG_SOURCE = ""
+    PAYLOAD_CATALOG = ()  # type: ignore
+    catalog_counts = None  # type: ignore
+    catalog_total = None  # type: ignore
     PROTO_MARKER_KEY = "xoxss"  # type: ignore
     PROTO_PROBE_JS = ""  # type: ignore
     PrototypePollutionDetector = None  # type: ignore
@@ -211,10 +210,7 @@ except Exception:  # pragma: no cover - optional integration edge case
     resolve_ai_key = lambda *args, **kwargs: ""  # type: ignore  # noqa: E731
     resolve_ai_model = lambda *args, **kwargs: ""  # type: ignore  # noqa: E731
 from xoxss.core.evidence import (
-    SENSITIVE_KEY_RE,
     canonical_finding_url,
-    finding_id as make_finding_id,
-    finding_curl,
     parse_curl_request,
     parse_oob_context,
     request_to_dict,
@@ -235,21 +231,17 @@ from xoxss.core.finding import (
     ValidationResult,
     enforce_finding_policy,
     meets_fail_threshold,
-    now_iso,
     reflection_confidence,
 )
 from xoxss.core.scope import (
     Scope,
     looks_like_dangerous,
     looks_like_page,
-    normalize_scan_url,
     normalize_url,
 )
 from xoxss.scan.injection import (
     FormField,
     InjectionPoint,
-    JS_ENDPOINT_PATTERNS,
-    VULNERABLE_LIBS,
     VulnerableLib,
     WAFDetector,
     WAFReport,
@@ -259,59 +251,33 @@ from xoxss.scan.injection import (
     default_field_value,
     endpoint_accepts_query_params,
     extract_endpoints_from_text,
-    extract_lib_version_from_content,
-    extract_lib_version_from_filename,
     merge_query,
-    parse_version,
     replace_query_param,
-    version_in_range,
 )
 from xoxss.detection.tamper import (
     TAMPER_CHAINS,
     TAMPERS,
     apply_tamper,
-    tamper_doubleencode,
-    tamper_hexencode,
-    tamper_htmlentities,
-    tamper_jscomment,
-    tamper_jsonfuzz,
-    tamper_spacetab,
-    tamper_uppercase,
-    tamper_urlencode,
 )
 from xoxss.scan.payloads import (
     DEFAULT_PAYLOADS,
     FUZZ_PARAM_NAMES,
     LAZY_PAYLOAD_FILE,
-    MAX_PAYLOAD_BYTES,
-    MAX_REMOTE_PAYLOADS,
-    PAYLOAD_CACHE_DIRNAME,
-    PAYLOAD_CACHE_MAX_BYTES,
-    PAYLOAD_CACHE_TTL,
     PAYLOAD_SOURCES,
     PayloadEngine,
-    classify_remote_payload,
     cleanup_payload_lists,
     download_payload_lists,
-    embed_marker,
-    payload_cache_path,
     payload_workdir,
-    read_payload_cache,
-    write_payload_cache,
-    _plausible_remote_payload,
 )
 from xoxss.utils.console import (
     APP_NAME,
-    CODENAME,
     VERSION,
     Console,
     banner,
     bcolors,
     briefing_rows,
     fmt_duration,
-    js_marker,
     mark_ai_payload,
-    sanitize_text,
     slugify,
     strip_ansi,
     truncate,
@@ -570,12 +536,15 @@ class XSSScanner(CrawlerMixin):
                 remote_files=getattr(args, "payload_files", None),
                 corpus_dirs=getattr(args, "payload_dir", None),
                 lazy_payloads=getattr(args, "lazy_payloads", True),
+                catalog_payloads=getattr(args, "payload_catalog", True),
             )
             try:
                 setattr(args, "_payload_engine", cached_payloads)
             except Exception:
                 pass
-        self.payloads = cached_payloads
+        # Framework bypasses are registered per target; fork the cached engine
+        # so one target's registrations never leak into the next target's pool.
+        self.payloads = cached_payloads.clone()
         self._cookies = self._parse_cookies(
             getattr(args, "cookies", None),
             getattr(args, "cookie_file", None),
@@ -5063,6 +5032,28 @@ def print_payloads() -> None:
         f"\n[Bundled LazyXss pack] {bundled} payload(s) at {LAZY_PAYLOAD_FILE} "
         "(enabled by default; disable with --no-lazy-payloads)"
     )
+    if catalog_total is not None and catalog_counts is not None:
+        print(
+            f"\n[Bundled repo catalog] {catalog_total()} payload(s) from {CATALOG_SOURCE}"
+        )
+        for category, count in catalog_counts().items():
+            print(f"  {category:<16} {count:>3} payload(s)")
+        print("  (dump every vector with --list-payload-catalog)")
+
+
+def print_payload_catalog() -> None:
+    """Dump every vector in the bundled brokep/XSS-Payloads catalog."""
+    if not PAYLOAD_CATALOG:
+        print("Bundled payload catalog unavailable.")
+        return
+    print(f"# Bundled payload catalog: {len(PAYLOAD_CATALOG)} payload(s)")
+    print(f"# Source: {CATALOG_SOURCE}")
+    current = ""
+    for entry in PAYLOAD_CATALOG:
+        if entry.category.value != current:
+            current = entry.category.value
+            print(f"\n[{current}]")
+        print(f"  {entry.payload}")
 
 
 def print_tampers() -> None:
@@ -5318,9 +5309,15 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
     engine = PayloadEngine(
         console,
         args.payload_file,
+        remote_files=getattr(args, "payload_files", None),
         corpus_dirs=getattr(args, "payload_dir", None),
         lazy_payloads=getattr(args, "lazy_payloads", True),
+        catalog_payloads=getattr(args, "payload_catalog", True),
     )
+    scopes = [
+        Scope(target, args.allow_subdomains, args.include, args.exclude)
+        for target in targets
+    ]
     http = HttpEngine(
         console,
         stats,
@@ -5332,10 +5329,7 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
         concurrency=args.concurrency,
         proxy=args.proxy,
         insecure=args.insecure,
-        redirect_scope=lambda candidate: any(
-            Scope(target, args.allow_subdomains, args.include, args.exclude).in_scope(candidate)
-            for target in targets
-        ),
+        redirect_scope=lambda candidate: any(scope.in_scope(candidate) for scope in scopes),
         max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
         http2=getattr(args, "http2", False),
         impersonate=getattr(args, "impersonate", None),
@@ -5487,6 +5481,10 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         return 1, 0
 
     stats = ScanStats(urls_total=len(targets))
+    scopes = [
+        Scope(target, args.allow_subdomains, args.include, args.exclude)
+        for target in targets
+    ]
     http = HttpEngine(
         console,
         stats,
@@ -5498,10 +5496,7 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         concurrency=args.concurrency,
         proxy=args.proxy,
         insecure=args.insecure,
-        redirect_scope=lambda candidate: any(
-            Scope(target, args.allow_subdomains, args.include, args.exclude).in_scope(candidate)
-            for target in targets
-        ),
+        redirect_scope=lambda candidate: any(scope.in_scope(candidate) for scope in scopes),
         max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
         http2=getattr(args, "http2", False),
         impersonate=getattr(args, "impersonate", None),
@@ -5639,10 +5634,7 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
         concurrency=args.concurrency,
         proxy=args.proxy,
         insecure=args.insecure,
-        redirect_scope=lambda candidate: any(
-            Scope(target, args.allow_subdomains, args.include, args.exclude).in_scope(candidate)
-            for target in targets
-        ),
+        redirect_scope=lambda candidate: any(scope.in_scope(candidate) for scope in scopes),
         max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
         http2=getattr(args, "http2", False),
         impersonate=getattr(args, "impersonate", None),
@@ -6146,6 +6138,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _ui.disable()
     if args.list_payloads:
         print_payloads()
+        return 0
+    if getattr(args, "list_payload_catalog", False):
+        print_payload_catalog()
         return 0
     if args.list_tampers:
         print_tampers()

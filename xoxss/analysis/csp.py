@@ -6,9 +6,9 @@ Consolidates CSP policy evaluation, weakness detection, and automated bypass pay
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional
 
 
 class CSPSeverity(Enum):

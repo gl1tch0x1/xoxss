@@ -417,12 +417,14 @@ class HttpEngine:
         if self.session is None:
             await self.start()
 
-        cache_key = self._cache_key(method, url, headers, data, json_body)
-        if cache and cache_key in self._cache:
-            expiry, cached = self._cache[cache_key]
-            if expiry > time.monotonic():
-                hit = HttpResponse(**{**cached.__dict__, "from_cache": True})
-                return hit
+        cache_key = ""
+        if cache:
+            cache_key = self._cache_key(method, url, headers, data, json_body)
+            if cache_key in self._cache:
+                expiry, cached = self._cache[cache_key]
+                if expiry > time.monotonic():
+                    hit = HttpResponse(**{**cached.__dict__, "from_cache": True})
+                    return hit
 
         if self.transport == "curl":
             return await self._request_curl(
@@ -443,9 +445,10 @@ class HttpEngine:
                 await asyncio.sleep(delay)
             try:
                 host = (urlsplit(url).hostname or "").lower()
-                host_semaphore = self._host_semaphores.setdefault(
-                    host, asyncio.Semaphore(self.per_host_concurrency)
-                )
+                host_semaphore = self._host_semaphores.get(host)
+                if host_semaphore is None:
+                    host_semaphore = asyncio.Semaphore(self.per_host_concurrency)
+                    self._host_semaphores[host] = host_semaphore
                 async with host_semaphore, self.semaphore:
                     assert self.session is not None
                     current_url, current_method = url, method
@@ -650,9 +653,10 @@ class HttpEngine:
                 await asyncio.sleep(delay)
             try:
                 host = (urlsplit(url).hostname or "").lower()
-                host_semaphore = self._host_semaphores.setdefault(
-                    host, asyncio.Semaphore(self.per_host_concurrency)
-                )
+                host_semaphore = self._host_semaphores.get(host)
+                if host_semaphore is None:
+                    host_semaphore = asyncio.Semaphore(self.per_host_concurrency)
+                    self._host_semaphores[host] = host_semaphore
                 async with host_semaphore, self.semaphore:
                     assert self.session is not None
                     current_url, current_method = url, method

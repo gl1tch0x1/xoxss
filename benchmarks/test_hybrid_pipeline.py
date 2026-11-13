@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -30,15 +30,12 @@ from xoxss.core.cdp_hooks import (
     CdpTelemetryParser,
     build_cdp_instrumentation,
 )
-from xoxss.analysis.dfg_slicer import DfgFlow, DfgSlicer
+from xoxss.analysis.dfg_slicer import DfgSlicer
 from xoxss.analysis.context_mutator import ContextMutator, DomSyntaxContext
 from xoxss.analysis.llm_triage import (
-    ComponentClassificationResult,
     LLMTriageEngine,
-    SanitizerAnalysisResult,
-    StoredXSSPlan,
 )
-from xoxss.core.execution_oracle import ExecutionOracle, OracleVerdict
+from xoxss.core.execution_oracle import ExecutionOracle
 
 
 # ==============================================================================

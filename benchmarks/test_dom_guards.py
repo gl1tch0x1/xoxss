@@ -21,9 +21,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from xoxss.analysis.framework_sinks import (
-    is_framework_internal_sink,
-    is_sanitizer_barrier,
-    is_static_or_feature_detection,
     is_third_party_analytics,
 )
 from xoxss.analysis.storage_xss import StorageType, StorageXSSAnalyzer

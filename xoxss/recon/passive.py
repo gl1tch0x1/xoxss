@@ -13,24 +13,10 @@ import asyncio
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, quote, urlsplit, urlunsplit
 
-class HttpLike(Protocol):  # pragma: no cover
-    async def get(
-        self,
-        url: str,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        allow_redirects: bool = True,
-        cache: bool = False,
-    ) -> Any: ...
-
-
-class ConsoleLike(Protocol):  # pragma: no cover
-    def info(self, message: str, important: bool = False) -> None: ...
-    def warn(self, message: str, important: bool = True) -> None: ...
-    def debug(self, message: str) -> None: ...
+from xoxss.core.protocols import ConsoleLike, HttpLike
 
 
 @dataclass

@@ -264,6 +264,19 @@ def build_parser(
         help="encoder registry transform applied after --tamper (repeatable; see --list-encoders)",
     )
     injection.add_argument("--max-payloads", type=int, default=6, help="payloads per injection point (default: 6)")
+    injection.add_argument(
+        "--payload-catalog",
+        dest="payload_catalog",
+        action="store_true",
+        default=True,
+        help="enable the bundled brokep/XSS-Payloads catalog (default)",
+    )
+    injection.add_argument(
+        "--no-payload-catalog",
+        dest="payload_catalog",
+        action="store_false",
+        help="disable the bundled brokep/XSS-Payloads vector catalog",
+    )
     injection.add_argument("--mutation-probes", action="store_true", help="probe one endpoint for bounded Unicode, decoding, byte-mask, and multibyte transformations")
     injection.add_argument("--mutation-probe-limit", type=int, default=12, help="maximum transformation probes per endpoint (default: 12, hard cap: 14)")
     injection.add_argument("--adaptive-payloads", action="store_true", help="add bounded whitespace/quote and empirically observed Unicode payload variants")
@@ -633,6 +646,11 @@ def build_parser(
 
     misc = parser.add_argument_group("misc", "utilities and diagnostics")
     misc.add_argument("--list-payloads", action="store_true", help="print built-in payloads and exit")
+    misc.add_argument(
+        "--list-payload-catalog",
+        action="store_true",
+        help="print every bundled repo catalog vector and exit",
+    )
     misc.add_argument("--doctor", action="store_true", help="check the installation and exit")
     misc.add_argument("--list-tampers", action="store_true", help="print available tampers and exit")
     misc.add_argument(

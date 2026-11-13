@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List
 
 
 class DomSyntaxContext(Enum):
@@ -64,7 +64,6 @@ class ContextMutator:
         end = min(len(html), pos + len(canary) + 200)
         surrounding = html[start:end]
         prefix = html[start:pos]
-        suffix = html[pos + len(canary):end]
 
         # 1. Inside HTML comment: <!-- ... CANARY ... -->
         last_comment_open = prefix.rfind("<!--")

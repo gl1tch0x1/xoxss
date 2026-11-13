@@ -9,7 +9,7 @@ fetch callbacks, and IndexedDB handlers. Suppresses framework runtime boilerplat
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 from xoxss.analysis.ast_taint import SOURCE_PATTERNS, SINK_PATTERNS, strip_comments
@@ -253,7 +253,6 @@ class DfgSlicer:
         """Check if an identifier name is a short minified variable (1-2 chars, not a source API)."""
         if not name:
             return False
-        known_sources = {"db", "id", "store", "url", "hash", "loc"}
         if len(name) <= 2:
             return True
         return False

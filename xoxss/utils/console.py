@@ -4,10 +4,7 @@ Console abstraction, ANSI styling, live progress status line, and briefing UI.
 
 from __future__ import annotations
 
-import argparse
-import html
 import json
-import os
 import random
 import re
 import shutil
@@ -19,7 +16,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from xoxss.core.finding import Finding
@@ -28,6 +25,8 @@ try:
     from xoxss.utils import ui as _ui
 except Exception:  # pragma: no cover
     _ui = None
+
+from xoxss.utils.helpers import fmt_duration, now_iso, strip_ansi, truncate
 
 APP_NAME = "XOX$$"
 VERSION = "2.0.0"
@@ -58,28 +57,10 @@ class bcolors:
                 setattr(cls, name, "")
 
 
-def now_iso() -> str:
-    """Return current UTC timestamp in ISO-8601 format."""
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 def slugify(value: str, maxlen: int = 48) -> str:
     """Convert arbitrary string into filesystem-safe identifier."""
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip("-")
     return (slug or "target")[:maxlen]
-
-
-def truncate(text: Any, limit: int = 400) -> str:
-    """Truncate text to limit with trailing ellipsis."""
-    s = str(text)
-    if len(s) <= limit:
-        return s
-    return s[: max(0, limit - 3)] + "..."
-
-
-def strip_ansi(text: str) -> str:
-    """Strip ANSI color and cursor codes from text."""
-    return re.sub(r"\033\[[0-9;]*m", "", text)
 
 
 def sanitize_text(text: Any, limit: int = 100000) -> str:
@@ -88,18 +69,6 @@ def sanitize_text(text: Any, limit: int = 100000) -> str:
     s = re.sub(r"\x1b(?!\[[0-9;]*m)", lambda m: "\\x1b", s)
     s = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]", lambda m: "\\x%02x" % ord(m.group()), s)
     return s[:limit]
-
-
-def fmt_duration(seconds: float) -> str:
-    """Format duration in human-readable seconds/minutes/hours."""
-    seconds = max(0.0, float(seconds))
-    if seconds < 60:
-        return f"{seconds:.2f}s"
-    minutes, sec = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours:
-        return f"{hours}h {minutes}m {sec}s"
-    return f"{minutes}m {sec}s"
 
 
 def unique_token(prefix: str = "z", length: int = 9) -> str:

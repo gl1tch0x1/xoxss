@@ -24,38 +24,11 @@ from difflib import SequenceMatcher
 import json
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from xoxss.core.protocols import ConsoleLike, HttpPostLike
 from xoxss.detection.context import ContextDetector
-
-
-class HttpLike(Protocol):  # pragma: no cover
-    async def get(
-        self,
-        url: str,
-        *,
-        headers: Optional[Dict[str, str]] = None,
-        allow_redirects: bool = True,
-        cache: bool = False,
-    ) -> Any: ...
-
-    async def post(
-        self,
-        url: str,
-        *,
-        data: Optional[Dict[str, str]] = None,
-        json_body: Optional[Dict[str, Any]] = None,
-        headers: Optional[Dict[str, str]] = None,
-        allow_redirects: bool = True,
-    ) -> Any: ...
-
-
-class ConsoleLike(Protocol):  # pragma: no cover
-    def info(self, message: str, important: bool = False) -> None: ...
-    def warn(self, message: str, important: bool = True) -> None: ...
-    def debug(self, message: str) -> None: ...
-    def ok(self, message: str, important: bool = True) -> None: ...
 
 
 HIGH_VALUE_PARAMETERS: Set[str] = {
@@ -195,7 +168,7 @@ class ParameterHarvester:
 
     def __init__(
         self,
-        http: HttpLike,
+        http: HttpPostLike,
         console: ConsoleLike,
         *,
         limit: int = 5000,
@@ -391,7 +364,7 @@ class ReflectionProbe:
 
     def __init__(
         self,
-        http: HttpLike,
+        http: HttpPostLike,
         console: ConsoleLike,
         *,
         marker: str = "XoxssReflect",

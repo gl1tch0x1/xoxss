@@ -130,8 +130,10 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 
 **Payloads and evasion**
 
-- Ten context-specific built-in payload families, a rotating remote corpus and the
-  bundled 6,900+ entry LazyXss payload pack.
+- Ten context-specific built-in payload families, the bundled 440-vector
+  [brokep/XSS-Payloads](https://github.com/brokep/XSS-Payloads) catalog (24 attack
+  families plus the README examples, scheduled by reflection context), a rotating
+  remote corpus and the bundled 6,900+ entry LazyXss payload pack.
 - Eight tamper transforms (`doubleencode`, `hexencode`, `htmlentities`, `jscomment`,
   `jsonfuzz`, `spacetab`, `uppercase`, `urlencode`) and the `all` chain.
 - Twenty composable encoders, including entity variants, JS escapes, `fromCharCode`,
@@ -417,6 +419,7 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | Option | Description |
 |---|---|
 | `--max-payloads N` | Payloads per injection point (default `6`). |
+| `--payload-catalog` / `--no-payload-catalog` | Bundled 440-vector repo catalog, context-scheduled (on by default). |
 | `--payload-file PATH` / `--payload-dir DIR` | Custom corpus: single file, `os.pathsep`-separated list, JSON array / recursive directory. |
 | `--lazy-payloads` / `--remote-payloads` | Bundled LazyXss pack (on) / temporary GitHub corpus download (on). Disable with the `--no-*` form. |
 | `--payload-source URL` / `--payload-limit N` | Extra raw payload URL / maximum remote payloads kept (default `600`, hard cap `5000`). |
@@ -519,7 +522,7 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--fail-on-findings` | Shorthand for `--fail-on any`. |
 | `--replay FINDING_ID` | Re-run one finding from a previous JSON report: one request plus one browser check. |
 | `--replay-report PATH` | JSON report to load for `--replay` (default: newest `*.json` in `--report-dir`). |
-| `--doctor` / `--list-payloads` / `--list-tampers` / `--list-encoders` / `--version` | Diagnostics and registry inspection. |
+| `--doctor` / `--list-payloads` / `--list-payload-catalog` / `--list-tampers` / `--list-encoders` / `--version` | Diagnostics and registry inspection. |
 
 > [!NOTE]
 > `--headers` and `--cookies` apply to HTTP requests. Use `--auth-state` to provide
@@ -1162,7 +1165,7 @@ python -m compileall -q xoxss xoxss.py benchmarks
 ruff check xoxss benchmarks
 pyright
 
-# Run test suites & benchmarks
+# Run verification suites & benchmarks
 python benchmarks/test_dom_guards.py        # DOM false positive guards & framework sink suppression
 python benchmarks/test_hybrid_pipeline.py   # Hybrid pipeline (CDP, DFG, Mutator, Oracle, LLM)
 python benchmarks/run_benchmark.py --quick  # HTTP-only benchmark cases (fast)
@@ -1240,7 +1243,7 @@ no stealth-only features, no destructive defaults, no unconfirmed finding promot
   parameter-harvest workflow. See `xoxss/data/LAZYXSS_NOTICE.md` for provenance.
 - [interactsh](https://github.com/projectdiscovery/interactsh) for the out-of-band
   interaction protocol implemented by the native client.
-- The maintainers of aiohttp, BeautifulSoup, Selenium, Playwright and pytest.
+- The maintainers of aiohttp, BeautifulSoup, Selenium and Playwright.
 
 ## License
 

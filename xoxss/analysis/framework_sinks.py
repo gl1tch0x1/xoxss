@@ -4,7 +4,7 @@ Provides XSS bypass techniques for popular JavaScript frameworks.
 """
 
 import re
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 

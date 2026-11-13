@@ -5,12 +5,11 @@ Consolidates GraphQL endpoint fingerprinting, introspection analysis, and inject
 
 from __future__ import annotations
 
-import html
 import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 
 
 class GraphQLInjectionType(Enum):
