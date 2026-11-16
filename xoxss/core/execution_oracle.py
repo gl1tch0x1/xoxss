@@ -11,6 +11,7 @@ and strictly separates findings into:
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -20,6 +21,8 @@ from xoxss.core.cdp_hooks import (
     COLLECT_TELEMETRY_JS,
     CdpTelemetryParser,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -87,8 +90,8 @@ class ExecutionOracle:
                     if screenshot_path and hasattr(browser, "screenshot"):
                         try:
                             screenshot = await browser.screenshot(screenshot_path)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            _LOGGER.debug("oracle screenshot capture failed: %s", exc)
                     return OracleVerdict(
                         status="CONFIRMED",
                         executed=True,
@@ -248,8 +251,8 @@ class ExecutionOracle:
                 return await browser.page.evaluate(COLLECT_TELEMETRY_JS)
             elif hasattr(browser, "driver") and browser.driver is not None:
                 return await asyncio.to_thread(browser.driver.execute_script, COLLECT_TELEMETRY_JS)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("could not collect browser telemetry: %s", exc)
         return {}
 
     async def _clear_telemetry(self, browser: Any) -> None:
@@ -259,8 +262,8 @@ class ExecutionOracle:
                 await browser.page.evaluate(CLEAR_TELEMETRY_JS)
             elif hasattr(browser, "driver") and browser.driver is not None:
                 await asyncio.to_thread(browser.driver.execute_script, CLEAR_TELEMETRY_JS)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("could not reset browser telemetry: %s", exc)
 
     async def _evaluate(self, browser: Any, script: str) -> Any:
         """Execute script in page context."""

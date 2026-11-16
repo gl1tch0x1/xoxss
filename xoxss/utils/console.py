@@ -26,10 +26,14 @@ try:
 except Exception:  # pragma: no cover
     _ui = None
 
+from xoxss import __version__
 from xoxss.utils.helpers import fmt_duration, now_iso, strip_ansi, truncate
 
 APP_NAME = "XOX$$"
-VERSION = "2.0.0"
+# Single source of truth: the package version in ``xoxss/__init__.py`` (mirrored
+# by ``pyproject.toml``).  Keeping a second literal here silently drifted every
+# release, so the CLI, reports and ``--version`` output could disagree.
+VERSION = __version__
 CODENAME = "PERSISTENT"
 
 

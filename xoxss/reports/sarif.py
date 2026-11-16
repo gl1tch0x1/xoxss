@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from xoxss.reports.common import VERSION
+
 # SARIF severity mapping.  "note" still surfaces in GitHub code scanning.
 SARIF_LEVELS = {
     "confirmed": "error",
@@ -60,7 +62,7 @@ def build_sarif_document(
     truncated_responses: int = 0,
     blind_markers: Optional[Sequence[Dict[str, Any]]] = None,
     tool_name: str = "XOX$$",
-    tool_version: str = "2.0.0",
+    tool_version: Optional[str] = None,
     information_uri: str = "https://github.com/gl1tch0x1/xoxss",
     timestamp: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -182,7 +184,7 @@ def build_sarif_document(
                 "tool": {
                     "driver": {
                         "name": tool_name,
-                        "version": tool_version,
+                        "version": tool_version or VERSION,
                         "informationUri": information_uri,
                         "rules": [rules[rule_id] for rule_id in rule_order],
                     }

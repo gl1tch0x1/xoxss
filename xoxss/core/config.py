@@ -191,7 +191,7 @@ class ScanConfig:
     websocket: bool = False
     file_upload: bool = False
     postmessage: bool = False
-    ast_analysis: bool = False
+    ast_analysis: bool = True
     dom_source_probes: bool = False
     ws_active: bool = False
 

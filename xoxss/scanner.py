@@ -102,6 +102,11 @@ from xoxss.tools.external import ExternalFinding, ExternalToolkit, available_too
 try:
     from xoxss.analysis.ast_taint import analyze_javascript as analyze_js_taint
     from xoxss.analysis.ast_taint import summarize_flows as summarize_taint_flows
+    from xoxss.analysis.csp_bypass import CSPBypassAutomator
+    from xoxss.analysis.graphql_xss import GraphQLAnalyzer as GraphQLXSSAnalyzer
+    from xoxss.analysis.enhanced_sinks import EnhancedSinkTracker
+    from xoxss.analysis.storage_xss import StorageXSSAnalyzer
+    from xoxss.analysis.framework_sinks import FrameworkSinkExploiter
     from xoxss.detection.encoders import (
         apply_chain as apply_encoder_chain,
         describe_encoders,
@@ -149,6 +154,15 @@ except Exception as _recon_exc:  # pragma: no cover
     FUZZ_EXTENSIONS = ()  # type: ignore
     PARAM_WORDS = ()  # type: ignore
     DirFuzzer = ParameterMiner = None  # type: ignore
+    # These analysers live in the recon/analysis block above; their fallbacks
+    # used to sit in the unrelated AI import handler, which both left the names
+    # undefined on a partial recon import and silently disabled them whenever
+    # the AI module failed to import.
+    CSPBypassAutomator = None  # type: ignore
+    GraphQLXSSAnalyzer = None  # type: ignore
+    EnhancedSinkTracker = None  # type: ignore
+    StorageXSSAnalyzer = None  # type: ignore
+    FrameworkSinkExploiter = None  # type: ignore
 
 try:
     from xoxss.scan.parameters import ParameterHarvester, ReflectionProbe
@@ -217,7 +231,7 @@ from xoxss.core.evidence import (
     response_excerpt,
 )
 from xoxss.core.browser import BrowserEngine, BrowserPool, PlaywrightEngine
-from xoxss.core.config import ScanConfig, load_dotenv
+from xoxss.core.config import ScanConfig
 from xoxss.core.finding import (
     CONFIDENCE_LEVELS,
     CONFIDENCE_RANK,
@@ -230,7 +244,6 @@ from xoxss.core.finding import (
     ScanStats,
     ValidationResult,
     enforce_finding_policy,
-    meets_fail_threshold,
     reflection_confidence,
 )
 from xoxss.core.scope import (
@@ -263,17 +276,12 @@ from xoxss.scan.payloads import (
     DEFAULT_PAYLOADS,
     FUZZ_PARAM_NAMES,
     LAZY_PAYLOAD_FILE,
-    PAYLOAD_SOURCES,
     PayloadEngine,
-    cleanup_payload_lists,
-    download_payload_lists,
-    payload_workdir,
 )
 from xoxss.utils.console import (
     APP_NAME,
     VERSION,
     Console,
-    banner,
     bcolors,
     briefing_rows,
     fmt_duration,
@@ -545,6 +553,11 @@ class XSSScanner(CrawlerMixin):
         # Framework bypasses are registered per target; fork the cached engine
         # so one target's registrations never leak into the next target's pool.
         self.payloads = cached_payloads.clone()
+        
+        # Framework bypass detector
+        self.framework_exploiter: Optional[Any] = None
+        if HAS_ADVANCED and FrameworkSinkExploiter is not None:
+            self.framework_exploiter = FrameworkSinkExploiter()
         self._cookies = self._parse_cookies(
             getattr(args, "cookies", None),
             getattr(args, "cookie_file", None),
@@ -577,6 +590,36 @@ class XSSScanner(CrawlerMixin):
         self._finding_keys: Set[str] = set()
         self._finding_index: Dict[str, Finding] = {}
         self._confirmed_contexts: Set[Tuple[str, str, str]] = set()
+        
+        # Initialize advanced analyzers.  The classes are imported behind
+        # optional-dependency guards, so the attributes stay loosely typed.
+        self.csp_bypass: Optional[Any] = None
+        self.graphql_xss: Optional[Any] = None
+        self.enhanced_sinks: Optional[Any] = None
+        self.storage_xss: Optional[Any] = None
+        self.interactsh_client: Optional[Any] = None
+        
+        if CSPBypassAutomator is not None:
+            self.csp_bypass = CSPBypassAutomator()
+        if GraphQLXSSAnalyzer is not None:
+            self.graphql_xss = GraphQLXSSAnalyzer()
+        if EnhancedSinkTracker is not None:
+            self.enhanced_sinks = EnhancedSinkTracker()
+        if StorageXSSAnalyzer is not None:
+            self.storage_xss = StorageXSSAnalyzer()
+        if InteractshClient is not None and getattr(args, 'interactsh', False):
+            # ``--interactsh`` carries the server name (``nargs="?"``); the
+            # constructor also needs the console, so calling it bare raised
+            # TypeError whenever the flag was used.
+            interactsh_server = getattr(args, "interactsh", "oast.pro")
+            self.interactsh_client = InteractshClient(
+                console,
+                server=interactsh_server if isinstance(interactsh_server, str) else "oast.pro",
+                token=getattr(args, "interactsh_token", "") or "",
+                insecure=getattr(args, "insecure", False),
+                timeout=getattr(args, "timeout", 15.0),
+                proxy=getattr(args, "proxy", None),
+            )
         # Opt-in AI fallback.  The key resolution order is CLI -> env -> .env;
         # the analyzer is only constructed when a key is actually available.
         self.ai: Any = None
@@ -1993,8 +2036,58 @@ class XSSScanner(CrawlerMixin):
                 if not cached.error and cached.text:
                     self._analyze_graphql(url, cached.text, cached.header("content-type", ""))
 
+            # Advanced: GraphQL XSS testing
+            if HAS_ADVANCED and getattr(self.args, 'graphql_xss', False) and self.graphql_xss:
+                cached_page = self.http.peek(url) or await self.http.get(url, cache=True)
+                if not cached_page.error and cached_page.text:
+                    if self.graphql_xss.detect_graphql_endpoint(cached_page.text):
+                        marker = unique_token("graphql", 10)
+                        vectors = self.graphql_xss.generate_xss_vectors([], marker)
+                        self.console.info(f"GraphQL XSS: {len(vectors)} vectors detected for {url}")
+
+            # Advanced: CSP bypass testing
+            if HAS_ADVANCED and getattr(self.args, 'csp_bypass', False) and self.csp_bypass:
+                csp_header = None
+                try:
+                    csp_response = await self.http.get(url, cache=True)
+                    if not csp_response.error:
+                        csp_header = csp_response.header("content-security-policy", "")
+                except Exception:
+                    pass
+                if csp_header:
+                    csp_dict = self.csp_bypass.parse_csp(csp_header)
+                    weaknesses = self.csp_bypass.analyze_weaknesses(csp_dict)
+                    if weaknesses:
+                        self.console.info(f"CSP: {len(weaknesses)} weakness(es) detected for {url}")
+                        bypasses = self.csp_bypass.get_applicable_bypasses(csp_dict, unique_token("csp", 8))
+                        if bypasses:
+                            self.console.info(f"CSP: {len(bypasses)} bypass technique(s) applicable")
+
             if HAS_ADVANCED and getattr(self.args, "proto_pollution", False):
                 await self.test_proto_pollution(url)
+
+            # Advanced: SPA-aware crawling
+            if HAS_ADVANCED and getattr(self.args, 'spa_crawl', False):
+                from xoxss.crawler.spa import SPACrawler
+                try:
+                    spa_crawler = SPACrawler()
+                    page_content = ""
+                    try:
+                        cached_page = self.http.peek(url) or await self.http.get(url, cache=True)
+                        if not cached_page.error and cached_page.text:
+                            page_content = cached_page.text
+                    except Exception:
+                        pass
+                    routes = spa_crawler.discover_routes(page_content)
+                    if routes:
+                        self.console.info(f"SPA: {len(routes)} route(s) discovered for {url}")
+                        for route in routes:
+                            if route.router_type != "none":
+                                test_url = f"{url}#{route.path}" if route.router_type.value == "hash_router" else f"{url}/{route.path}"
+                                if not self.state.is_scanned(test_url):
+                                    await self.scan_url(test_url)
+                except Exception as exc:
+                    self.console.debug(f"SPA crawling failed: {exc}")
 
             points = await self.discover_points(url)
             self.console.debug(f"{len(points)} injection point(s) on {url}")
@@ -2008,6 +2101,38 @@ class XSSScanner(CrawlerMixin):
                 await self.test_dom(url)
             if getattr(self.args, "fragment_xss", False):
                 await self.test_fragment(url)
+            
+            # Advanced: Enhanced sink tracking
+            if HAS_ADVANCED and getattr(self.args, 'enhanced_sinks', False) and self.enhanced_sinks:
+                try:
+                    page_text = ""
+                    try:
+                        cached_page = self.http.peek(url) or await self.http.get(url, cache=True)
+                        if not cached_page.error and cached_page.text:
+                            page_text = cached_page.text
+                    except Exception:
+                        pass
+                    enhanced_matches = self.enhanced_sinks.analyze(page_text, "")
+                    if enhanced_matches:
+                        self.console.info(f"Enhanced sinks: {len(enhanced_matches)} additional sink(s) detected")
+                except Exception as exc:
+                    self.console.debug(f"Enhanced sink tracking failed: {exc}")
+            
+            # Advanced: Storage XSS
+            if HAS_ADVANCED and getattr(self.args, 'storage_xss', False) and self.storage_xss:
+                try:
+                    page_text = ""
+                    try:
+                        cached_page = self.http.peek(url) or await self.http.get(url, cache=True)
+                        if not cached_page.error and cached_page.text:
+                            page_text = cached_page.text
+                    except Exception:
+                        pass
+                    storage_vectors = self.storage_xss.analyze(page_text)
+                    if storage_vectors:
+                        self.console.info(f"Storage XSS: {len(storage_vectors)} vector(s) detected for {url}")
+                except Exception as exc:
+                    self.console.debug(f"Storage XSS analysis failed: {exc}")
             completed = True
         except asyncio.CancelledError:
             interrupted = True
@@ -3653,10 +3778,63 @@ class XSSScanner(CrawlerMixin):
                     )
 
     async def test_dom(self, url: str) -> None:
+        """Static DOM analysis plus browser confirmation of source/sink flows."""
         response = await self.http.get(url, cache=True)
         if response.error or not response.text or not HAS_BS4:
             return
 
+        self._probe_framework(url, response)
+        scripts = await self._collect_dom_scripts(url, response)
+
+        candidates = static_dom_candidates(scripts)
+        # Enhanced coverage: sinks the basic DOM map does not model (postMessage,
+        # Web Speech, WebGL, SVG, CSS, worker), storage reads, and service
+        # workers registered by the page.
+        candidates.extend(self._static_enhanced_candidates(url, scripts))
+        await self._analyze_service_workers(url, scripts)
+        inline_sink = any(has_dom_sink(script.content) for script in scripts if script.content)
+
+        await self._analyze_script_sinks(url, scripts, response)
+        self._report_static_dom_candidates(url, candidates)
+
+        if not candidates and not inline_sink:
+            return
+        if self.pool is None or not self.pool.engines:
+            if candidates:
+                self.console.info(
+                    f"DOM sinks present on {url} - install Selenium to verify at runtime",
+                    important=False,
+                )
+            return
+        if await self._verify_dom_vectors(url):
+            return
+        if getattr(self.args, "dom_source_probes", False):
+            await self._probe_dom_sources(url)
+
+    def _probe_framework(self, url: str, response: HttpResponse) -> None:
+        """Log framework-specific bypass vectors when the option is enabled."""
+        if not (
+            HAS_ADVANCED
+            and getattr(self.args, "framework_bypass", False)
+            and self.framework_exploiter
+        ):
+            return
+        try:
+            framework = self.framework_exploiter.detect_framework(response.text)
+            if framework:
+                self.console.info(f"Framework: {framework} detected on {url}")
+                bypasses = self.framework_exploiter.generate_bypasses(
+                    framework, unique_token("fw", 8)
+                )
+                if bypasses:
+                    self.console.info(
+                        f"Framework bypass: {len(bypasses)} bypass payload(s) for {framework}"
+                    )
+        except Exception as exc:
+            self.console.debug(f"Framework bypass testing failed: {exc}")
+
+    async def _collect_dom_scripts(self, url: str, response: HttpResponse) -> List[DomScript]:
+        """Extract page scripts, fetch remote bundles and run taint analyses."""
         scripts = extract_scripts(url, response.text)
         fetched = 0
         for script in scripts:
@@ -3669,7 +3847,10 @@ class XSSScanner(CrawlerMixin):
                 script.content = remote.text
                 fetched += 1
 
-        if HAS_RECON and analyze_js_taint is not None:
+        # AST taint analysis is on by default; ``--no-ast-analysis`` turns it
+        # off.  The flag used to be accepted (and advertised) but never read,
+        # so this gate is what makes it functional.
+        if getattr(self.args, "ast_analysis", True) and HAS_RECON and analyze_js_taint is not None:
             for script in scripts:
                 if not script.content:
                     continue
@@ -3692,19 +3873,17 @@ class XSSScanner(CrawlerMixin):
                         self._record_taint_flow(script.url or url, flow)
                 except Exception as exc:
                     self.console.debug(f"DFG slice analysis failed: {exc}")
+        return scripts
 
-        candidates = static_dom_candidates(scripts)
-        # Enhanced coverage: sinks the basic DOM map does not model (postMessage,
-        # Web Speech, WebGL, SVG, CSS, worker), storage reads, and service
-        # workers registered by the page.
-        candidates.extend(self._static_enhanced_candidates(url, scripts))
-        await self._analyze_service_workers(url, scripts)
-        inline_sink = any(has_dom_sink(script.content) for script in scripts if script.content)
-
+    async def _analyze_script_sinks(
+        self, url: str, scripts: Sequence[DomScript], response: HttpResponse
+    ) -> None:
+        """Run the opt-in analyzer passes (postMessage, WebSocket, uploads)."""
         # --postmessage / --websocket: analyze inline scripts for sink handlers
         if scripts and (self.args.postmessage or self.args.websocket):
             from xoxss.analysis.postmessage import PostMessageAnalyzer
             from xoxss.analysis.websocket import WebSocketAnalyzer
+
             marker = unique_token()
             for script in scripts:
                 if not script.content or self._stop.is_set():
@@ -3746,6 +3925,7 @@ class XSSScanner(CrawlerMixin):
         # --dom-clobbering: static check on the page markup
         if self.args.dom_clobbering and response.text:
             from xoxss.analysis.dom_clobbering import DOMClobberingDetector
+
             try:
                 for vuln in DOMClobberingDetector().detect_dom_clobbering(response.text, url):
                     self.dom_clobber_findings.append({
@@ -3765,6 +3945,7 @@ class XSSScanner(CrawlerMixin):
         # --file-upload: look for upload forms so the operator gets an endpoint list
         if self.args.file_upload and response.text:
             from xoxss.analysis.file_upload import FileUploadAnalyzer
+
             try:
                 if FileUploadAnalyzer().detect_file_upload_endpoint(response.text):
                     self.file_upload_findings.append({'url': url})
@@ -3772,45 +3953,51 @@ class XSSScanner(CrawlerMixin):
             except Exception as exc:
                 self.console.debug(f"File upload analysis failed: {exc}")
 
-        if candidates:
-            self.console.debug(
-                f"DOM source/sink candidates on {url}: "
-                + "; ".join(f"{c['source']} -> {c['sink']}" for c in candidates[:4])
+    def _report_static_dom_candidates(
+        self, url: str, candidates: Sequence[Dict[str, str]]
+    ) -> None:
+        """Log static candidates and emit low-confidence leads on request."""
+        if not candidates:
+            return
+        self.console.debug(
+            f"DOM source/sink candidates on {url}: "
+            + "; ".join(f"{c['source']} -> {c['sink']}" for c in candidates[:4])
+        )
+        if not self.args.report_reflections:
+            return
+        for candidate in candidates[:3]:
+            self.add_finding(
+                Finding(
+                    kind="DOM XSS (static candidate)",
+                    url=url,
+                    parameter="N/A",
+                    method="GET",
+                    payload=candidate.get("snippet", ""),
+                    evidence=f"{candidate['source']} flows into {candidate['sink']}",
+                    confidence="low",
+                    context="dom",
+                    detail=f"script: {candidate.get('script', '')}",
+                    source="dom",
+                    sink=candidate.get("sink", "") or "",
+                    confidence_rationale=(
+                        "A static source/sink pair exists in page scripts; no runtime "
+                        "execution was observed."
+                    ),
+                )
             )
-            if self.args.report_reflections:
-                for candidate in candidates[:3]:
-                    self.add_finding(
-                        Finding(
-                            kind="DOM XSS (static candidate)",
-                            url=url,
-                            parameter="N/A",
-                            method="GET",
-                            payload=candidate.get("snippet", ""),
-                            evidence=f"{candidate['source']} flows into {candidate['sink']}",
-                            confidence="low",
-                            context="dom",
-                            detail=f"script: {candidate.get('script', '')}",
-                            source="dom",
-                            sink=candidate.get("sink", "") or "",
-                            confidence_rationale=(
-                                "A static source/sink pair exists in page scripts; no runtime "
-                                "execution was observed."
-                            ),
-                        )
-                    )
 
-        if not candidates and not inline_sink:
-            return
-        if self.pool is None or not self.pool.engines:
-            if candidates:
-                self.console.info(f"DOM sinks present on {url} - install Selenium to verify at runtime", important=False)
-            return
+    async def _verify_dom_vectors(self, url: str) -> bool:
+        """Navigate DOM vectors in a browser.
 
+        Returns ``True`` when the caller should stop the DOM phase (a finding
+        was recorded, the run was interrupted, or a browser error made further
+        navigation pointless) and ``False`` when no vector fired.
+        """
         for vector, token, kind in self.dom_vectors(url)[: self.args.max_payloads * 3]:
             if self._stop.is_set():
-                return
+                return True
             try:
-                async with self.pool.borrow() as browser:
+                async with self.pool.borrow() as browser:  # type: ignore[union-attr]
                     self.stats.browser_checks += 1
                     await browser.navigate(vector)
                     hit = await browser.check_token(token, timeout=2.0)
@@ -3875,16 +4062,18 @@ class XSSScanner(CrawlerMixin):
                             dom_path=dom_path,
                         )
                     )
-                    return
+                    return True
             except Exception as exc:
                 self.console.debug(f"DOM verification error: {exc}")
-                return
+                return True
+        return False
 
-        # Exercise non-URL sources that static analysis commonly sees in SPAs.
-        # These probes use unique per-run keys and stay within the existing
-        # browser-worker and same-origin scope controls.
-        if not getattr(self.args, "dom_source_probes", False):
-            return
+    async def _probe_dom_sources(self, url: str) -> None:
+        """Exercise non-URL sources that static analysis commonly sees in SPAs.
+
+        These probes use unique per-run keys and stay within the existing
+        browser-worker and same-origin scope controls.
+        """
         marker = unique_token()
         runtime_value = self.payloads.render('<img src=x onerror="{m}">', marker)
         source_probes = (
@@ -3897,7 +4086,7 @@ class XSSScanner(CrawlerMixin):
             if self._stop.is_set():
                 return
             try:
-                async with self.pool.borrow() as browser:
+                async with self.pool.borrow() as browser:  # type: ignore[union-attr]
                     await browser.navigate(url)
                     await browser.evaluate(seed_script, runtime_value)
                     if reload_page:
@@ -6102,279 +6291,15 @@ async def run_replay(args: argparse.Namespace, console: Console) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    load_dotenv()
-    raw_args = list(argv) if argv is not None else sys.argv[1:]
-    # Decide about colour before argparse renders --help, so `--no-color --help`
-    # is plain even on a TTY.
-    if "--no-color" in raw_args or os.environ.get("NO_COLOR"):
-        bcolors.disable()
-        if _ui is not None:
-            _ui.disable()
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if getattr(args, "config", None):
-        load_dotenv(args.config, override=True)
-    # ``--fail-on-findings`` predates ``--fail-on`` and is its "any" shorthand.
-    if not getattr(args, "fail_on", None):
-        args.fail_on = "any" if getattr(args, "fail_on_findings", False) else None
-    explicit_flags = {token.split("=", 1)[0] for token in raw_args if token.startswith("--")}
-    god_mode_requested = "--god" in explicit_flags or "--yolo" in explicit_flags
-    if args.ai_only:
-        args.ai = True
+    """CLI entry point.
 
-    if args.profile == "quick" and not god_mode_requested:
-        if "--crawl" not in explicit_flags and "--deep" not in explicit_flags:
-            args.crawl = False
-        if not {"--no-browser", "--browser", "--confirm"}.intersection(explicit_flags):
-            args.no_browser = True
-        if "--no-remote-payloads" not in explicit_flags and "--remote-payloads" not in explicit_flags:
-            args.remote_payloads = False
-    elif args.profile == "deep":
-        args.deep = True
+    The implementation lives in :mod:`xoxss.app`; importing it lazily keeps
+    ``import xoxss.scanner`` free of the argument-parsing/console layer and
+    avoids an import cycle (``app`` imports the scanner's engine helpers).
+    """
+    from xoxss.app import main as _app_main
 
-    if args.no_color or os.environ.get("NO_COLOR"):
-        bcolors.disable()
-        if _ui is not None:
-            _ui.disable()
-    if args.list_payloads:
-        print_payloads()
-        return 0
-    if getattr(args, "list_payload_catalog", False):
-        print_payload_catalog()
-        return 0
-    if args.list_tampers:
-        print_tampers()
-        return 0
-    if getattr(args, "list_encoders", False):
-        print_encoders()
-        return 0
-
-    console = Console(
-        verbose=args.verbose, quiet=args.quiet, log_file=args.output,
-        events_file=getattr(args, "events_jsonl", None),
-    )
-    if getattr(args, "doctor", False):
-        return run_doctor(console, args)
-    if not args.quiet:
-        banner(console)
-
-    if args.blind:
-        if not re.match(r"^https?://", args.blind, re.IGNORECASE):
-            console.error("--blind requires an http(s) callback URL, e.g. --blind https://xo.example")
-            return 1
-        console.info(
-            f"Blind XSS: injecting out-of-band probes that call back to {args.blind}",
-            important=False,
-        )
-
-    if getattr(args, "encoder", None):
-        known = set(encoder_names()) if HAS_RECON else set()
-        unknown = [name for name in args.encoder if name not in known]
-        if unknown:
-            console.error(
-                "Unknown encoder(s): " + ", ".join(unknown) + ". Run --list-encoders."
-            )
-            return 1
-
-    if getattr(args, "oob_file", None) and not (args.blind or args.interactsh):
-        console.error(
-            "--oob-file only reads observed callbacks; pair it with --blind <callback-url> "
-            "or use --interactsh for a generated callback."
-        )
-        return 1
-
-    if getattr(args, "god", False):
-        raw_tokens = list(argv) if argv is not None else sys.argv[1:]
-        # Normalize `--flag=value` tokens so explicit user settings claim their
-        # flag (otherwise god mode would override them).
-        user_flags = {
-            token.split("=", 1)[0]
-            for token in raw_tokens
-            if token.startswith("--") and token.split("=", 1)[0] not in ("--god", "--yolo")
-        }
-        apply_god_preset(args, console, user_flags)
-        if _ui is not None and _ui.enabled() and not console.quiet:
-            diamond = _ui.glyphs()["diamond"]
-            console.raw(
-                f"  {bcolors.FAIL}{bcolors.BOLD}{diamond} GOD MODE ENGAGED{bcolors.ENDC}"
-                f"{bcolors.DIM}  full-automatic maximum-aggression preset  "
-                f"{bcolors.FAIL}{diamond}{bcolors.ENDC}"
-            )
-        else:
-            console.info("GOD MODE engaged: full-automatic maximum-aggression preset applied", important=True)
-        console.info(
-            f"god preset: crawl depth {args.crawl_depth}/{args.max_urls} URLs/{args.js_files} JS files, "
-            f"{args.max_payloads} payloads per point, {args.threads} workers x {args.concurrency} requests, "
-            f"browser {'off (HTTP-only)' if args.no_browser else args.browser}, "
-            f"OOB {'interactsh' if getattr(args, 'interactsh', None) else ('blind callback' if args.blind else 'off')}",
-        )
-
-    recon_flags = (
-        getattr(args, "subdomains", False)
-        or int(getattr(args, "subdomain_brute", 0) or 0) > 0
-        or getattr(args, "passive_urls", False)
-        or getattr(args, "openapi", False)
-        or getattr(args, "fuzz_paths", False)
-        or getattr(args, "mine_params", False)
-        or getattr(args, "external_tools", False)
-    )
-    if recon_flags and not HAS_RECON:
-        console.error(
-            "Reconnaissance modules failed to import: " + str(globals().get("_RECON_IMPORT_ERROR", "unknown error"))
-        )
-        return 1
-
-    if not HAS_AIOHTTP:
-        console.error("aiohttp is required: pip install -r requirements.txt")
-        return 1
-    if not HAS_BS4:
-        console.error("beautifulsoup4 is required: pip install -r requirements.txt")
-        return 1
-
-    if args.no_browser:
-        args.confirm = "http"
-    if args.threads < 1:
-        args.threads = 1
-    if args.concurrency < 1:
-        args.concurrency = 1
-    if args.max_response_bytes < 1024:
-        console.warn("--max-response-bytes is below 1024; using 1024 bytes")
-        args.max_response_bytes = 1024
-    if args.max_payloads < 1:
-        args.max_payloads = 1
-    if args.crawl_depth < 1:
-        args.crawl_depth = 1
-    if args.max_urls < 1:
-        args.max_urls = 1
-    if args.js_files < 0:
-        args.js_files = 0
-    if args.fuzz_param_limit < 1:
-        args.fuzz_param_limit = 1
-    if args.subdomain_brute < 0:
-        args.subdomain_brute = 0
-    if args.oob_interval < 1:
-        args.oob_interval = 1.0
-    if args.oob_wait < 0:
-        args.oob_wait = 0.0
-
-    if args.deep:
-        args.crawl = True
-        args.crawl_depth = max(args.crawl_depth, 5)
-        args.max_urls = max(args.max_urls, 1500)
-        args.discover = True
-        args.discover_paths = True
-        args.fuzz_params = True
-        if "--no-path-xss" not in explicit_flags:
-            args.path_xss = True
-
-    # Headed vs headless is resolved from the terminal/CI context unless the
-    # operator pinned it with --headless or --show-browser.
-    resolve_headless(args, explicit_flags)
-
-    if getattr(args, "replay", None):
-        install_uvloop()
-        try:
-            return asyncio.run(run_replay(args, console))
-        except KeyboardInterrupt:
-            console.warn("Interrupted")
-            return 130
-        except Exception as exc:
-            console.error(f"Replay failed: {exc}")
-            if args.verbose:
-                console.raw(traceback.format_exc())
-            return 1
-
-    if args.mass and getattr(args, "param_audit", False):
-        console.error("--mass and --param-audit are separate modes; choose one")
-        return 1
-
-    if getattr(args, "god", False) and (args.mass or getattr(args, "param_audit", False)):
-        console.error("--god is a full-scan preset; it cannot be combined with --mass or --param-audit")
-        return 1
-
-    if getattr(args, "param_audit", False):
-        if not HAS_PARAM_AUDIT:
-            console.error(
-                "Parameter-audit modules failed to import: "
-                + str(globals().get("_PARAM_IMPORT_ERROR", "unknown error"))
-            )
-            return 1
-        console.info(
-            "Parameter audit: URL harvest + batched GET/JSON reflection probes",
-            important=False,
-        )
-        install_uvloop()
-        try:
-            code, reflected = asyncio.run(run_param_audit(args, console))
-            if meets_fail_threshold(reflected, args.fail_on):
-                code = 2
-        except KeyboardInterrupt:
-            console.warn("Interrupted")
-            code = 130
-        except Exception as exc:
-            console.error(f"Fatal error: {exc}")
-            if args.verbose:
-                console.raw(traceback.format_exc())
-            code = 1
-        return code
-
-    if args.mass:
-        if args.blind:
-            console.warn("--blind is ignored in mass mode (HTTP-only sweep)")
-        console.info("Mass mode: stateless HTTP sweep (no crawl, browser or reports)", important=False)
-        install_uvloop()
-        try:
-            code, findings = asyncio.run(run_mass(args, console))
-            if meets_fail_threshold(findings, args.fail_on):
-                code = 2
-        except KeyboardInterrupt:
-            console.warn("Interrupted")
-            code = 130
-        except Exception as exc:
-            console.error(f"Fatal error: {exc}")
-            if args.verbose:
-                console.raw(traceback.format_exc())
-            code = 1
-        return code
-
-    if args.jsonl and not args.mass:
-        console.warn("--jsonl is only written in --mass mode; full scans use --report json")
-
-    install_uvloop()
-    payload_files: List[Path] = []
-    payload_dir: Optional[Path] = None
-    code = 0
-    try:
-        if args.remote_payloads:
-            sources: List[str] = list(PAYLOAD_SOURCES)
-            for extra in args.payload_source or []:
-                if extra and extra not in sources:
-                    sources.append(str(extra))
-            payload_dir = payload_workdir(args.payload_tmp_dir)
-            payload_files, payload_dir = download_payload_lists(
-                console,
-                sources,
-                args.payload_limit,
-                work_dir=payload_dir,
-            )
-        args.payload_files = [str(path) for path in payload_files]
-
-        console.start_status()
-        code, findings = asyncio.run(run_targets(args, console))
-        if meets_fail_threshold(findings, args.fail_on):
-            code = 2
-    except KeyboardInterrupt:
-        console.warn("Interrupted - checkpoints were saved")
-        code = 130
-    except Exception as exc:
-        console.error(f"Fatal error: {exc}")
-        if args.verbose:
-            console.raw(traceback.format_exc())
-        code = 1
-    finally:
-        console.stop_status()
-        cleanup_payload_lists(payload_dir, keep=args.keep_payloads, console=console)
-    return code
+    return _app_main(argv)
 
 
 if __name__ == "__main__":

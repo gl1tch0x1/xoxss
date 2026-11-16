@@ -25,6 +25,9 @@ examples:
   xoxss https://target.tld --stored --stored-pages 20 --screenshot
   xoxss https://target.tld --show-browser          # visible Chromium/Selenium window
   xoxss --replay 1a2b3c4d5e6f7890 --replay-report .xoxss/reports/latest.json
+  xoxss https://target.tld --ast-analysis --framework-bypass --spa-crawl
+  xoxss https://target.tld --csp-bypass --graphql-xss --enhanced-sinks
+  xoxss https://target.tld --storage-xss --service-worker --interactsh
 
 evidence policy:
   default findings require a reflected payload whose breakout delimiters survive
@@ -359,7 +362,7 @@ def build_parser(
     oob.add_argument(
         "--oob-file",
         metavar="PATH",
-        help="tail a local JSON-lines/text collector file (requires --blind for the callback)",
+        help="tail a local JSON-lines/text collector file (requires --blind or --interactsh for the callback)",
     )
     oob.add_argument("--oob-interval", type=float, default=5.0, help="seconds between OOB polls (default: 5)")
     oob.add_argument(
@@ -467,6 +470,21 @@ def build_parser(
     browser.add_argument("--screenshot", action="store_true", help="save a screenshot for confirmed findings")
     browser.add_argument("--binary", help="explicit browser binary path")
     browser.add_argument("--user-agent", default=user_agent, help="User-Agent override")
+
+    advanced = parser.add_argument_group("advanced analysis", "deep static and runtime detection")
+    advanced.add_argument(
+        "--ast-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable AST-based JavaScript taint analysis for DOM XSS (default: on; --no-ast-analysis disables)",
+    )
+    advanced.add_argument("--framework-bypass", action="store_true", help="enable framework-specific XSS bypass testing (React, Vue, Angular)")
+    advanced.add_argument("--spa-crawl", action="store_true", help="enable SPA-aware hash route navigation and dynamic content discovery")
+    advanced.add_argument("--csp-bypass", action="store_true", help="enable automated CSP bypass testing and payload generation")
+    advanced.add_argument("--graphql-xss", action="store_true", help="enable GraphQL schema introspection and XSS testing")
+    advanced.add_argument("--enhanced-sinks", action="store_true", help="enable tracking of additional sinks (postMessage, Web Speech, WebGL, etc.)")
+    advanced.add_argument("--storage-xss", action="store_true", help="enable storage-based XSS discovery (localStorage, sessionStorage, IndexedDB)")
+    advanced.add_argument("--service-worker", action="store_true", help="enable Service Worker XSS detection and cache poisoning analysis")
 
     network = parser.add_argument_group("network", "transport, pacing and concurrency")
     network.add_argument("--threads", type=int, default=10, help="parallel URL workers (default: 10)")

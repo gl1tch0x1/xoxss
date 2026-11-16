@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import random
 import socket
 import sys
@@ -36,6 +37,8 @@ if TYPE_CHECKING:  # pragma: no cover - optional runtime dependency
     from aiohttp import ClientResponse, ClientSession
 
 from xoxss.utils.helpers import truncate
+
+_LOGGER = logging.getLogger(__name__)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -351,8 +354,8 @@ class HttpEngine:
         if self.session is not None:
             try:
                 await self.session.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("HTTP session close failed: %s", exc)
         self.session = None
 
     def enable_smart_rate(self, initial_rate: float) -> None:
@@ -831,8 +834,8 @@ class HttpEngine:
     def _close_curl_response(response: Any) -> None:
         try:
             response.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("curl response close failed: %s", exc)
 
     @staticmethod
     def _cache_key(

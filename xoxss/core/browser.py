@@ -13,6 +13,7 @@ import asyncio
 import importlib.util
 import inspect
 import json
+import logging
 import os
 import re
 import shutil
@@ -22,6 +23,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from xoxss.core.protocols import ConsoleLike
+
+#: Cleanup failures are expected (a driver may already be gone) but must stay
+#: observable in debug logs instead of vanishing into ``pass``.
+_LOGGER = logging.getLogger(__name__)
 
 #: Whether the optional Playwright backend can be imported in this environment.
 HAS_PLAYWRIGHT = importlib.util.find_spec("playwright") is not None
@@ -226,8 +231,8 @@ class BrowserEngine:
         try:
             driver.set_page_load_timeout(self.page_timeout)
             driver.set_script_timeout(self.page_timeout)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("could not apply Selenium timeouts: %s", exc)
 
         if self.kind in ("chrome", "chromium", "edge"):
             try:
@@ -326,8 +331,8 @@ class BrowserEngine:
         self.driver = None
         try:
             await asyncio.to_thread(driver.quit)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("Selenium quit failed (driver already closed?): %s", exc)
 
     def is_alive(self) -> bool:
         """Return True only if the driver process and session are responsive."""
@@ -357,15 +362,15 @@ class BrowserEngine:
             self._drain_dialog_sync()
         try:
             driver.execute_script(HOOK_JS)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("instrumentation hook injection failed after load: %s", exc)
         deadline = time.time() + min(10.0, self.page_timeout)
         while time.time() < deadline:
             try:
                 if driver.execute_script("return document.readyState") == "complete":
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("readyState probe failed while loading: %s", exc)
             time.sleep(0.1)
         return error
 
@@ -502,14 +507,14 @@ class BrowserEngine:
             try:
                 if driver.execute_script("return document.readyState") == "complete":
                     break
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("readyState probe failed after form submit: %s", exc)
             time.sleep(0.1)
         self._drain_dialog_sync()
         try:
             driver.execute_script(HOOK_JS)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("instrumentation hook re-injection failed after submit: %s", exc)
         time.sleep(0.2)
         return result
 
@@ -572,12 +577,12 @@ class PlaywrightEngine:
     async def _on_dialog(self, dialog: Any) -> None:
         try:
             self._dialogs.append(str(dialog.message))
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("could not record dialog message: %s", exc)
         try:
             await dialog.dismiss()
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("could not dismiss dialog: %s", exc)
 
     def _on_request(self, request: Any) -> None:
         """Keep a bounded list of app navigation and API request URLs."""
@@ -595,8 +600,8 @@ class PlaywrightEngine:
                     detail = {"url": url, "method": method, "content_type": content_type, "post_data": post_data}
                     if detail not in self.observed_request_details:
                         self.observed_request_details.append(detail)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.debug("could not record observed request: %s", exc)
 
     async def start(self) -> bool:
         try:
@@ -726,16 +731,16 @@ class PlaywrightEngine:
             try:
                 if resource is not None:
                     await resource.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("Playwright resource close failed: %s", exc)
         self._context = None
         self._browser = None
         self.page = None
         if self._pw is not None:
             try:
                 await self._pw.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("Playwright stop failed: %s", exc)
             self._pw = None
 
     def is_alive(self) -> bool:
@@ -766,8 +771,8 @@ class PlaywrightEngine:
                 error = str(exc)
             try:
                 await self.page.evaluate(HOOK_JS)
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("Playwright hook injection failed after load: %s", exc)
             return error
 
     async def collect(self) -> Dict[str, Any]:
@@ -889,13 +894,13 @@ class PlaywrightEngine:
                 try:
                     if await self.page.evaluate("document.readyState") == "complete":
                         break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _LOGGER.debug("Playwright readyState probe failed after submit: %s", exc)
                 await asyncio.sleep(0.1)
             try:
                 await self.page.evaluate(HOOK_JS)
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("Playwright hook re-injection failed after submit: %s", exc)
             return result
 
     async def screenshot(self, path: str) -> str:
