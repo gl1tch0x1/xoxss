@@ -9,6 +9,74 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional
+from urllib.parse import urlsplit
+
+
+def _normalize_host_source(source: str) -> Optional[str]:
+    """Return the hostname of a CSP host-source expression.
+
+    ``None`` is returned for scheme sources (``data:``), keywords
+    (``'self'``, ``'unsafe-inline'``), nonces/hashes and tokens that do not
+    parse as a host.  Wildcard hosts keep their leading ``*.`` so the caller
+    can apply the CSP subdomain-matching rules.
+    """
+    token = str(source or "").strip().strip("'\"")
+    if not token:
+        return None
+    lower = token.lower()
+    if lower.startswith(("nonce-", "sha256-", "sha384-", "sha512-")):
+        return None
+    if "://" in lower:
+        candidate = lower
+    elif lower.startswith("//"):
+        candidate = "http:" + lower
+    else:
+        candidate = "http://" + lower
+    try:
+        host = urlsplit(candidate).hostname
+    except ValueError:
+        return None
+    if not host:
+        return None
+    host = host.lower()
+    # ``data:``/``blob:``/``https:`` parse as a host named after the scheme;
+    # they are scheme sources, not hosts.
+    if lower.endswith(":") and re.fullmatch(r"[a-z][a-z0-9+.-]*", host):
+        return None
+    return host
+
+
+def _source_allows_host(source: str, host: str) -> bool:
+    """Whether a CSP source expression permits ``host``.
+
+    Compares parsed hostnames instead of substrings, so
+    ``https://evil.example/ajax.googleapis.com`` does not match
+    ``ajax.googleapis.com``.  ``*.example.com`` follows CSP wildcard rules:
+    it matches subdomains and the bare domain, but not lookalikes such as
+    ``notexample.com``.
+    """
+    hostname = _normalize_host_source(source)
+    if not hostname:
+        return False
+    wanted = host.lower()
+    if hostname.startswith("*."):
+        suffix = hostname[2:]
+        return wanted == suffix or wanted.endswith("." + suffix)
+    return hostname == wanted
+
+
+def _is_scheme_source(source: str, scheme: str) -> bool:
+    """Whether ``source`` is exactly the CSP scheme source ``scheme:``.
+
+    Scheme sources are unquoted in CSP; a quoted ``'data:'`` is a keyword,
+    not a scheme source.
+    """
+    return str(source or "").strip().lower() == f"{scheme.lower()}:"
+
+
+def _is_csp_keyword(source: str, keyword: str) -> bool:
+    """Whether ``source`` is the CSP keyword (quoted or bare, any case)."""
+    return str(source or "").strip().strip("'\"").lower() == keyword.lower()
 
 
 class CSPSeverity(Enum):
@@ -218,7 +286,7 @@ class CSPAnalyzer:
         for directive, values in directives.items():
             for value in values:
                 for gadget in gadget_domains:
-                    if gadget in value:
+                    if _source_allows_host(value, gadget):
                         issues.append(CSPIssue(
                             issue_type="jsonp_gadget_domain",
                             severity=CSPSeverity.MEDIUM,
@@ -421,11 +489,17 @@ class CSPBypassAutomator:
             if '*' in values:
                 applicable.append(bypass)
                 continue
-            if bypass.technique == "data_uri" and any('data:' in v for v in values):
+            if bypass.technique == "data_uri" and any(
+                _is_scheme_source(v, "data") for v in values
+            ):
                 applicable.append(bypass)
-            elif bypass.technique == "angular_cdn" and any('ajax.googleapis.com' in v for v in values):
+            elif bypass.technique == "angular_cdn" and any(
+                _source_allows_host(v, "ajax.googleapis.com") for v in values
+            ):
                 applicable.append(bypass)
-            elif bypass.technique == "iframe_sandbox" and any('sandbox' in v for v in values):
+            elif bypass.technique == "iframe_sandbox" and any(
+                _is_csp_keyword(v, "sandbox") for v in values
+            ):
                 applicable.append(bypass)
 
         return applicable
