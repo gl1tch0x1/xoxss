@@ -32,7 +32,13 @@ class Encoder:
     tags: Tuple[str, ...] = field(default_factory=tuple)
 
     def encode(self, value: str) -> str:
-        return self.func(value or "")
+        text = value or ""
+        # Encoders that wrap their input (``base64_eval``, ``utf16le``) would
+        # otherwise emit scaffolding for an empty payload; an empty transform
+        # must stay empty so chains do not invent content.
+        if not text:
+            return ""
+        return self.func(text)
 
 
 def _random_case(value: str) -> str:

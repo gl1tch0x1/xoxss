@@ -229,9 +229,6 @@ class PerCharProbe:
         mapping = {
             ContextType.HTML_BODY: ProbeContext.HTML,
             ContextType.HTML_TAG: ProbeContext.HTML,
-            ContextType.SVG_DATA: ProbeContext.HTML,
-            ContextType.MATHML: ProbeContext.HTML,
-            ContextType.TEMPLATE_LITERAL: ProbeContext.HTML,
             ContextType.ATTR_DOUBLE_QUOTED: ProbeContext.ATTR_DOUBLE,
             ContextType.ATTR_SINGLE_QUOTED: ProbeContext.ATTR_SINGLE,
             ContextType.ATTR_UNQUOTED: ProbeContext.ATTR_UNQUOTED,

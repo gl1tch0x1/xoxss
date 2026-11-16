@@ -145,13 +145,6 @@ class ContextType(Enum):
     JAVASCRIPT_COMMENT = "js_comment"
     JSON_STRING = "json_string"
     JSON_VALUE = "json_value"
-    URL_PATH = "url_path"
-    URL_QUERY = "url_query"
-    URL_FRAGMENT = "url_fragment"
-    DATA_URI = "data_uri"
-    SVG_DATA = "svg_data"
-    MATHML = "mathml"
-    TEMPLATE_LITERAL = "template_literal"
 
 
 @dataclass
@@ -204,78 +197,6 @@ class ContextDetector:
         'onclick': r'\bon\w+\s*=',
         'onerror': r'\bonerror\s*=',
         'onload': r'\bonload\s*=',
-    }
-
-    # Context detection patterns
-    CONTEXT_PATTERNS = {
-        ContextType.HTML_BODY: [
-            r'>[^<]*x',
-            r'<body[^>]*>.*x',
-        ],
-        ContextType.HTML_TAG: [
-            r'<\w+[^>]*x',
-        ],
-        ContextType.ATTR_DOUBLE_QUOTED: [
-            r'="[^"]*x',
-        ],
-        ContextType.ATTR_SINGLE_QUOTED: [
-            r"='[^']*x",
-        ],
-        ContextType.ATTR_UNQUOTED: [
-            r'=[^"\'<>\s]*x',
-        ],
-        ContextType.JAVASCRIPT_STRING_DOUBLE: [
-            r'"[^"]*x"',
-        ],
-        ContextType.JAVASCRIPT_STRING_SINGLE: [
-            r"'[^']*x'",
-        ],
-        ContextType.JAVASCRIPT_TEMPLATE: [
-            r'`[^`]*x`',
-        ],
-        ContextType.JAVASCRIPT_CODE: [
-            r';\s*x',
-            r'\(\s*x',
-            r'\s+x\s*[=\+\-\*\/]',
-        ],
-        ContextType.CSS_STRING: [
-            r'"[^"]*x"',
-            r"'[^']*x'",
-        ],
-        ContextType.CSS_PROPERTY: [
-            r':[^;]*x',
-        ],
-        ContextType.HTML_COMMENT: [
-            r'<!--.*x',
-        ],
-        ContextType.JAVASCRIPT_COMMENT: [
-            r'//.*x',
-            r'/\*.*x',
-        ],
-        ContextType.JSON_STRING: [
-            r'"{[^}]*x',
-        ],
-        ContextType.JSON_VALUE: [
-            r':\s*["\']?x',
-        ],
-        ContextType.URL_PATH: [
-            r'/[^?\s]*x',
-        ],
-        ContextType.URL_QUERY: [
-            r'\?[^#]*x',
-        ],
-        ContextType.URL_FRAGMENT: [
-            r'#.*x',
-        ],
-        ContextType.DATA_URI: [
-            r'data:[^,]*,.*x',
-        ],
-        ContextType.SVG_DATA: [
-            r'<svg[^>]*>.*x',
-        ],
-        ContextType.MATHML: [
-            r'<math[^>]*>.*x',
-        ],
     }
 
     # Special characters for each context
@@ -346,10 +267,12 @@ class ContextDetector:
         # raw character elsewhere in the document from being mistaken for a
         # surviving delimiter inside a comment/textarea/entity output.
         inert_reason, _breakout = inert_zone(response, position, marker or "")
-        vicinity = response[max(0, position - 64): position + len(marker or "") + 320]
-        entity_encoded = bool(ENTITY_RE.search(vicinity)) and not any(
-            char in strip_inert_regions(vicinity) for char in "<>\"'`"
-        )
+        # Only an entity adjacent to the reflection indicates that *this*
+        # payload was encoded.  Inspecting the whole snippet let wrapper tags
+        # such as ``<div>`` mask ``&lt;script&gt;`` output and report the
+        # reflection as raw.
+        window = response[max(0, position - 24): position + len(marker or "") + 24]
+        entity_encoded = bool(ENTITY_RE.search(window))
 
         # Generate suggested payloads
         suggested_payloads = self._generate_payloads(context_type, special_chars_allowed)
@@ -452,8 +375,6 @@ class ContextDetector:
         # resolved above.  A bare scheme in a text node is inert, so matching
         # it here turned escaped output such as
         # ``&lt;img onerror=javascript:...&gt;`` into a phantom data-URI sink.
-        # ``ContextType.DATA_URI`` is retained for callers that classify URL
-        # attributes directly.
         return ContextType.HTML_BODY
 
     def _calculate_confidence(self, context_type: ContextType) -> float:
@@ -473,7 +394,6 @@ class ContextDetector:
             ContextType.CSS_PROPERTY: 0.7,
             ContextType.JSON_STRING: 0.8,
             ContextType.JSON_VALUE: 0.8,
-            ContextType.DATA_URI: 0.8,
             ContextType.HTML_TAG: 0.55,
             ContextType.HTML_BODY: 0.6,
         }
@@ -583,10 +503,6 @@ class ContextDetector:
         elif context_type == ContextType.CSS_PROPERTY:
             payloads.append(";expression(alert(1))")
             payloads.append("};alert(1);{")
-
-        elif context_type == ContextType.URL_QUERY:
-            payloads.append("<script>alert(1)</script>")
-            payloads.append("javascript:alert(1)")
 
         return payloads
 

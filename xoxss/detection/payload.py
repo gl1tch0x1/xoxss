@@ -235,6 +235,11 @@ class PayloadGenerator:
                     tamper_resistant=True
                 ))
 
+        # Optional payload families are additive: truncating to ``count`` after
+        # appending them silently dropped every polyglot/obfuscated/evasion
+        # vector whenever the context already had ``count`` standard templates.
+        if include_polyglots or include_obfuscated or include_evasion:
+            return payloads
         return payloads[:count]
 
     def generate_custom_payload(
@@ -250,55 +255,6 @@ class PayloadGenerator:
             marker=marker,
             description="Custom payload"
         )
-
-    def generate_catalog_payloads(
-        self,
-        context: str,
-        marker: str,
-        count: int = 10,
-        auto_only: bool = True,
-        include_reference: bool = False,
-    ) -> List[Payload]:
-        """Build payloads from the bundled brokep/XSS-Payloads catalog.
-
-        ``context`` is a scanner context name (``html``, ``attr_double``,
-        ``script``, ``json`` ...).  Only vectors that match the context are
-        returned; ``auto_only`` keeps vectors that fire without a user gesture,
-        which is what the browser confirmation gate needs.
-        """
-        entries = catalog_entries(
-            context=context,
-            auto_only=auto_only,
-            include_reference=include_reference,
-        )
-        if not entries and context != "generic":
-            entries = catalog_entries(
-                context="generic",
-                auto_only=auto_only,
-                include_reference=include_reference,
-            )
-        payload_context = _CATALOG_PAYLOAD_CONTEXT.get(context, PayloadContext.HTML)
-        generated: List[Payload] = []
-        seen: Set[str] = set()
-        for entry in entries:
-            if entry.payload in seen:
-                continue
-            seen.add(entry.payload)
-            generated.append(
-                Payload(
-                    template=entry.payload,
-                    context=payload_context,
-                    marker=marker,
-                    description=f"Catalog {entry.category.value} payload",
-                    tamper_resistant=(
-                        "polyglot" in entry.tags or "filter-bypass" in entry.tags
-                    ),
-                    obfuscated="mutation" in entry.tags,
-                )
-            )
-            if len(generated) >= max(1, count):
-                break
-        return generated
 
     def generate_blind_payload(
         self,
@@ -1317,21 +1273,6 @@ def _build_context_index() -> Dict[str, Tuple[CatalogPayload, ...]]:
 
 #: Context name -> entries whose ``contexts`` include it (reference-only vectors excluded).
 _CATALOG_BY_CONTEXT: Dict[str, Tuple[CatalogPayload, ...]] = _build_context_index()
-
-#: Scanner context name -> :class:`PayloadContext` for generated catalog payloads.
-_CATALOG_PAYLOAD_CONTEXT: Dict[str, PayloadContext] = {
-    "html": PayloadContext.HTML,
-    "attr_double": PayloadContext.ATTR_DOUBLE,
-    "attr_single": PayloadContext.ATTR_SINGLE,
-    "attr_unquoted": PayloadContext.ATTR_UNQUOTED,
-    "script": PayloadContext.JAVASCRIPT,
-    "style": PayloadContext.CSS,
-    "comment": PayloadContext.HTML,
-    "json": PayloadContext.JAVASCRIPT,
-    "url": PayloadContext.URL,
-    "svg": PayloadContext.SVG,
-    "generic": PayloadContext.HTML,
-}
 
 
 def catalog_total() -> int:
