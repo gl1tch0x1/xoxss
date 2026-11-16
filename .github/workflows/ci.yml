@@ -27,20 +27,48 @@ jobs:
 
       - name: Import and CLI surface
         run: |
-          python -m compileall -q xoxss xoxss.py
+          python -m compileall -q xoxss xoxss.py tests
           python -m xoxss --version
           python -m xoxss --list-encoders >/dev/null
           python -m xoxss --list-tampers >/dev/null
           python -m xoxss --doctor
 
+      - name: Unit tests
+        run: pytest --cov=xoxss --cov-report=term-missing
+
       - name: Static type checks
         run: pyright
 
       - name: Lint
-        run: ruff check xoxss benchmarks
+        run: ruff check xoxss tests benchmarks
+
+      - name: DOM false-positive guards
+        run: python benchmarks/test_dom_guards.py
+
+      - name: Hybrid pipeline suite
+        run: python benchmarks/test_hybrid_pipeline.py
 
       - name: Coverage benchmark (HTTP-only)
         run: python benchmarks/run_benchmark.py --quick
+
+  browser-benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install with Playwright
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,playwright]"
+          python -m playwright install --with-deps chromium
+
+      - name: Browser benchmark (full case set)
+        run: python benchmarks/run_benchmark.py
 
   windows-smoke:
     runs-on: windows-latest
@@ -56,9 +84,11 @@ jobs:
           pip install -e ".[dev]"
       - name: Import and CLI surface
         run: |
-          python -m compileall -q xoxss xoxss.py
+          python -m compileall -q xoxss xoxss.py tests
           python -m xoxss --version
           python -m xoxss --list-encoders | Out-Null
           python -m xoxss --list-tampers | Out-Null
+      - name: Unit tests
+        run: pytest
       - name: Coverage benchmark (HTTP-only)
         run: python benchmarks/run_benchmark.py --quick

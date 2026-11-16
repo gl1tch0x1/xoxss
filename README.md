@@ -9,7 +9,7 @@
 **Advanced, persistent, context-aware XSS scanner for authorized security testing.**
 
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#requirements)
-![Version](https://img.shields.io/badge/version-2.0.0-informational.svg)
+![Version](https://img.shields.io/badge/version-2.0.1-informational.svg)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
 [![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](SECURITY.md)
 [![Contributing](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
@@ -89,6 +89,17 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
   `insertAdjacentHTML`, `eval`, `setTimeout`, `setInterval`, `postMessage`, and framework
   sinks (React `dangerouslySetInnerHTML`, Vue `v-html`, Angular `bypassSecurityTrust*`, Navigation API),
   distinguishing *confirmed execution* from *static sink taint*.
+- **Advanced Detection Modules (`--ast-analysis` / `--no-ast-analysis`, `--framework-bypass`, `--spa-crawl`, `--csp-bypass`, `--graphql-xss`, `--enhanced-sinks`, `--storage-xss`, `--service-worker`):**
+  - **AST-based JavaScript Taint Analysis (`analysis/ast_taint.py`):** Pattern-based AST analysis tracking data flow from sources (location.hash, localStorage, postMessage) to sinks (innerHTML, eval, setTimeout) in minified/obfuscated code.
+  - **Framework-Specific Sink Exploitation (`analysis/framework_sinks.py`):** Detects React, Vue, Angular, jQuery, and other frameworks to generate framework-specific XSS bypass payloads (React `dangerouslySetInnerHTML`, Vue `v-html`, Angular `bypassSecurityTrustHtml`, jQuery `html`/`append`).
+  - **SPA-Aware Crawling (`crawler/spa.py`):** Detects router types (History API, hash router, custom router) and frameworks (React, Vue, Angular, Next.js, Remix, Solid, Astro) to discover hash routes and API endpoints for SPAs.
+  - **CSP Bypass Automation (`analysis/csp_bypass.py`):** Parses CSP headers, detects weaknesses, and tests 10+ bypass techniques (data URI, JSON gadgets, Angular CDN, nonce prediction, iframe sandbox, meta CSP differences).
+  - **GraphQL XSS Testing (`analysis/graphql_xss.py`):** Detects GraphQL endpoints, performs schema introspection, and generates XSS payloads for queries, mutations, subscriptions, inline fragments, and subscription-based XSS.
+  - **Enhanced Sink Tracking (`analysis/enhanced_sinks.py`):** Tracks 20+ additional sinks including postMessage, Web Speech API, Web Audio API, WebGL, CSS expression, variable injection, Worker importScripts, iframe sandbox/srcdoc bypasses, SVG filters, SMIL animations, MathML contexts.
+  - **Storage XSS Discovery (`analysis/storage_xss.py`):** Inspects localStorage, sessionStorage, IndexedDB, WebSQL, cookies, and Service Worker cache storage for persistent vs transient XSS vectors.
+  - **Service Worker XSS Detection (`analysis/service_worker.py`):** Detects XSS in install/activate/fetch/message handlers, cache poisoning vectors, and importScripts XSS in Service Workers.
+- **Interactsh Integration (`--interactsh`):** Automatic blind XSS callback generation with Interactsh OOB polling and correlation.
+- **Playwright/CDP Support (`--browser playwright`):** Async Playwright browser automation with network interception, page evaluation, and faster boot times.
 - Parenthesis-less JavaScript execution vectors, universal multi-context polyglots, and
   overlong 2-byte UTF-8 (`%C0%BC`, `%C0%BE`) mutation probes for bypassing modern WAFs.
 - Reflected, stored, header and DOM XSS with an explicit confidence model instead of a
@@ -760,7 +771,7 @@ intelligence, OpenAPI operations, OOB registrations and every analyzer list):
 ```json
 {
   "tool": "XOX$$",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "target": "https://target.tld/",
   "duration_seconds": 12.34,
   "waf": ["cloudflare"],
@@ -947,7 +958,9 @@ flowchart TD
 xoxss.py                  compatibility entry point for `python xoxss.py`
 xoxss/
   scanner.py              scan coordinator and target orchestration
+  app.py                  CLI application layer (profiles, mode dispatch, entry point)
   cli.py                  CLI parser construction
+  py.typed                PEP 561 marker for inline type information
   core/
     config.py             typed ScanConfig schema supporting all 102 options and presets
     finding.py            Finding, Evidence, Confidence, and finding collection models
@@ -1011,6 +1024,14 @@ xoxss/
   utils/
     console.py            Console output, log formatting, colors, and progress spinners
     helpers.py url.py urlpolicy.py ui.py
+tests/
+  conftest.py             repo-root path setup for the unit suite
+  test_*.py               fast unit tests (helpers, encoders, context, reflection,
+                          findings, WAF, payload catalog, version)
+  test_cli.py             CLI parsing surface
+  test_app.py             CLI application layer (profiles, limits, validation, dispatch)
+  test_http_engine.py     HTTP transport integration tests against a loopback server
+  test_report_writers.py  JSON/Markdown/SARIF/HTML writers and escaping
 benchmarks/
   cases.json              machine-readable benchmark corpus
   fixture_server.py       local loopback HTTP/HTTPS test server

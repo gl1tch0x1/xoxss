@@ -130,6 +130,5 @@ dmypy.json
 
 # Local tooling and editor state
 .freebuff/
-tests/
 .vscode/
 .DS_Store

@@ -136,6 +136,28 @@ XOXSS is designed to avoid drowning operators in false alarms. When adding or up
 
 ---
 
+## Running Tests
+
+The fast unit suite needs no browser, target or network:
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+It covers the display helpers, encoder registry, context detection, reflection
+scoring, finding identity/dedupe, WAF fingerprinting, payload catalog, CLI
+parsing and the CLI application layer, report writers/escaping, and the HTTP
+transport (retries, redirect scoping, truncation, caching) against a loopback
+server.  With coverage:
+
+```bash
+pytest --cov=xoxss --cov-report=term
+```
+
+CI runs the suite on Python 3.9 through 3.14 plus Windows, and enforces a
+coverage floor from `pyproject.toml`.
+
 ## Running Benchmarks
 
 Before opening a pull request, run the benchmark suite to verify that your changes do not introduce regressions or false positives.
@@ -178,9 +200,12 @@ python benchmarks/run_benchmark.py --only dom-location-hash
 
 3. **Verify all checks locally:**
    ```bash
-   python -m compileall xoxss xoxss.py
-   ruff check xoxss benchmarks
+   python -m compileall xoxss xoxss.py tests
+   ruff check xoxss tests benchmarks
    pyright
+   pytest
+   python benchmarks/test_dom_guards.py
+   python benchmarks/test_hybrid_pipeline.py
    python benchmarks/run_benchmark.py --quick
    ```
 

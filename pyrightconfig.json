@@ -1,11 +1,11 @@
 {
   "include": [
     "xoxss.py",
-    "xoxss"
+    "xoxss",
+    "tests"
   ],
   "exclude": ["**/__pycache__", ".venv", "build", "dist"],
-  "venvPath": ".",
-  "venv": ".venv",
   "pythonVersion": "3.9",
-  "typeCheckingMode": "basic"
+  "typeCheckingMode": "basic",
+  "reportMissingImports": true
 }
