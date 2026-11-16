@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import shlex
 from typing import Any, Dict
+from urllib.parse import urlsplit
 
 from xoxss.core.finding import Finding
 
@@ -55,5 +57,13 @@ def test_nested_containers_are_coerced_to_dicts() -> None:
 
 def test_curl_poc_is_populated() -> None:
     finding = make()
-    assert finding.poc_curl.startswith("curl")
-    assert "example.com" in finding.poc_curl
+    command = shlex.split(finding.poc_curl)
+    assert command[:2] == ["curl", "-sk"]
+    # Parse the URL instead of substring-matching the host, so the assertion
+    # cannot pass on a URL that merely embeds "example.com" somewhere
+    # (py/incomplete-url-substring-sanitization).
+    url = next(token for token in command if token.startswith(("http://", "https://")))
+    parsed = urlsplit(url)
+    assert parsed.scheme == "https"
+    assert parsed.hostname == "example.com"
+    assert parsed.path == "/search"
