@@ -163,7 +163,7 @@ class JSIntel:
     url: str = ""
     endpoints: List[str] = field(default_factory=list)
     parameters: List[str] = field(default_factory=list)
-    secrets: List[SecretHit] = field(default_factory=list)
+    exposures: List[SecretHit] = field(default_factory=list)
     graphql: List[str] = field(default_factory=list)
     websockets: List[str] = field(default_factory=list)
     sourcemaps: List[str] = field(default_factory=list)
@@ -181,18 +181,27 @@ class JSIntel:
         self.chunks = list(dict.fromkeys([*self.chunks, *other.chunks]))
         self.dom_flows.extend(other.dom_flows)
         key = lambda hit: (hit.kind, hit.value, hit.source)  # noqa: E731
-        existing = {key(hit) for hit in self.secrets}
-        for hit in other.secrets:
+        existing = {key(hit) for hit in self.exposures}
+        for hit in other.exposures:
             if key(hit) not in existing:
-                self.secrets.append(hit)
+                self.exposures.append(hit)
         self.size += other.size
+
+    @property
+    def secrets(self) -> List[SecretHit]:
+        """Backwards-compatible alias for :attr:`exposures`."""
+        return self.exposures
+
+    @secrets.setter
+    def secrets(self, value: List[SecretHit]) -> None:
+        self.exposures = list(value or ())
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "url": self.url,
             "endpoints": list(self.endpoints),
             "parameters": list(self.parameters),
-            "secrets": [hit.to_dict() for hit in self.secrets],
+            "secrets": [hit.to_dict() for hit in self.exposures],
             "graphql": list(self.graphql),
             "websockets": list(self.websockets),
             "sourcemaps": list(self.sourcemaps),
@@ -457,7 +466,7 @@ def analyze_javascript_intel(
     intel = JSIntel(url=source or base_url, size=len(js or ""))
     intel.endpoints = extract_endpoints(js, base_url)
     intel.parameters = extract_parameters(js)
-    intel.secrets = extract_secrets(js, source or base_url)
+    intel.exposures = extract_secrets(js, source or base_url)
     intel.graphql = extract_graphql(js, base_url)
     intel.websockets = extract_websockets(js)
     intel.sourcemaps = extract_sourcemaps(js, base_url)

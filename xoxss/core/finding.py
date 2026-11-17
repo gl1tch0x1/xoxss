@@ -270,7 +270,7 @@ class ScanStats:
     browser_checks: int = 0
     endpoints: int = 0
     js_files: int = 0
-    secrets: int = 0
+    js_exposures: int = 0
     subdomains: int = 0
     passive_urls: int = 0
     fuzzed_paths: int = 0
@@ -290,6 +290,15 @@ class ScanStats:
     @property
     def elapsed(self) -> float:
         return time.time() - self.started
+
+    @property
+    def secrets(self) -> int:
+        """Backwards-compatible alias for :attr:`js_exposures`."""
+        return self.js_exposures
+
+    @secrets.setter
+    def secrets(self, value: int) -> None:
+        self.js_exposures = int(value or 0)
 
 
 __all__ = [

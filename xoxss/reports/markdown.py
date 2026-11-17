@@ -46,10 +46,10 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
             )
         lines += ["", "These observations are not XSS findings by themselves.", ""]
 
-    if scanner.trusted_types_issues:
+    if scanner.policy_issues:
         lines += ["## Trusted Types issues", "",
                   "| # | URL | Issue |", "|---|-----|-------|"]
-        for index, item in enumerate(scanner.trusted_types_issues, 1):
+        for index, item in enumerate(scanner.policy_issues, 1):
             lines.append(f"| {index} | {item['url']} | {'; '.join(item['issues'])} |")
         lines += [""]
 

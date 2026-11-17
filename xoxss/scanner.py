@@ -707,7 +707,7 @@ class XSSScanner(CrawlerMixin):
         self.mxss_findings: List[Dict] = []
         self.proto_pollution_findings: List[Dict] = []
         self.cors_issues: List[Dict] = []
-        self.trusted_types_issues: List[Dict] = []
+        self.policy_issues: List[Dict] = []
         self.dom_clobber_findings: List[Dict] = []
         self.postmessage_findings: List[Dict] = []
         self.websocket_findings: List[Dict] = []
@@ -2037,9 +2037,9 @@ class XSSScanner(CrawlerMixin):
             endpoints = extract_endpoints_from_text(response.text, url)
         else:
             self.js_intel.append(intel)
-            self.stats.secrets += len(intel.secrets)
+            self.stats.js_exposures += len(intel.exposures)
             self.stats.ast_flows += len(intel.dom_flows)
-            for secret in intel.secrets:
+            for secret in intel.exposures:
                 self._record_secret(url, secret)
             for flow in intel.dom_flows:
                 self._record_taint_flow(url, flow)
@@ -2069,6 +2069,13 @@ class XSSScanner(CrawlerMixin):
         digest = hashlib.sha1(
             str(getattr(secret, "value", "")).encode("utf-8", "replace")
         ).hexdigest()[:10]
+        # Keep the surrounding code for triage but never echo the matched value
+        # itself: reports are shareable artefacts and the value is still live
+        # until the target rotates it.
+        context = str(getattr(secret, "context", "") or "")
+        value = str(getattr(secret, "value", "") or "")
+        if value and value in context:
+            context = context.replace(value, str(getattr(secret, "masked", lambda: "")()))
         self.add_finding(
             Finding(
                 kind="JavaScript secret exposure",
@@ -2078,7 +2085,7 @@ class XSSScanner(CrawlerMixin):
                 payload=getattr(secret, "masked", lambda: "")(),
                 evidence=(
                     f"{getattr(secret, 'kind', 'secret')} ({severity}) at line "
-                    f"{getattr(secret, 'line', 0)}: {getattr(secret, 'context', '')}"
+                    f"{getattr(secret, 'line', 0)}: {context}"
                 ),
                 confidence=confidence,
                 context="js",
@@ -4514,7 +4521,7 @@ class XSSScanner(CrawlerMixin):
             from xoxss.analysis.trusted_types import TrustedTypesAnalyzer
             tt_analysis = TrustedTypesAnalyzer().analyze_trusted_types(csp_header)
             if tt_analysis.issues:
-                self.trusted_types_issues.append({
+                self.policy_issues.append({
                     'url': url,
                     'issues': [
                         f"{issue.issue_type} ({issue.severity}): {issue.description}"
@@ -4935,7 +4942,7 @@ class XSSScanner(CrawlerMixin):
             ("Endpoints", str(len(self.endpoints))),
             ("Subdomains", str(stats.subdomains)),
             ("Passive URLs", str(stats.passive_urls)),
-            ("JS files / secrets", f"{stats.js_files} / {stats.secrets}"),
+            ("JS files / secrets", f"{stats.js_files} / {stats.js_exposures}"),
             (
                 "Access bypasses",
                 f"{stats.access_bypasses} ({stats.bypass_attempts} probe(s))",
@@ -4954,7 +4961,7 @@ class XSSScanner(CrawlerMixin):
             ("JSONP findings", str(len(self.jsonp_findings))),
             ("CSP issues", str(len(self.csp_issues))),
             ("CORS issues", str(len(self.cors_issues))),
-            ("Trusted Types issues", str(len(self.trusted_types_issues))),
+            ("Trusted Types issues", str(len(self.policy_issues))),
             ("DOM clobbering", str(len(self.dom_clobber_findings))),
             ("postMessage sinks", str(len(self.postmessage_findings))),
             ("WebSocket sinks", str(len(self.websocket_findings))),
@@ -5084,10 +5091,10 @@ class XSSScanner(CrawlerMixin):
                 for sub_issue in issue["issues"][:2]:
                     console.raw(f"    - {sub_issue}")
 
-        if self.trusted_types_issues:
+        if self.policy_issues:
             console.raw("")
             console.raw(f"{bcolors.BOLD}Trusted Types issues{bcolors.ENDC}")
-            for item in self.trusted_types_issues[:5]:
+            for item in self.policy_issues[:5]:
                 console.raw(f"  URL: {truncate(item['url'], 120)}")
                 for sub_issue in item["issues"][:2]:
                     console.raw(f"    - {sub_issue}")

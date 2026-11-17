@@ -115,7 +115,7 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
             _card("JSONP", len(scanner.jsonp_findings)),
             _card("CSP issues", len(scanner.csp_issues)),
             _card("CORS issues", len(scanner.cors_issues)),
-            _card("Trusted Types", len(scanner.trusted_types_issues)),
+            _card("Trusted Types", len(scanner.policy_issues)),
             _card("DOM clobbering", len(scanner.dom_clobber_findings)),
             _card("postMessage", len(scanner.postmessage_findings)),
             _card("WebSocket", len(scanner.websocket_findings)),
@@ -215,9 +215,9 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:
             "<tbody>" + "".join(cors_rows) + "</tbody></table>"
         )
 
-    if scanner.trusted_types_issues:
+    if scanner.policy_issues:
         tt_rows = []
-        for item in scanner.trusted_types_issues:
+        for item in scanner.policy_issues:
             tt_rows.append(
                 "<tr>"
                 f"<td><code>{html_lib.escape(truncate(item['url'], 300))}</code></td>"

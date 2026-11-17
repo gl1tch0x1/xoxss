@@ -117,7 +117,7 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
         "csp_issues": scanner.csp_issues,
         "cors_issues": scanner.cors_issues,
         "proto_pollution_sources": scanner.proto_pollution_findings,
-        "trusted_types_issues": scanner.trusted_types_issues,
+        "trusted_types_issues": scanner.policy_issues,
         "dom_clobbering": scanner.dom_clobber_findings,
         "postmessage": scanner.postmessage_findings,
         "websocket": scanner.websocket_findings,

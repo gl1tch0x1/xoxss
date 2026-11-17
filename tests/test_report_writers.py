@@ -122,7 +122,7 @@ class StubScanner:
         self.csp_issues = [{"url": "https://example.com/", "issues": ["unsafe-inline"]}]
         self.cors_issues = [{"url": "https://example.com/api", "issues": ["origin reflected"]}]
         self.proto_pollution_findings: List[Any] = []
-        self.trusted_types_issues = [{"url": "https://example.com/", "issues": ["no policy"]}]
+        self.policy_issues = [{"url": "https://example.com/", "issues": ["no policy"]}]
         self.dom_clobber_findings = [
             {
                 "url": "https://example.com/",
