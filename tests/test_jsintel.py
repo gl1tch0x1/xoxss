@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from xoxss.core.finding import ScanStats
-from xoxss.recon.jsintel import JSIntel, extract_secrets
+from xoxss.recon.jsintel import JSIntel, extract_inline_scripts, extract_secrets
 
 
 def test_extract_secrets_still_detects_common_tokens() -> None:
@@ -30,3 +30,14 @@ def test_scan_stats_secrets_alias_maps_to_js_exposures() -> None:
     stats.secrets = 3
     assert stats.js_exposures == 3
     assert stats.secrets == 3
+
+
+def test_inline_scripts_are_extracted_with_forgiving_closing_tags() -> None:
+    html = (
+        "<script>var a = 1;</script>"
+        "<script type='module'>var b = 2;</script >"
+        "<script>var c = 3;</script foo='bar'>"
+        "<script src='/app.js'></script>"
+    )
+    scripts = extract_inline_scripts(html)
+    assert scripts == ["var a = 1;", "var b = 2;", "var c = 3;"]

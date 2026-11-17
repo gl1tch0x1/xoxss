@@ -105,7 +105,10 @@ _SCRIPT_SRC_RE = re.compile(
     r"<script\b[^>]*\bsrc\s*=\s*['\"]([^'\"]+)['\"][^>]*>", re.I
 )
 _INLINE_SCRIPT_RE = re.compile(
-    r"<script\b(?![^>]*\bsrc\s*=)[^>]*>(.*?)</script>", re.I | re.S
+    # Browsers accept whitespace and attributes in the closing tag
+    # (`</script >`, `</script foo="bar">`), so extraction must too or inline
+    # payload analysis silently misses scripts.
+    r"<script\b(?![^>]*\bsrc\s*=)[^>]*>(.*?)</script\b[^>]*>", re.I | re.S
 )
 _FORM_RE = re.compile(r"<form\b[^>]*>(.*?)</form>", re.I | re.S)
 _INPUT_NAME_RE = re.compile(
