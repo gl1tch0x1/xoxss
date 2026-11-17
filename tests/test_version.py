@@ -10,7 +10,10 @@ from xoxss.reports import common
 from xoxss.utils import console
 
 try:  # Python 3.11+
-    import tomllib
+    # `tomllib` is stdlib from 3.11 on; the fallback below keeps the suite
+    # runnable on 3.9/3.10.  pyright resolves imports against the running
+    # interpreter, so the import is expected to be missing there.
+    import tomllib  # pyright: ignore[reportMissingImports]
 except ImportError:  # pragma: no cover - Python 3.9/3.10
     tomllib = None  # type: ignore[assignment]
 
