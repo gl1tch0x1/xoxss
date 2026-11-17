@@ -165,8 +165,8 @@ def expand_paths(words: Iterable[str], extensions: Sequence[str] = FUZZ_EXTENSIO
         if not word:
             continue
         candidates = [word]
-        if not word.endswith(tuple(ext for ext in extensions if ext)):
-            for ext in extensions:
+        for ext in extensions:
+            if ext and not word.endswith(ext):
                 candidates.append(word + ext)
         for candidate in candidates:
             if candidate and candidate not in seen:
@@ -181,7 +181,11 @@ def _origin(url: str) -> str:
 
 
 def _soft_404_signature(status: int, body: str) -> Tuple[int, int, str]:
+    # Collapse nonces, timestamps, request ids and other per-response noise so
+    # a catch-all page that echoes a random token still matches its baseline.
     normalized = re.sub(r"\s+", " ", (body or "")[:4000]).strip().lower()
+    normalized = re.sub(r"[0-9a-f]{8,}", " ", normalized)
+    normalized = re.sub(r"\d{4,}", " ", normalized)
     return status, len(body or ""), hashlib.sha1(normalized.encode("utf-8", "replace")).hexdigest()
 
 
@@ -235,7 +239,13 @@ class DirFuzzer:
             return None
         body = getattr(response, "text", "") or ""
         signature = _soft_404_signature(status, body)
-        if status in (200, 201, 204, 206) and signature[0] == baseline[0] and signature[1] == baseline[1] and signature[2] == baseline[2]:
+        # Same normalised body as the random-path baseline: this is a catch-all
+        # (soft-404) page, regardless of its status code.
+        length_tolerance = max(32, baseline[1] // 20)
+        if (
+            signature[2] == baseline[2]
+            and abs(signature[1] - baseline[1]) <= length_tolerance
+        ):
             return None
         headers = getattr(response, "headers", {}) or {}
         return FuzzResult(
@@ -253,6 +263,7 @@ class DirFuzzer:
         baseline = await self._baseline(origin)
         queue: List[Tuple[str, int]] = [(origin + "/", 0)]
         seen: Set[str] = set()
+        probed: Set[str] = set()
         results: List[FuzzResult] = []
         semaphore = asyncio.Semaphore(self.concurrency)
 
@@ -263,21 +274,28 @@ class DirFuzzer:
             seen.add(base)
 
             async def probe(path: str) -> Optional[FuzzResult]:
+                url = urljoin(base, path)
+                if url in probed:
+                    return None
+                probed.add(url)
                 async with semaphore:
-                    return await self._probe(urljoin(base, path), origin, baseline)
+                    return await self._probe(url, origin, baseline)
 
             group = await asyncio.gather(*(probe(path) for path in self.words), return_exceptions=True)
             for item in group:
                 if not isinstance(item, FuzzResult):
                     continue
                 results.append(item)
-                if (
-                    recursive
-                    and depth < max_depth
-                    and item.url.endswith("/")
-                    and _origin(item.url) == origin
-                ):
-                    queue.append((item.url, depth + 1))
+                if not recursive or depth >= max_depth:
+                    continue
+                path = urlsplit(item.url).path
+                leaf = path.rstrip("/").rsplit("/", 1)[-1]
+                looks_like_directory = item.url.endswith("/") or (
+                    item.status in (200, 201, 204, 301, 302, 303, 307, 308)
+                    and "." not in leaf
+                )
+                if looks_like_directory and _origin(item.url) == origin:
+                    queue.append((item.url.rstrip("/") + "/", depth + 1))
             self.console.debug(
                 f"Directory fuzzing {base}: {len(results)} hit(s) so far"
             )

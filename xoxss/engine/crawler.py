@@ -92,6 +92,7 @@ class CrawlerMixin:
     _endpoints_from_scripts: Any
     _endpoints_from_js_file: Any
     discover_browser_requests: Any
+    fetch_page: Any
 
     async def prepare_urls(self) -> List[str]:
         recon = await self.recon_seeds()
@@ -237,7 +238,9 @@ class CrawlerMixin:
 
         async def probe(candidate: str) -> Optional[str]:
             async with semaphore:
-                response = await self.http.get(candidate, allow_redirects=False, cache=True)
+                response = await self.fetch_page(
+                    candidate, cache=True, allow_redirects=False
+                )
                 if response.error:
                     return None
                 if response.status in (200, 201, 204, 301, 302, 303, 307, 308, 401, 403, 405):
@@ -284,12 +287,16 @@ class CrawlerMixin:
             extract_scripts,
         )
 
-        response = await self.http.get(url, cache=True)
+        response = await self.fetch_page(url, cache=True)
         if response.error or not response.text:
             return []
         text = response.text[:3_000_000]
         content_type = response.header("content-type", "").lower()
         links: List[str] = []
+        # A redirect target is a real route even when the body is empty.
+        location = response.header("location", "")
+        if location and response.status in (301, 302, 303, 307, 308):
+            links.append(urljoin(url, location))
         is_html = "html" in content_type or text.lstrip().startswith("<")
         if is_html and HAS_BS4:
             soup = _soup(text)

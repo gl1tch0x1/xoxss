@@ -123,6 +123,7 @@ try:
         extract_script_urls,
         sources_from_sourcemap,
     )
+    from xoxss.recon.access import AccessBypassEngine
     from xoxss.recon.openapi import APIOperation, OpenAPIFinder
     from xoxss.recon.passive import PassiveURLCollector
     from xoxss.recon.subdomains import SubdomainFinder, root_domain
@@ -154,6 +155,7 @@ except Exception as _recon_exc:  # pragma: no cover
     FUZZ_EXTENSIONS = ()  # type: ignore
     PARAM_WORDS = ()  # type: ignore
     DirFuzzer = ParameterMiner = None  # type: ignore
+    AccessBypassEngine = None  # type: ignore
     # These analysers live in the recon/analysis block above; their fallbacks
     # used to sit in the unrelated AI import handler, which both left the names
     # undefined on a partial recon import and silently disabled them whenever
@@ -680,6 +682,22 @@ class XSSScanner(CrawlerMixin):
         self.discovered_param_names: List[str] = []
         self._param_wordlist_cache: Optional[List[str]] = None
         self._ast_seen: Set[str] = set()
+
+        # 401/403 access-control bypass engine (gobypass403/nomore403 style).
+        # Results are cached per URL and replayed for discovery, crawling and
+        # injection so a protected route is still scanned for XSS.
+        self.access_bypass: Optional[Any] = None
+        self.bypass_results: Dict[str, Any] = {}
+        if AccessBypassEngine is not None and getattr(args, "bypass_403", False):
+            self.access_bypass = AccessBypassEngine(
+                self.http,
+                console,
+                max_attempts=int(getattr(args, "bypass_attempts", 24) or 24),
+                concurrency=2,
+                timeout=max(5.0, float(getattr(args, "timeout", 20.0) or 20.0)),
+                techniques=getattr(args, "bypass_techniques", None),
+                aggressive=bool(getattr(args, "bypass_aggressive", False)),
+            )
         self.oob: Optional[OOBManager] = None  # type: ignore[valid-type]
         self._oob_task: Optional[asyncio.Task] = None
         
@@ -1084,6 +1102,15 @@ class XSSScanner(CrawlerMixin):
                     await self._status_task
                 self._status_task = None
             try:
+                if self.access_bypass is not None:
+                    self.stats.bypass_attempts = int(
+                        getattr(self.access_bypass, "attempts", 0) or 0
+                    )
+                    self.stats.access_bypasses = max(
+                        self.stats.access_bypasses,
+                        len(self.access_bypass.export_results()),
+                    )
+                    self.state.extra["access_bypass_attempts"] = self.stats.bypass_attempts
                 self.stats.endpoints = len(self.endpoints)
                 self.state.extra["endpoints"] = sorted(self.endpoints)[:5000]
                 self.state.extra["endpoint_sources"] = {
@@ -1130,6 +1157,130 @@ class XSSScanner(CrawlerMixin):
         self.stats.findings = len(self.findings)
         if self.state.waf:
             self.waf = WAFReport(names=list(self.state.waf))
+        if self.access_bypass is not None:
+            raw_bypasses = self.state.extra.get("access_bypasses", [])
+            if isinstance(raw_bypasses, list):
+                restored = self.access_bypass.load_results(raw_bypasses)
+                if restored:
+                    self.stats.access_bypasses = restored
+                    self.stats.bypass_attempts = int(
+                        self.state.extra.get("access_bypass_attempts", 0) or 0
+                    )
+                    self.console.info(
+                        f"Restored {restored} access-control bypass(es) from checkpoint",
+                        important=False,
+                    )
+
+    # -- 401/403 access-control bypass --------------------------------------------------
+    def _bypass_result_for(self, url: str) -> Optional[Any]:
+        if self.access_bypass is None:
+            return None
+        try:
+            return self.access_bypass.cached(url)
+        except Exception:
+            return None
+
+    def _register_bypass(self, url: str, result: Any) -> None:
+        """Record a verified bypass and expose the protected route to injection."""
+        if result is None or url in self.bypass_results:
+            return
+        self.bypass_results[url] = result
+        self.stats.access_bypasses = len(self.bypass_results)
+        self.stats.bypass_attempts = int(getattr(self.access_bypass, "attempts", 0) or 0)
+        stored = self.state.extra.setdefault("access_bypasses", [])
+        if isinstance(stored, list):
+            stored.append(result.to_dict())
+            del stored[:-500]
+        self.state.extra["access_bypass_attempts"] = self.stats.bypass_attempts
+        self.console.ok(
+            f"401/403 bypass via {result.technique} on {url} "
+            f"(HTTP {result.status}, {result.confidence} confidence)"
+        )
+        self._record_bypass_finding(url, result)
+
+    def _record_bypass_finding(self, url: str, result: Any) -> None:
+        """Report a verified bypass; method-only probes stay informational."""
+        if str(getattr(result, "confidence", "low")) == "low":
+            return
+        headers = result.replay_headers()
+        header_summary = ", ".join(f"{name}: {value}" for name, value in headers.items())
+        finding = Finding(
+            kind="Access control bypass (401/403)",
+            url=url,
+            parameter="",
+            method=str(getattr(result, "method", "GET") or "GET"),
+            payload="",
+            evidence=(
+                f"{result.technique} returned HTTP {result.status} instead of "
+                f"{result.baseline_status}; {result.reason}. "
+                f"Request: {result.method} {result.request_url or url}"
+                + (f"; headers: {header_summary}" if header_summary else "")
+            ),
+            confidence=(
+                result.confidence
+                if result.confidence in CONFIDENCE_LEVELS
+                else "medium"
+            ),
+            context="server-side access control",
+            detail=(
+                "The protected route served content after the request shape was "
+                "altered. XOXSS replayed the bypass while testing the route for "
+                "XSS; verify whether it exposes privileged data or actions."
+            ),
+            tags=["access-control", "bypass", str(getattr(result, "category", "header"))],
+            subkey=f"access-bypass:{result.technique}",
+            source="access",
+        )
+        self.add_finding(finding)
+
+    def _apply_bypass(self, url: str) -> Tuple[str, Dict[str, str], Optional[Any]]:
+        """Return the replay URL/headers for a previously verified bypass."""
+        result = self._bypass_result_for(url)
+        if result is None:
+            return url, {}, None
+        return result.applied_url(url), result.replay_headers(), result
+
+    async def fetch_page(
+        self,
+        url: str,
+        *,
+        cache: bool = True,
+        allow_redirects: bool = True,
+    ) -> HttpResponse:
+        """Fetch a page, transparently trying a 401/403 bypass first.
+
+        Used by crawling and injection-point discovery so protected pages are
+        parsed and scanned instead of being skipped as forbidden.
+        """
+        result = self._bypass_result_for(url)
+        if (
+            result is None
+            and self.access_bypass is not None
+            and not self.access_bypass.is_known(url)
+        ):
+            baseline = await self.http.get(url, allow_redirects=allow_redirects)
+            if (
+                not getattr(baseline, "error", None)
+                and int(getattr(baseline, "status", 0) or 0) in (401, 403)
+            ):
+                result = await self.access_bypass.probe(url, baseline)
+                if result is not None:
+                    self._register_bypass(url, result)
+        if result is None:
+            return await self.http.get(
+                url, allow_redirects=allow_redirects, cache=cache
+            )
+        target, headers, _ = self._apply_bypass(url)
+        method = "GET"
+        if result.category == "method" and result.can_replay_method():
+            method = result.method.upper()
+        return await self.http.request(
+            method,
+            target,
+            headers=headers or None,
+            allow_redirects=allow_redirects,
+            cache=cache,
+        )
 
     # -- out-of-band verification -------------------------------------------------------
     async def _start_oob(self) -> None:
@@ -1649,13 +1800,21 @@ class XSSScanner(CrawlerMixin):
                 fuzzer = DirFuzzer(
                     self.http,
                     self.console,
-                    extensions=("",),
+                    wordlist=getattr(self.args, "endpoint_wordlist", None),
+                    extensions=tuple(getattr(self.args, "fuzz_extensions", None) or ("",)),
                     concurrency=min(10, max(1, self.args.concurrency)),
                     limit=min(500, max(50, self.args.max_urls)),
                     timeout=max(5.0, self.args.timeout),
                 )
-                fuzz_results = await fuzzer.discover(self.target)
+                fuzz_results = await fuzzer.discover(
+                    self.target,
+                    recursive=bool(getattr(self.args, "fuzz_recursive", False)),
+                    max_depth=max(1, int(getattr(self.args, "crawl_depth", 3) or 3)),
+                )
                 self.stats.fuzzed_paths = len(fuzz_results)
+                self.state.extra["fuzz_results"] = [
+                    item.to_dict() for item in fuzz_results[:2000]
+                ]
                 for fuzz_result in fuzz_results:
                     extra.append(fuzz_result.url)
                     self._record_endpoint(fuzz_result.url, "fuzz")
@@ -1674,10 +1833,22 @@ class XSSScanner(CrawlerMixin):
                 names = list(PARAM_WORDS)[
                     : max(1, int(getattr(self.args, "fuzz_param_limit", 10)) * 4)
                 ]
-                discovered = await miner.mine([self.target], names)
+                # Mine every known parameterised URL, not only the seed: the
+                # passive collector usually supplies the interesting ones.
+                mine_targets: List[str] = [self.target]
+                for candidate in self.passive_urls:
+                    if "?" in candidate and self.scope.in_scope(candidate):
+                        mine_targets.append(candidate)
+                mine_targets = list(dict.fromkeys(mine_targets))[
+                    : max(1, min(25, int(getattr(self.args, "max_param_targets", 100) or 100)))
+                ]
+                discovered = await miner.mine(mine_targets, names)
                 self.stats.discovered_params = max(
                     self.stats.discovered_params, len(discovered)
                 )
+                self.state.extra["mined_parameters"] = [
+                    item.to_dict() for item in discovered[:2000]
+                ]
                 for item in discovered:
                     self._mined_params.setdefault(item.url, []).append(item.name)
                     separator = "&" if "?" in item.url else "?"
@@ -2018,6 +2189,12 @@ class XSSScanner(CrawlerMixin):
         error_message = ""
         self.state.mark_url_status(url, "running")
         try:
+            # A 401/403 landing page still hides a scannable surface.  Attempt
+            # the access-control bypass before the analyzers read the page so
+            # every later fetch replays the successful request shape.
+            if self.access_bypass is not None:
+                await self.fetch_page(url, cache=True)
+
             # Advanced: JSONP detection
             if HAS_ADVANCED and getattr(self.args, 'jsonp', False):
                 await self._test_jsonp(url)
@@ -2032,13 +2209,13 @@ class XSSScanner(CrawlerMixin):
             
             # Advanced: GraphQL endpoint detection (uses the cached page when possible)
             if HAS_ADVANCED and getattr(self.args, 'graphql', False):
-                cached = self.http.peek(url) or await self.http.get(url, cache=True)
+                cached = await self.fetch_page(url, cache=True)
                 if not cached.error and cached.text:
                     self._analyze_graphql(url, cached.text, cached.header("content-type", ""))
 
             # Advanced: GraphQL XSS testing
             if HAS_ADVANCED and getattr(self.args, 'graphql_xss', False) and self.graphql_xss:
-                cached_page = self.http.peek(url) or await self.http.get(url, cache=True)
+                cached_page = await self.fetch_page(url, cache=True)
                 if not cached_page.error and cached_page.text:
                     if self.graphql_xss.detect_graphql_endpoint(cached_page.text):
                         marker = unique_token("graphql", 10)
@@ -2073,7 +2250,7 @@ class XSSScanner(CrawlerMixin):
                     spa_crawler = SPACrawler()
                     page_content = ""
                     try:
-                        cached_page = self.http.peek(url) or await self.http.get(url, cache=True)
+                        cached_page = await self.fetch_page(url, cache=True)
                         if not cached_page.error and cached_page.text:
                             page_content = cached_page.text
                     except Exception:
@@ -2107,7 +2284,7 @@ class XSSScanner(CrawlerMixin):
                 try:
                     page_text = ""
                     try:
-                        cached_page = self.http.peek(url) or await self.http.get(url, cache=True)
+                        cached_page = await self.fetch_page(url, cache=True)
                         if not cached_page.error and cached_page.text:
                             page_text = cached_page.text
                     except Exception:
@@ -2123,7 +2300,7 @@ class XSSScanner(CrawlerMixin):
                 try:
                     page_text = ""
                     try:
-                        cached_page = self.http.peek(url) or await self.http.get(url, cache=True)
+                        cached_page = await self.fetch_page(url, cache=True)
                         if not cached_page.error and cached_page.text:
                             page_text = cached_page.text
                     except Exception:
@@ -2279,7 +2456,7 @@ class XSSScanner(CrawlerMixin):
                     )
                 )
 
-        response = await self.http.get(url, cache=True)
+        response = await self.fetch_page(url, cache=True)
         resp_text = response.text if (response and not response.error and response.text) else ""
 
         # 7. HTML Forms and Links discovery
@@ -2488,6 +2665,10 @@ class XSSScanner(CrawlerMixin):
 
     async def send_point(self, point: InjectionPoint, payload: str) -> Optional[HttpResponse]:
         method = point.method.upper()
+        bypass = self._bypass_result_for(point.url)
+        replay_headers: Dict[str, str] = (
+            bypass.replay_headers() if bypass is not None else {}
+        )
         if point.source == "json":
             body = copy.deepcopy(point.json_body or {})
             json_path = point.extra.get("json_path")
@@ -2502,16 +2683,36 @@ class XSSScanner(CrawlerMixin):
                     target[final] = payload
             else:
                 body[point.param] = payload
+            url = bypass.applied_url(point.url) if bypass is not None else point.url
+            headers = dict(replay_headers)
+            headers.setdefault("Content-Type", point.content_type or "application/json")
             return await self.http.request(
                 method,
-                point.url,
+                url,
                 json_body=body,
-                headers={"Content-Type": point.content_type or "application/json"},
+                headers=headers,
             )
         if method == "GET":
-            return await self.http.get(self.build_get_url(point, payload))
+            url = self.build_get_url(point, payload)
+            if bypass is not None:
+                url = bypass.applied_url(url)
+            if (
+                bypass is not None
+                and bypass.category == "method"
+                and bypass.can_replay_method()
+            ):
+                return await self.http.request(
+                    bypass.method.upper(),
+                    url,
+                    headers=replay_headers or None,
+                )
+            return await self.http.get(url, headers=replay_headers or None)
+        url = bypass.applied_url(point.url) if bypass is not None else point.url
         return await self.http.request(
-            method, point.url, data=self.build_post_data(point, payload)
+            method,
+            url,
+            data=self.build_post_data(point, payload),
+            headers=replay_headers or None,
         )
 
     async def inject_blind(self, point: InjectionPoint) -> None:
@@ -4735,6 +4936,10 @@ class XSSScanner(CrawlerMixin):
             ("Subdomains", str(stats.subdomains)),
             ("Passive URLs", str(stats.passive_urls)),
             ("JS files / secrets", f"{stats.js_files} / {stats.secrets}"),
+            (
+                "Access bypasses",
+                f"{stats.access_bypasses} ({stats.bypass_attempts} probe(s))",
+            ),
             ("AST taint flows", str(stats.ast_flows)),
             ("OOB markers / hits", f"{stats.oob_registered} / {stats.oob_hits}"),
             ("External findings", str(stats.external_findings)),
@@ -5104,6 +5309,11 @@ def apply_god_preset(
     if unclaimed("--no-fuzz-params"):
         args.fuzz_params = True
     bump("fuzz_param_limit", 25, "--fuzz-param-limit")
+    args.fuzz_recursive = True
+    if unclaimed("--no-bypass-403"):
+        args.bypass_403 = True
+    bump("bypass_attempts", 48, "--bypass-attempts")
+    args.bypass_aggressive = True
     if recon:
         args.subdomains = True
         args.passive_urls = True

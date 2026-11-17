@@ -27,6 +27,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def bypassed(self, raw_path: str) -> bool:
+        """True when a spoofed header or path-normalisation trick is present."""
+        forwarded = " ".join(
+            (
+                self.headers.get("X-Forwarded-For", ""),
+                self.headers.get("Forwarded", ""),
+                self.headers.get("X-Real-IP", ""),
+            )
+        )
+        if "127.0.0.1" in forwarded:
+            return True
+        if self.headers.get("X-Original-URL") or self.headers.get("X-Rewrite-URL"):
+            return True
+        # Anything that is *not* the canonical path but still routes here is a
+        # path-normalisation bypass (//, /./, ..;/, %00, %2e, trailing ; ...).
+        # Compare the path only: the query string is not part of the route.
+        path = urlsplit(raw_path).path
+        return path not in ("/forbidden", "/forbidden/search") and "forbidden" in path.lower()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
         value = parse_qs(parsed.query, keep_blank_values=True).get("q", [""])[0]
@@ -102,8 +121,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond("<h1>Login required</h1>", 401)
             else:
                 self.respond(f"<main>{value}</main>")
-        elif parsed.path == "/api/search":
+        elif parsed.path.rstrip("/") == "/api/search":
             self.respond(json.dumps({"q": value}), content_type="application/json")
+        elif parsed.path.rstrip("/") == "/forbidden" or "forbidden" in parsed.path:
+            route = parsed.path.rstrip("/") or "/"
+            if not self.bypassed(self.path):
+                self.respond("<h1>Access denied</h1><p>Administrators only.</p>", 403)
+            elif route == "/forbidden/search":
+                self.respond(f"<main>Search result: {value}</main>")
+            else:
+                self.respond(
+                    "<h1>Administrative console</h1>"
+                    "<form method='get' action='/forbidden/search'>"
+                    "<input name='q' value='hello'><button>Search</button></form>"
+                    "<a href='/forbidden/search?q=hello'>search</a>"
+                )
         else:
             self.respond("Not found", 404)
 

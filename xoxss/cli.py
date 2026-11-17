@@ -168,6 +168,17 @@ def build_parser(
     crawl.add_argument("--no-fuzz-params", dest="fuzz_params", action="store_false", help="disable parameter fuzzing")
     crawl.add_argument("--fuzz-param-limit", type=int, default=10, help="parameter names per endpoint (default: 10)")
     crawl.add_argument(
+        "--fuzz-extensions",
+        nargs="+",
+        metavar="EXT",
+        help="extensions appended during active path fuzzing, e.g. .php .bak (default: fuzzer built-ins)",
+    )
+    crawl.add_argument(
+        "--fuzz-recursive",
+        action="store_true",
+        help="recurse into discovered directories while path fuzzing (bounded by --crawl-depth)",
+    )
+    crawl.add_argument(
         "--subdomains",
         action="store_true",
         help="enumerate passive subdomains (crt.sh, certspotter, OTX, urlscan) before scanning",
@@ -485,6 +496,30 @@ def build_parser(
     advanced.add_argument("--enhanced-sinks", action="store_true", help="enable tracking of additional sinks (postMessage, Web Speech, WebGL, etc.)")
     advanced.add_argument("--storage-xss", action="store_true", help="enable storage-based XSS discovery (localStorage, sessionStorage, IndexedDB)")
     advanced.add_argument("--service-worker", action="store_true", help="enable Service Worker XSS detection and cache poisoning analysis")
+    advanced.add_argument(
+        "--bypass-403",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="attempt 401/403 access-control bypasses before scanning protected routes (default: on; --no-bypass-403 disables)",
+    )
+    advanced.add_argument(
+        "--bypass-attempts",
+        type=int,
+        default=24,
+        metavar="N",
+        help="maximum bypass request shapes per protected URL (default: 24, max: 64)",
+    )
+    advanced.add_argument(
+        "--bypass-techniques",
+        nargs="+",
+        metavar="NAME",
+        help="restrict bypasses to categories (header/path/method) or technique names",
+    )
+    advanced.add_argument(
+        "--bypass-aggressive",
+        action="store_true",
+        help="also probe state-changing HTTP methods (POST/PUT/PATCH) while looking for a bypass",
+    )
 
     network = parser.add_argument_group("network", "transport, pacing and concurrency")
     network.add_argument("--threads", type=int, default=10, help="parallel URL workers (default: 10)")

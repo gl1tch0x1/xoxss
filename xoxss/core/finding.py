@@ -279,6 +279,8 @@ class ScanStats:
     oob_registered: int = 0
     oob_hits: int = 0
     external_findings: int = 0
+    access_bypasses: int = 0
+    bypass_attempts: int = 0
     false_positives: int = 0
     rejected_candidates: int = 0
     needs_manual_test: int = 0

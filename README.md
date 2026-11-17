@@ -153,6 +153,22 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
   with graceful fallback when offline. Local corpora load from files, JSON arrays or
   whole directories.
 
+**Access-control bypass (401/403)**
+
+- gobypass403/nomore403-style request-shape probing: proxy/client-IP headers
+  (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`, `CF-Connecting-IP`, …), URL-rewrite
+  headers (`X-Original-URL`, `X-Rewrite-URL`), host/scheme headers, method-override
+  headers and 22 path-normalisation variants (`//`, `/./`, `%2e`, `..;/`, `;`, `%00`,
+  encoded separators, case toggles, extension tricks).
+- Verified, not guessed: a bypass must improve the status, diverge from the original
+  body, carry real content markers and survive login/WAF/Cloudflare-challenge and
+  soft-404 rejection. CDN block pages never become findings.
+- A verified bypass is replayed through crawling, injection-point discovery and every
+  payload request, so protected routes are still tested for XSS. Results are cached per
+  URL, persisted for `--resume`, and exported to JSON/Markdown/HTML/SARIF reports.
+- Strictly bounded (24 shapes per URL by default), GET-safe, and never sends
+  state-changing methods unless `--bypass-aggressive` is set.
+
 **Out-of-band confirmation**
 
 - Blind XSS injections that phone home with a marker, page URL and cookies.
@@ -421,6 +437,8 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--passive-urls` | Mine Wayback, Common Crawl, urlscan and OTX for historic URLs. |
 | `--openapi` | Discover OpenAPI/Swagger documents and expand their operations. |
 | `--fuzz-paths` | Run the internal soft-404-aware path fuzzer. |
+| `--fuzz-extensions EXT ...` | Extensions appended during path fuzzing (e.g. `--fuzz-extensions .php .bak`). |
+| `--fuzz-recursive` | Recurse into directory-like hits, bounded by `--crawl-depth`; probes are de-duplicated. |
 | `--mine-params` | Probe high-signal parameter names and keep ones that affect the response. |
 | `--external-tools` | Use installed external recon/verification binaries. |
 | `--allow-subdomains` / `--include REGEX` / `--exclude REGEX` | Scope control; subdomains are auto-enabled for recon. |
@@ -468,6 +486,23 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--ws-active` | Actively inject marker frames into WebSocket endpoints discovered in page JavaScript (requires `--websocket`). Frame reflections are reported conservatively; they still require handler verification. |
 | `--file-upload` | File upload form discovery. |
 | `--postmessage` | `postMessage` handler analysis (origin validation). |
+
+### Access-control bypass
+
+| Option | Description |
+|---|---|
+| `--bypass-403` / `--no-bypass-403` | Probe 401/403 routes for a replayed request shape before scanning them (default: on). |
+| `--bypass-attempts N` | Maximum request shapes per protected URL (default `24`, hard cap `64`). |
+| `--bypass-techniques NAME ...` | Restrict the plan to categories (`header`, `path`, `method`) or exact technique names. |
+| `--bypass-aggressive` | Also probe `POST`/`PUT`/`PATCH` while looking for a method-based bypass. |
+
+A verified bypass is cached per URL and replayed for crawling, point discovery and every
+payload (`method`, mutated path and headers). A response is accepted only when the status
+improves, the body diverges from the original 401/403, it contains real content markers,
+and it is not a login screen, WAF block, Cloudflare/interstitial challenge or soft-404.
+The bypass itself is reported as `Access control bypass (401/403)`; if the replayed route
+reflects a payload, the normal XSS finding is raised as well. `--resume` restores verified
+bypasses from the checkpoint.
 
 ### Hybrid Detection Pipeline & Verification
 
@@ -608,7 +643,10 @@ It enables and retries degraded setups automatically:
 
 - **Recon**: passive subdomains, 50 brute-force candidates, `--allow-subdomains`,
   Wayback/Common Crawl/urlscan/OTX URL mining, OpenAPI discovery, parameter mining.
-- **Discovery**: crawl depth ≥ 6, ≥ 3000 URLs, 60 JS files, path and parameter fuzzing.
+- **Discovery**: crawl depth ≥ 6, ≥ 3000 URLs, 60 JS files, recursive path and
+  parameter fuzzing.
+- **Protected routes**: 401/403 bypass on, up to 48 request shapes per URL,
+  aggressive method probing.
 - **Injection**: ≥ 16 payloads per point, ≥ 1500 remote payloads + LazyXss, header
   injection, stored-XSS hunting, reflection reporting.
 - **Analyzers**: polyglots, JSONP, prototype pollution, mXSS, CSP/CORS, Trusted Types,
@@ -671,6 +709,23 @@ xoxss https://target.tld \
 Reconnaissance is opt-in. Subdomain enumeration widens scope to the registrable
 domain; historic-URL collection keeps only in-scope hosts. `--include`/`--exclude`
 constrain either result.
+
+### Protected routes (401/403)
+
+```bash
+# defaults: header + path + safe-method probes, 24 shapes per URL
+xoxss https://target.tld/admin --crawl --no-browser
+
+# narrow the plan, or allow state-changing method probes
+xoxss https://target.tld/admin --bypass-techniques header path --bypass-attempts 16
+xoxss https://target.tld/admin --bypass-aggressive --rate-limit 5
+```
+
+The engine replays the winning request shape for crawling, point discovery and payload
+delivery, so a route that returns 403 to a normal browser is still tested for XSS.
+Only verified bypasses (status improvement, body divergence, content markers and no
+login/WAF/challenge fingerprint) are reported. Keep `--bypass-aggressive` for
+authorized engagements: it sends `POST`/`PUT`/`PATCH` probes.
 
 ### Runtime prototype pollution
 
@@ -930,7 +985,7 @@ flowchart LR
     SCAN --> DETECT["detection/ modules<br/>tamper, dom, context, waf, encoders"]
     SCAN --> ANALYSIS["analysis/ modules<br/>dfg_slicer, framework_sinks, context_mutator, llm_triage"]
     SCAN --> CRAWLER["engine/crawler.py<br/>BFS spider and sitemaps"]
-    SCAN --> RECON["recon/ modules<br/>passive, JS, OpenAPI"]
+    SCAN --> RECON["recon/ modules<br/>passive, JS, OpenAPI, access bypass"]
     SCAN --> OOB["oob/ modules<br/>interactsh and pollers"]
     SCAN --> REPORTS["reports/ modules<br/>JSON, HTML, Markdown, SARIF"]
     SCAN --> EVENTS["console events and JSONL"]
@@ -1006,6 +1061,7 @@ xoxss/
     passive.py            Wayback, Common Crawl, urlscan, OTX
     jsintel.py            bundle endpoints, secrets, source maps, taint
     openapi.py            Swagger/OpenAPI expansion
+    access.py             401/403 request-shape bypass engine and verification
   oob/
     base.py               OOB manager, marker correlation, generic parsing
     interactsh.py         native RSA/AES interactsh client
