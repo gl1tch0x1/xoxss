@@ -128,7 +128,7 @@ class _Taint:
 
 
 class _Binding:
-    __slots__ = ("name", "kind", "taint", "function_node", "line")
+    __slots__ = ("function_node", "kind", "line", "name", "taint")
 
     def __init__(self, name: str, kind: str, line: int) -> None:
         self.name = name
@@ -139,7 +139,7 @@ class _Binding:
 
 
 class _Scope:
-    __slots__ = ("parent", "kind", "bindings")
+    __slots__ = ("bindings", "kind", "parent")
 
     def __init__(self, parent: Optional["_Scope"], kind: str) -> None:
         self.parent = parent

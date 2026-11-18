@@ -18,18 +18,18 @@ from xoxss.analysis.file_upload import FileUploadAnalyzer
 from xoxss.analysis.postmessage import PostMessageAnalyzer
 
 __all__ = [
-    "PolyglotGenerator",
-    "PerCharProbe",
-    "JSONPAnalyzer",
-    "CSPAnalyzer",
     "CORSAnalyzer",
+    "CSPAnalyzer",
+    "DOMClobberingDetector",
+    "FileUploadAnalyzer",
+    "GraphQLAnalyzer",
+    "JSONPAnalyzer",
     "MXSSDetector",
+    "PerCharProbe",
+    "PolyglotGenerator",
+    "PostMessageAnalyzer",
     "PrototypePollutionDetector",
     "SmartRateLimiter",
-    "DOMClobberingDetector",
     "TrustedTypesAnalyzer",
-    "GraphQLAnalyzer",
     "WebSocketAnalyzer",
-    "FileUploadAnalyzer",
-    "PostMessageAnalyzer",
 ]

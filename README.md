@@ -72,17 +72,18 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 
 **Detection**
 
-- **Hybrid Zero-FP Verification Pipeline (`--hybrid`, `--oracle-verify`):**
+- **Hybrid Evidence-Based Verification Pipeline (`--hybrid`, `--oracle-verify`):**
   - **CDP Runtime Taint & Hooking (`core/cdp_hooks.py`):** Injects deep prototype hooks into Chromium DevTools Protocol (`Page.addScriptToEvaluateOnNewDocument`) across Playwright and Selenium before page scripts execute. Taints sources with trackable canary tokens (`xoxss_canary_<id>`) and hooks sinks (`Element.prototype.innerHTML`, `outerHTML`, `insertAdjacentHTML`, `Document.prototype.write`, `eval`, `Function`, `location.href`, `setAttribute`). Tracks async storage provenance (`IDBObjectStore.prototype.put/get`, `Storage.prototype.setItem/getItem`) to prevent cross-script storage contamination.
   - **AST / CFG / DFG Program Slicing (`analysis/dfg_slicer.py`):** Tree-sitter CST and AST backward data-flow slicer that computes def-use chains, traces variable propagation across closures and minified scopes, and eliminates false positives caused by minified variable name collisions (`id`, `db`, `url`, `hash`, `loc`).
   - **Framework Runtime Internal Sink Suppression (`analysis/framework_sinks.py`):** Eliminates vendor framework internal runtime false positives (Vue 3 `Af.innerHTML = Ef(...)`, Alpine.js `D('html', ...)`, React `dangerouslySetInnerHTML`, Angular and jQuery internal sinks) by classifying vendor internals as safe wrappers unless reachable by untrusted user data.
   - **Context-Aware DOM Breakout Mutation (`analysis/context_mutator.py`):** Generates optimal breakout payloads tailored to the exact enclosing syntax tree context (HTML body, quoted attribute, script block, template string, or event handler).
   - **Multi-Provider LLM Semantic Triage (`analysis/llm_triage.py`):** Optional AI triage layer supporting OpenAI, Google Gemini, Anthropic Claude, and local Ollama models with strict JSON schema validation to filter out harmless DOM flows before browser execution.
-  - **Headless Execution Oracle (`core/execution_oracle.py`):** Dual-engine verification harness for Playwright and Selenium CDP sessions that injects candidates into an isolated sandbox, monitors `window.__xoxss_verify`, and produces irrefutable PoC execution evidence.
+  - **Headless Execution Oracle (`core/execution_oracle.py`):** Browser verification harness for Playwright and Selenium sessions that injects candidates into an isolated test page, monitors `window.__xoxss_verify`, and records browser-observed execution evidence.
 - Context-aware payloads for HTML, attributes (double/single/unquoted), `<script>`,
   `<style>`, comments, JSON, `javascript:` URLs and generic fallbacks.
-- HTTP-first probing with browser confirmation: Selenium (Firefox, Chrome, Edge) or
-  Playwright drives only the candidates that survive the probe stage.
+- HTTP-first probing with browser confirmation: Selenium Firefox or Playwright drives
+  only candidates that survive the probe stage. Scoped Selenium Chrome/Edge verification
+  fails closed until reliable BiDi request continuation is available.
 - Execution markers instead of blocking dialogs. Payloads write a random token to
   `window.__xoxss_hits`; `alert`, `confirm` and `prompt` are intercepted and recorded.
 - Runtime DOM instrumentation for `innerHTML`, `outerHTML`, `document.write`,
@@ -318,11 +319,14 @@ Once installed, convenient root launchers are generated automatically:
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
-# install the package and console script
+# install the package and console script (HTTP-only scans)
 pip install .
 
-# install with all optional extras (interactsh, playwright, http2, ast, dev)
-pip install ".[playwright,interactsh,http2,ast,dev]"
+# add browser verification (Selenium + webdriver-manager)
+pip install ".[browser]"
+
+# install with all optional extras (browser, interactsh, playwright, http2, ast, dev)
+pip install ".[browser,playwright,interactsh,http2,ast,dev]"
 playwright install chromium
 ```
 
@@ -708,7 +712,11 @@ xoxss https://target.tld \
 
 Reconnaissance is opt-in. Subdomain enumeration widens scope to the registrable
 domain; historic-URL collection keeps only in-scope hosts. `--include`/`--exclude`
-constrain either result.
+constrain either result. Browser verification applies the configured scope to
+navigations and browser network requests, including redirects and subresources.
+Out-of-scope requests are blocked; pages that depend on third-party resources
+may therefore behave differently during verification. The JSON report records
+the number of browser requests blocked by the scope guard.
 
 ### Protected routes (401/403)
 
@@ -1268,9 +1276,9 @@ coding standards, and our pull request process.
 - **Proposing a feature or tamper?** Share your idea via [Feature Request](https://github.com/gl1tch0x1/xoxss/issues/new?template=feature_request.yml).
 - **Submitting code?** Check the [Pull Request Template](.github/PULL_REQUEST_TEMPLATE.md) before opening a PR.
 
-Contributions: keep changes focused, explain security rationale, maintain zero false positive tolerance
-for benign reflections, update docs for flag/report changes, and preserve authorized-testing safeguards —
-no stealth-only features, no destructive defaults, no unconfirmed finding promoted without evidence.
+Contributions: keep changes focused, explain security rationale, minimize false positives for benign
+reflections, update docs for flag/report changes, and preserve authorized-testing safeguards — no
+stealth-only features, no destructive defaults, no unconfirmed finding promoted without evidence.
 
 ## Limitations
 
@@ -1282,6 +1290,13 @@ no stealth-only features, no destructive defaults, no unconfirmed finding promot
   the stored payload is not re-executed in a second browser session.
 - **Browser verification does not inherit arbitrary CLI headers**. `--auth-state`
   loads Playwright storage-state cookies into HTTP and browser sessions.
+- **Browser scope enforcement depends on interception support**. Playwright routes
+  requests through its context; Selenium Firefox uses WebDriver BiDi network interception.
+  Scoped Selenium Chrome/Edge verification is currently disabled because Chromium BiDi
+  request continuation proved unreliable in integration testing. Unsupported Selenium
+  backends fail closed rather than continuing without the configured scope boundary.
+  Out-of-scope resources are blocked, which can change pages that depend on third-party
+  assets.
 - **Prototype-pollution gadgets are finite**; known gadgets are fingerprinted, but
   arbitrary chains are not synthesized.
 - **Advanced analyzers are heuristics** (mXSS, CSP, CORS, clobbering, Trusted Types,

@@ -4,5 +4,5 @@
 #
 #   pip install -r requirements.txt
 #   pip install -e ".[dev]"
-#   pip install -e ".[playwright,http2,ast,interactsh]"
+#   pip install -e ".[browser,playwright,http2,ast,interactsh]"
 -e .

@@ -38,7 +38,7 @@ HIGH_VALUE_PARAMETERS: Set[str] = {
     "ref", "referer", "referrer", "file", "filename", "path", "template",
     "view", "page", "id", "uid", "user", "userid", "account", "name",
     "email", "message", "msg", "comment", "content", "body", "title",
-    "lang", "language", "locale", "callback", "jsonp", "format", "output",
+    "lang", "language", "locale", "jsonp", "format", "output",
     "html", "raw", "preview", "embed", "iframe", "widget", "share",
     "source", "src", "href", "image", "avatar", "theme", "debug", "test",
 }
@@ -919,8 +919,8 @@ class ReflectionProbe:
 __all__ = [
     "HIGH_VALUE_PARAMETERS",
     "ParameterCandidate",
-    "ParameterReport",
     "ParameterHarvester",
+    "ParameterReport",
     "ReflectionProbe",
     "parameter_risk",
 ]

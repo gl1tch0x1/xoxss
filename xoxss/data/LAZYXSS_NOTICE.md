@@ -17,5 +17,6 @@ attribution because it was explicitly requested for this project. If you
 redistribute XOXSS, verify the upstream licensing terms first or remove this
 file and use `--payload-file` / the remote SecLists corpora instead.
 
-The file is loaded only when the bundled payload pack is enabled
-(`--lazy-payloads`, the default). Disable it with `--no-lazy-payloads`.
+The file is loaded only when the bundled payload pack is explicitly enabled
+(`--lazy-payloads`). It is disabled by default due to licensing ambiguity;
+use the SecLists corpus via `--payload-file` or remote sources instead.

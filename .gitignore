@@ -97,6 +97,8 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .config
 .venv
 .tmp/
@@ -127,6 +129,37 @@ dmypy.json
 # XOXSS runtime artifacts
 .xoxss/
 *.state
+*.state.bak
+
+# Generated reports and evidence
+reports/
+*.jsonl
+screenshots/
+coverage.xml
+coverage.json
+
+# Payload cache and downloads
+payloads/
+downloads/
+payload-workdir/
+
+# UV lockfile (optional - remove if you want it in repo)
+uv.lock
+
+# Python environment lockfiles
+*.lock
+Pipfile.lock
+
+# Backup and temporary files
+*.bak
+*.tmp
+*.swp
+*~
+*.pem
+*.key
+*.p12
+*.pfx
+cov.txt
 
 # Local tooling and editor state
 .freebuff/

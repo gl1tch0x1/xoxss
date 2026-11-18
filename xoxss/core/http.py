@@ -45,6 +45,21 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+# Credentials must never follow a redirect or a recon-discovered host.  The
+# engine pins these to the configured credential origin and strips them from
+# every other request.
+SENSITIVE_HEADERS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "proxy-authorization",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-csrf-token",
+    }
+)
+
 @dataclass
 class HttpResponse:
     url: str
@@ -132,10 +147,12 @@ class HttpEngine:
         auth_state: Optional[str] = None,
         http2: bool = False,
         impersonate: Optional[str] = None,
+        auth_origin: Optional[str] = None,
     ):
         self.console = console
         self.stats = stats
         self.base_headers = dict(headers or {})
+        self.credential_origin = self._origin_key(auth_origin) if auth_origin else None
         self.http2 = bool(http2)
         self.impersonate = (impersonate or "").strip() or None
         self.transport = "aiohttp"
@@ -186,12 +203,10 @@ class HttpEngine:
                 return
             assert CurlAsyncSession is not None, "curl_cffi is not installed"
             options: Dict[str, Any] = {
-                "headers": self.base_headers,
+                "headers": self._default_headers(),
                 "timeout": self.timeout,
                 "verify": not self.insecure,
             }
-            if self.cookies:
-                options["cookies"] = self.cookies
             if self.proxy:
                 options["proxy"] = self.proxy
             if self.impersonate:
@@ -242,8 +257,7 @@ class HttpEngine:
         # default strict behavior unless the operator supplied auth state.
         cookie_jar = aiohttp.CookieJar(unsafe=bool(self.auth_state))
         self.session = aiohttp.ClientSession(
-            headers=self.base_headers,
-            cookies=self.cookies,
+            headers=self._default_headers(),
             timeout=timeout,
             connector=connector,
             cookie_jar=cookie_jar,
@@ -463,12 +477,12 @@ class HttpEngine:
                     for redirect_count in range(11):
                         await self._apply_rate_limit(urlsplit(current_url).hostname or "")
                         sent_headers, sent_body = self._sent_request(
-                            headers, current_data, current_json
+                            current_url, headers, current_data, current_json
                         )
                         response = await self.session.request(
                             current_method,
                             current_url,
-                            headers=headers,
+                            headers=sent_headers,
                             data=current_data,
                             json=current_json,
                             allow_redirects=False,
@@ -481,20 +495,12 @@ class HttpEngine:
                         if not (allow_redirects and is_redirect):
                             break
                         next_url = urljoin(str(response.url), location)
-                        current_parts = urlsplit(str(response.url))
-                        next_parts = urlsplit(next_url)
-                        same_origin = (
-                            current_parts.scheme.lower(), current_parts.hostname, current_parts.port
-                        ) == (
-                            next_parts.scheme.lower(), next_parts.hostname, next_parts.port
-                        )
-                        if not same_origin or (
-                            self.redirect_scope is not None and not self.redirect_scope(next_url)
-                        ):
+                        if not self._redirect_allowed(str(response.url), next_url):
+                            self.stats.redirects_blocked += 1
                             result = HttpResponse(
                                 url=str(response.url), status=response.status,
                                 headers={k.lower(): v for k, v in response.headers.items()},
-                                error="redirect target is outside the request origin or scan scope",
+                                error="redirect target is outside the configured scan scope",
                             )
                             response.release()
                             return result
@@ -609,18 +615,90 @@ class HttpEngine:
         return HttpResponse(url=url, error=last_error)
 
     # -- internals --------------------------------------------------------------------
+    @staticmethod
+    def _origin_key(url: str) -> Tuple[str, str, int]:
+        parts = urlsplit(url)
+        scheme = (parts.scheme or "http").lower()
+        try:
+            port = parts.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            port = -1
+        return scheme, (parts.hostname or "").lower(), port
+
+    def _default_headers(self) -> Dict[str, str]:
+        """Session-level headers without credentials.
+
+        ``aiohttp``/``curl_cffi`` merge session headers into every request, so
+        credentials must never live here.  Per-request headers are added by
+        :meth:`_request_headers` only for the pinned credential origin.
+        """
+        return {
+            key: value
+            for key, value in self.base_headers.items()
+            if key.lower() not in SENSITIVE_HEADERS
+        }
+
+    def _credentials_allowed(self, url: str) -> bool:
+        if self.credential_origin is None:
+            return True
+        scheme, host, port = self._origin_key(url)
+        anchor_scheme, anchor_host, anchor_port = self.credential_origin
+        if host != anchor_host:
+            return False
+        if scheme == anchor_scheme and port == anchor_port:
+            return True
+        # The near-universal ``http://site`` -> ``https://site`` redirect must
+        # still authenticate, but the reverse (cleartext downgrade) must not.
+        if (
+            anchor_scheme == "http"
+            and scheme == "https"
+            and anchor_port == 80
+            and port == 443
+        ):
+            return True
+        return False
+
+    def _request_headers(
+        self, url: str, headers: Optional[Dict[str, str]]
+    ) -> Dict[str, str]:
+        merged: Dict[str, str] = dict(self.base_headers)
+        if headers:
+            merged.update({str(key): str(value) for key, value in headers.items()})
+        if not self._credentials_allowed(url):
+            merged = {
+                key: value
+                for key, value in merged.items()
+                if key.lower() not in SENSITIVE_HEADERS
+            }
+        elif self.cookies and not any(
+            name.lower() == "cookie" for name in merged
+        ):
+            merged["Cookie"] = "; ".join(
+                f"{name}={value}" for name, value in self.cookies.items()
+            )
+        return merged
+
+    def _redirect_allowed(self, current_url: str, next_url: str) -> bool:
+        """Allow same-site redirects that stay inside the configured scope.
+
+        The previous implementation required an identical origin, which broke
+        the two most common production redirects: ``http`` -> ``https`` and
+        apex -> ``www``.  Scope is the authority; when no scope callback is
+        configured (direct engine use), fall back to same-origin.
+        """
+        if self.redirect_scope is not None:
+            return bool(self.redirect_scope(next_url))
+        return self._origin_key(current_url) == self._origin_key(next_url)
+
     def _sent_request(
         self,
+        url: str,
         headers: Optional[Dict[str, str]],
         data: Optional[Any],
         json_body: Optional[Dict[str, Any]],
     ) -> Tuple[Dict[str, str], str]:
         """Materialise the headers/body actually sent for evidence capture."""
-        merged: Dict[str, str] = dict(self.base_headers)
-        if headers:
-            merged.update({str(key): str(value) for key, value in headers.items()})
-        if self.cookies and not any(name.lower() == "cookie" for name in merged):
-            merged["Cookie"] = "; ".join(f"{name}={value}" for name, value in self.cookies.items())
+        merged = self._request_headers(url, headers)
         body = ""
         if data:
             body = urlencode(data, doseq=True) if isinstance(data, dict) else str(data)
@@ -672,7 +750,7 @@ class HttpEngine:
                     for redirect_count in range(11):
                         await self._apply_rate_limit(urlsplit(current_url).hostname or "")
                         request_headers, sent_body = self._sent_request(
-                            headers, current_data, current_json
+                            current_url, headers, current_data, current_json
                         )
                         sent_headers = request_headers
                         options: Dict[str, Any] = {
@@ -706,22 +784,14 @@ class HttpEngine:
                             break
                         response_url = str(getattr(response, "url", current_url) or current_url)
                         next_url = urljoin(response_url, location)
-                        current_parts = urlsplit(response_url)
-                        next_parts = urlsplit(next_url)
-                        same_origin = (
-                            current_parts.scheme.lower(), current_parts.hostname, current_parts.port
-                        ) == (
-                            next_parts.scheme.lower(), next_parts.hostname, next_parts.port
-                        )
-                        if not same_origin or (
-                            self.redirect_scope is not None and not self.redirect_scope(next_url)
-                        ):
+                        if not self._redirect_allowed(response_url, next_url):
+                            self.stats.redirects_blocked += 1
                             self._close_curl_response(response)
                             return HttpResponse(
                                 url=response_url,
                                 status=int(response.status_code),
                                 headers=response_headers,
-                                error="redirect target is outside the request origin or scan scope",
+                                error="redirect target is outside the configured scan scope",
                             )
                         self._close_curl_response(response)
                         if redirect_count == 10:

@@ -37,6 +37,16 @@ def _truncate(text: Any, limit: int = 200) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "\u2026"
 
 
+def _url_is_allowed(url: str, url_allowed: Optional[Callable[[str], bool]]) -> bool:
+    if url_allowed is None:
+        return True
+    try:
+        return bool(url_allowed(url))
+    except Exception:
+        _LOGGER.exception("scan-scope validation failed for browser request")
+        return False
+
+
 from xoxss.core.cdp_hooks import build_cdp_instrumentation  # noqa: E402
 
 HOOK_JS = build_cdp_instrumentation()
@@ -206,6 +216,8 @@ class BrowserEngine:
         self._lock = asyncio.Lock()
         self._cdp_hook = False
         self._suppress_dialogs = self.kind in ("chrome", "chromium", "edge")
+        self.scope_blocked_requests = 0
+        self._scope_guard_handler_id: Any = None
 
     # -- lifecycle --------------------------------------------------------------------
     async def start(self) -> bool:
@@ -234,6 +246,19 @@ class BrowserEngine:
         except Exception as exc:
             _LOGGER.debug("could not apply Selenium timeouts: %s", exc)
 
+        try:
+            self._install_scope_guard(driver)
+        except Exception as exc:
+            self.driver = None
+            try:
+                driver.quit()
+            except Exception:
+                _LOGGER.debug("could not close Selenium after scope guard failure", exc_info=True)
+            self.console.error(
+                f"Browser scope interception is unavailable; verification disabled: {exc}"
+            )
+            return False
+
         if self.kind in ("chrome", "chromium", "edge"):
             try:
                 driver.execute_cdp_cmd(
@@ -245,6 +270,40 @@ class BrowserEngine:
         self.console.ok(f"{self.kind} browser ready ({'headless' if self.headless else 'headed'})", important=False)
         return True
 
+    def _on_scope_request(self, request: Any) -> None:
+        url = str(getattr(request, "url", "") or "")
+        if _url_is_allowed(url, self.url_allowed):
+            return
+        self.scope_blocked_requests += 1
+        fail = getattr(request, "fail", None) or getattr(request, "fail_request", None)
+        if not callable(fail):
+            raise RuntimeError("Selenium BiDi request interception cannot fail an out-of-scope request")
+        fail()
+
+    def _install_scope_guard(self, driver: Any) -> None:
+        if self.url_allowed is None:
+            return
+        if self.kind in ("chrome", "chromium", "edge"):
+            raise RuntimeError(
+                "Selenium BiDi request continuation is unreliable for Chromium; "
+                "use Firefox or Playwright for scoped browser verification"
+            )
+        network = getattr(driver, "network", None)
+        add_handler = getattr(network, "add_request_handler", None)
+        if not callable(add_handler):
+            raise RuntimeError("Selenium WebDriver BiDi network interception is not supported")
+        try:
+            parameters = inspect.signature(add_handler).parameters
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("cannot determine Selenium BiDi request-handler API") from exc
+        callback_parameter = parameters.get("callback")
+        if callback_parameter is not None and callback_parameter.default is not inspect.Parameter.empty:
+            self._scope_guard_handler_id = add_handler(self._on_scope_request)
+        else:
+            self._scope_guard_handler_id = add_handler(
+                "before_request", self._on_scope_request
+            )
+
     def _create_driver(self) -> Any:
         from selenium import webdriver
         from selenium.webdriver.chrome.options import Options as ChromeOptions
@@ -252,6 +311,7 @@ class BrowserEngine:
 
         if self.kind in ("chrome", "chromium"):
             options = ChromeOptions()
+            options.enable_bidi = False
             for arg in CHROME_ARGS:
                 options.add_argument(arg)
             if self.headless:
@@ -286,6 +346,7 @@ class BrowserEngine:
             from selenium.webdriver.edge.options import Options as EdgeOptions
 
             options = EdgeOptions()
+            options.enable_bidi = False
             for arg in CHROME_ARGS:
                 options.add_argument(arg)
             if self.headless:
@@ -298,6 +359,7 @@ class BrowserEngine:
 
         # Firefox
         options = FirefoxOptions()
+        options.enable_bidi = self.url_allowed is not None
         if self.headless:
             options.add_argument("-headless")
         if self.binary:
@@ -346,7 +408,7 @@ class BrowserEngine:
 
     # -- page interaction -------------------------------------------------------------
     async def navigate(self, url: str) -> str:
-        if self.url_allowed is not None and not self.url_allowed(url):
+        if not _url_is_allowed(url, self.url_allowed):
             return "URL is outside the configured scan scope"
         async with self._lock:
             return await asyncio.to_thread(self._navigate_sync, url)
@@ -573,6 +635,7 @@ class PlaywrightEngine:
         self._page_handler: Any = None
         self.observed_requests: List[str] = []
         self.observed_request_details: List[Dict[str, str]] = []
+        self.scope_blocked_requests = 0
 
     async def _on_dialog(self, dialog: Any) -> None:
         try:
@@ -602,6 +665,14 @@ class PlaywrightEngine:
                         self.observed_request_details.append(detail)
         except Exception as exc:
             _LOGGER.debug("could not record observed request: %s", exc)
+
+    async def _guard_route(self, route: Any) -> None:
+        url = str(getattr(route.request, "url", "") or "")
+        if not _url_is_allowed(url, self.url_allowed):
+            self.scope_blocked_requests += 1
+            await route.abort("blockedbyclient")
+            return
+        await route.continue_()
 
     async def start(self) -> bool:
         try:
@@ -652,11 +723,14 @@ class PlaywrightEngine:
         context_options: Dict[str, Any] = {
             "ignore_https_errors": self.insecure,
             "viewport": {"width": 1366, "height": 900},
+            "service_workers": "block",
         }
         if self.auth_state:
-            state_path = Path(self.auth_state).expanduser()
-            if not state_path.is_file():
-                self.console.error(f"Browser auth state does not exist: {state_path}")
+            state_path = await asyncio.to_thread(self._resolve_auth_state)
+            if state_path is None:
+                self.console.error(
+                    f"Browser auth state does not exist: {self.auth_state}"
+                )
                 await self.stop()
                 return False
             context_options["storage_state"] = str(state_path)
@@ -666,6 +740,8 @@ class PlaywrightEngine:
             context_options["proxy"] = {"server": self.proxy}
         try:
             self._context = await self._browser.new_context(**context_options)
+            if self.url_allowed is not None:
+                await self._context.route("**/*", self._guard_route)
             await self._context.add_init_script("window.__xoxss_pw = true;\n" + HOOK_JS)
             self.page = await self._context.new_page()
             self.page.set_default_timeout(self.page_timeout * 1000)
@@ -681,6 +757,14 @@ class PlaywrightEngine:
             important=False,
         )
         return True
+
+    def _resolve_auth_state(self) -> Optional[Path]:
+        """Expand and validate the storage-state path off the event loop."""
+        state = self.auth_state
+        if not state:
+            return None
+        path = Path(state).expanduser()
+        return path if path.is_file() else None
 
     def _report_launch_failure(self, error: Optional[Exception]) -> None:
         """Turn a raw playwright launch stack into an actionable diagnosis.
@@ -753,7 +837,7 @@ class PlaywrightEngine:
             return False
 
     async def navigate(self, url: str) -> str:
-        if self.url_allowed is not None and not self.url_allowed(url):
+        if not _url_is_allowed(url, self.url_allowed):
             return "URL is outside the configured scan scope"
         async with self._lock:
             if self.page is None:
@@ -961,7 +1045,7 @@ class BrowserPool:
                 break
             except asyncio.TimeoutError:
                 if not self.engines:
-                    raise RuntimeError("browser pool has no active engines")
+                    raise RuntimeError("browser pool has no active engines") from None
                 continue
         crashed = False
         try:

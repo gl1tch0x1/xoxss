@@ -259,9 +259,11 @@ class ScanStats:
     """Aggregated scan statistics."""
     requests: int = 0
     errors: int = 0
+    redirects_blocked: int = 0
     truncated_responses: int = 0
     blocked: int = 0
     payloads: int = 0
+    payload_pool: int = 0
     points: int = 0
     urls_total: int = 0
     urls_done: int = 0
@@ -302,19 +304,19 @@ class ScanStats:
 
 
 __all__ = [
-    "now_iso",
-    "CONFIRMED_EXECUTION",
-    "REJECTED",
-    "UNVERIFIED",
-    "FALSE_POSITIVE",
-    "NEEDS_MANUAL_TEST",
     "CONFIDENCE_LEVELS",
     "CONFIDENCE_RANK",
-    "reflection_confidence",
+    "CONFIRMED_EXECUTION",
+    "FALSE_POSITIVE",
+    "NEEDS_MANUAL_TEST",
+    "REJECTED",
+    "UNVERIFIED",
     "Finding",
-    "meets_fail_threshold",
-    "enforce_finding_policy",
-    "ValidationResult",
     "ScanStats",
+    "ValidationResult",
+    "enforce_finding_policy",
+    "meets_fail_threshold",
+    "now_iso",
+    "reflection_confidence",
 ]
 

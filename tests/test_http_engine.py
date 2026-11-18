@@ -70,7 +70,7 @@ class _Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length else b""
 
     # -- routing ---------------------------------------------------------
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+    def do_GET(self) -> None:
         path = urlsplit(self.path).path
         state = self.server.state  # type: ignore[attr-defined]
 
@@ -95,6 +95,13 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Location", "https://example.invalid/ok")
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif path == "/redirect-cross-origin":
+            address = self.server.server_address
+            port = address[1] if isinstance(address, tuple) else 0
+            self.send_response(302)
+            self.send_header("Location", f"http://localhost:{port}/ok")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif path == "/redirect-loop":
             self.send_response(302)
             self.send_header("Location", "/redirect-loop")
@@ -114,7 +121,7 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send(b"missing", status=404)
 
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+    def do_POST(self) -> None:
         path = urlsplit(self.path).path
         body = self._read_body()
         content_type = self.headers.get("Content-Type", "")
@@ -238,9 +245,69 @@ def test_external_redirect_is_refused(fixture_server: FixtureServer) -> None:
     async def scenario(engine: HttpEngine) -> HttpResponse:
         return await engine.get(fixture_server.url("/redirect-external"))
 
-    result, _ = run_case(scenario)
+    result, stats = run_case(scenario)
     assert result.status == 302
-    assert "outside the request origin" in (result.error or "")
+    assert "outside the configured scan scope" in (result.error or "")
+    assert stats.redirects_blocked == 1
+
+
+def test_in_scope_cross_origin_redirect_is_followed(fixture_server: FixtureServer) -> None:
+    """Apex -> www / http -> https style hops must not become blind spots."""
+
+    async def scenario(engine: HttpEngine) -> HttpResponse:
+        return await engine.get(fixture_server.url("/redirect-cross-origin"))
+
+    result, _ = run_case(scenario, redirect_scope=lambda _url: True)
+    assert result.status == 200
+    assert result.text == "ok"
+
+
+def test_redirect_scope_is_the_only_redirect_authority() -> None:
+    engine = HttpEngine(
+        StubConsole(),
+        ScanStats(),
+        redirect_scope=lambda url: "example.test" in url,
+    )
+    assert engine._redirect_allowed("http://example.test/a", "https://www.example.test/b")
+    assert not engine._redirect_allowed("http://example.test/a", "https://evil.invalid/b")
+
+
+def test_engine_without_scope_keeps_same_origin_default() -> None:
+    engine = HttpEngine(StubConsole(), ScanStats())
+    assert engine._redirect_allowed("http://example.test/a", "http://example.test/b")
+    assert not engine._redirect_allowed("http://example.test/a", "https://example.test/b")
+    assert not engine._redirect_allowed("http://example.test/a", "http://www.example.test/b")
+
+
+def test_credentials_are_pinned_to_the_auth_origin() -> None:
+    engine = HttpEngine(
+        StubConsole(),
+        ScanStats(),
+        headers={"Authorization": "Bearer live", "X-Test": "1", "Cookie": "sid=1"},
+        auth_origin="https://app.test",
+    )
+    anchor = engine._request_headers("https://app.test/x", None)
+    sibling = engine._request_headers("https://api.app.test/x", None)
+    cleartext = engine._request_headers("http://app.test/x", None)
+
+    assert anchor["Authorization"] == "Bearer live"
+    assert anchor["Cookie"] == "sid=1"
+    assert "Authorization" not in sibling and "Cookie" not in sibling
+    # Non-sensitive headers still follow the scan.
+    assert sibling["X-Test"] == "1"
+    # https -> http downgrade never carries credentials.
+    assert "Authorization" not in cleartext and "Cookie" not in cleartext
+
+
+def test_credentials_follow_http_to_https_upgrade() -> None:
+    engine = HttpEngine(
+        StubConsole(),
+        ScanStats(),
+        headers={"Authorization": "Bearer live"},
+        auth_origin="http://app.test",
+    )
+    assert "Authorization" in engine._request_headers("https://app.test/x", None)
+    assert "Authorization" not in engine._request_headers("http://other.test/x", None)
 
 
 def test_redirect_loop_is_bounded(fixture_server: FixtureServer) -> None:

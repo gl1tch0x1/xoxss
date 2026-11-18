@@ -177,9 +177,9 @@ class ExecutionOracle:
             # 2. Inject payload into browser storage
             injection_script = ""
             if storage_type in ("localStorage", "localstorage"):
-                injection_script = f"localStorage.setItem({repr(key)}, {repr(payload)});"
+                injection_script = f"localStorage.setItem({key!r}, {payload!r});"
             elif storage_type in ("sessionStorage", "sessionstorage"):
-                injection_script = f"sessionStorage.setItem({repr(key)}, {repr(payload)});"
+                injection_script = f"sessionStorage.setItem({key!r}, {payload!r});"
             elif storage_type in ("indexedDB", "indexeddb"):
                 injection_script = f"""
                 (function() {{
@@ -187,15 +187,15 @@ class ExecutionOracle:
                     var req = indexedDB.open('xoxss_test_db', 1);
                     req.onupgradeneeded = function(e) {{
                       var db = e.target.result;
-                      if (!db.objectStoreNames.contains({repr(key)})) {{
-                        db.createObjectStore({repr(key)}, {{ keyPath: 'id', autoIncrement: true }});
+                      if (!db.objectStoreNames.contains({key!r})) {{
+                        db.createObjectStore({key!r}, {{ keyPath: 'id', autoIncrement: true }});
                       }}
                     }};
                     req.onsuccess = function(e) {{
                       var db = e.target.result;
-                      if (db.objectStoreNames.contains({repr(key)})) {{
-                        var tx = db.transaction([{repr(key)}], 'readwrite');
-                        tx.objectStore({repr(key)}).put({{ id: 1, val: {repr(payload)} }});
+                      if (db.objectStoreNames.contains({key!r})) {{
+                        var tx = db.transaction([{key!r}], 'readwrite');
+                        tx.objectStore({key!r}).put({{ id: 1, val: {payload!r} }});
                       }}
                     }};
                   }} catch (e) {{}}
@@ -235,7 +235,7 @@ class ExecutionOracle:
             await browser.navigate(target_url)
             pm_script = f"""
             try {{
-              window.postMessage({repr(payload)}, '*');
+              window.postMessage({payload!r}, '*');
             }} catch(e) {{}}
             """
             await self._evaluate(browser, pm_script)

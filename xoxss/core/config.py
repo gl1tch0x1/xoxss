@@ -167,7 +167,7 @@ class ScanConfig:
     mutation_probe_limit: int = 12
     adaptive_payloads: bool = False
     param_batch_size: int = 100
-    lazy_payloads: bool = True
+    lazy_payloads: bool = False
     payload_catalog: bool = True
     list_encoders: bool = False
     list_payload_catalog: bool = False
@@ -343,10 +343,10 @@ class ScanConfig:
 
 
 __all__ = [
-    "ScanMode",
-    "VerificationStrategy",
     "BrowserType",
     "ScanConfig",
+    "ScanMode",
+    "VerificationStrategy",
     "load_dotenv",
     "load_dotenv_or_config",
 ]

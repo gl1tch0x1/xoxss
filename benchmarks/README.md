@@ -11,7 +11,7 @@ or an application you are authorized to test.
 |---|---|
 | `fixture_server.py` | Self-contained vulnerable/benign HTTP fixture bound to `127.0.0.1` (port `8765`, or `XOXSS_BENCH_PORT`). |
 | `cases.json` | Schema 2 corpus: one object per case with the URL, expected evidence grade and browser requirements. |
-| `run_benchmark.py` | Runs the real CLI per case and compares the strongest confidence in the JSON report with the expectation. |
+| `run_benchmark.py` | Runs the real CLI per case and reports evidence outcomes, confusion-matrix metrics, request/payload counts, errors, browser checks, elapsed time, and coverage notes. |
 
 ## Running
 
@@ -38,6 +38,13 @@ passes when the strongest confidence in `findings` matches `expect`:
 * `none` requires no finding at or above `medium`; low informational leads are
   allowed for candidates such as a JSON echo.
 
+The console summary and each `--json-out` case record include measured scanner
+work (HTTP requests, payloads, errors, browser checks, and elapsed time). The
+summary also reports TP/FP/FN/TN, precision, recall, specificity, false-positive
+rate, and inconclusive cases. Timeouts and missing or unreadable reports are
+inconclusive rather than being counted as false negatives. The JSON output
+remains an array of per-case records.
+
 The runner exits `1` when any case fails and `2` when no case is selected. CI runs
 `--quick` on every supported Python version.
 
@@ -60,11 +67,12 @@ containing the same cookie and pass it with `--auth-state` to a manual scan.
 
 ## Interpreting results
 
-Record, per run: confirmed findings by case/context, high/medium heuristic findings
-separately, rejected/skipped points, HTTP errors, elapsed time, request count,
-payload count and browser checks. Compare confirmed detection and false positives
-independently: a change that only increases candidate counts or payload volume is
-not a detection improvement.
+The benchmark currently measures XOXSS against its bundled fixture; it is not a
+cross-tool bake-off and does not establish superiority over Dalfox, XSStrike,
+Burp DOM Invader, or ZAP. A fair comparison must pin tool versions and fixture
+revision, align browser/authentication modes and scan budgets, report incomplete
+cases, and compare false positives separately from detection. A tool that sends
+more payloads or reports more candidates has not necessarily improved detection.
 
 `--param-audit --param-batch-size 100` exercises batch-first hidden-parameter
 reflection checks. `--mutation-probes` adds bounded per-endpoint encoding and

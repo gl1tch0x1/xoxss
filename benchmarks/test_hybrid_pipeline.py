@@ -378,4 +378,4 @@ if __name__ == "__main__":
     print("11. test_etsy_bug_full_regression...", end=" ", flush=True)
     test_etsy_bug_full_regression()
     print("OK")
-    print("ALL HYBRID PIPELINE TESTS PASSED (11/11)! ZERO FALSE POSITIVES CONFIRMED.")
+    print("ALL HYBRID PIPELINE REGRESSION CHECKS PASSED (11/11).")

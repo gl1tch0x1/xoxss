@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
     args = getattr(scanner, "args", None)
     pool = getattr(scanner, "pool", None)
+    scope_blocked_requests = sum(
+        int(getattr(engine, "scope_blocked_requests", 0) or 0)
+        for engine in (getattr(pool, "engines", None) or [])
+    )
     browser_requested = not bool(getattr(args, "no_browser", False))
     browser_available = bool(pool and pool.engines)
     coverage_notes = []
@@ -25,6 +29,11 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
         coverage_notes.append("Browser execution verification was requested but no browser worker started")
     if not bool(getattr(args, "crawl", False)):
         coverage_notes.append("Crawling was disabled; only the target and enabled recon seeds were scanned")
+    fuzz_requested = getattr(args, "fuzz", None)
+    if fuzz_requested is None:
+        fuzz_requested = bool(getattr(args, "crawl", False))
+    if not fuzz_requested:
+        coverage_notes.append("Post-crawl path and hidden-parameter fuzzing was disabled")
     if not bool(getattr(args, "browser_discovery", False)):
         coverage_notes.append("Runtime SPA route and XHR/fetch discovery was disabled")
     if not bool(getattr(args, "stored", False)):
@@ -41,9 +50,17 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
         coverage_notes.append(
             f"{scanner.stats.truncated_responses} response(s) were truncated at the configured byte limit"
         )
+    if scope_blocked_requests:
+        coverage_notes.append(
+            f"{scope_blocked_requests} browser request(s) to out-of-scope URLs were blocked"
+        )
     if scanner.stats.errors:
         coverage_notes.append(
             f"{scanner.stats.errors} HTTP request(s) failed; affected endpoints may have incomplete coverage"
+        )
+    if getattr(scanner.stats, "redirects_blocked", 0):
+        coverage_notes.append(
+            f"{scanner.stats.redirects_blocked} redirect(s) left the configured scope and were not followed"
         )
     if scanner.stats.urls_failed:
         coverage_notes.append(
@@ -72,6 +89,7 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
             "browser_requested": browser_requested,
             "browser_available": browser_available,
             "browser_checks": scanner.stats.browser_checks,
+            "scope_blocked_requests": scope_blocked_requests,
             "http_errors": scanner.stats.errors,
             "truncated_responses": scanner.stats.truncated_responses,
         },
@@ -97,7 +115,10 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
                 operation.to_dict() for operation in scanner.api_operations[:500]
             ],
             "external_tools": scanner.external_summary,
-            "js_intel": [intel.to_dict() for intel in scanner.js_intel[:25]],
+            "js_intel": [
+                intel.to_dict(reveal=bool(getattr(args, "show_secrets", False)))
+                for intel in scanner.js_intel[:25]
+            ],
             "endpoint_sources": scanner.state.extra.get("endpoint_sources", {}),
             "external_parameters": scanner.state.extra.get("external_parameters", {}),
         },

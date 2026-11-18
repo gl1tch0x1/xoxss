@@ -13,6 +13,7 @@ import gzip
 import html as html_lib
 import io
 import re
+from pathlib import Path
 from typing import Any, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -93,6 +94,7 @@ class CrawlerMixin:
     _endpoints_from_js_file: Any
     discover_browser_requests: Any
     fetch_page: Any
+    _record_recon_error: Any
 
     async def prepare_urls(self) -> List[str]:
         recon = await self.recon_seeds()
@@ -109,6 +111,23 @@ class CrawlerMixin:
         if self.pool and getattr(self.args, "browser_discovery", False):
             observed = await self.discover_browser_requests(urls)
             urls = list(dict.fromkeys([*urls, *observed]))[: max(1, self.args.max_urls)]
+
+        # Crawl -> FUZZ -> param: enumeration only makes sense once the crawl
+        # has supplied real directories and endpoints to seed it with.
+        fuzz_enabled = getattr(self.args, "fuzz", None)
+        if fuzz_enabled is None:
+            fuzz_enabled = bool(getattr(self.args, "crawl", False))
+        if fuzz_enabled:
+            try:
+                from xoxss.scan.fuzz_phase import run_fuzz_phase
+
+                fuzzed = await run_fuzz_phase(self, urls)
+            except Exception as exc:
+                self._record_recon_error("post-crawl fuzzing", exc)
+                fuzzed = []
+            if fuzzed:
+                urls = list(dict.fromkeys([*urls, *fuzzed]))[: max(1, self.args.max_urls)]
+
         if self.target not in urls:
             urls.insert(0, self.target)
         self.state.extra["endpoints"] = sorted(self.endpoints)[:5000]
@@ -217,11 +236,15 @@ class CrawlerMixin:
         wordlist = getattr(self.args, "endpoint_wordlist", None)
         if wordlist:
             try:
-                with open(wordlist, "r", encoding="utf-8-sig", errors="replace") as handle:
-                    for line in handle:
-                        entry = line.strip()
-                        if entry and not entry.startswith("#"):
-                            paths.append(entry if entry.startswith("/") else "/" + entry)
+                text = await asyncio.to_thread(
+                    Path(wordlist).read_text,
+                    encoding="utf-8-sig",
+                    errors="replace",
+                )
+                for line in text.splitlines():
+                    entry = line.strip()
+                    if entry and not entry.startswith("#"):
+                        paths.append(entry if entry.startswith("/") else "/" + entry)
             except OSError as exc:
                 self.console.warn(f"Cannot read endpoint wordlist {wordlist}: {exc}")
 

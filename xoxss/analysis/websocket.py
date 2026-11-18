@@ -375,11 +375,11 @@ class WebSocketActiveProbe:
 
 
 __all__ = [
+    "WebSocketActiveProbe",
+    "WebSocketAnalyzer",
+    "WebSocketFrameHit",
     "WebSocketSink",
     "WebSocketVulnerability",
-    "WebSocketFrameHit",
-    "WebSocketAnalyzer",
-    "WebSocketActiveProbe",
     "extract_websocket_urls",
     "websocket_http_equivalent",
 ]

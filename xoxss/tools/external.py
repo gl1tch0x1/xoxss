@@ -762,7 +762,11 @@ class ExternalToolkit:
                                 timeout=self.timeout,
                             )
                             try:
-                                exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
+                                exported = await asyncio.to_thread(
+                                    Path(output_path).read_text,
+                                    encoding="utf-8",
+                                    errors="replace",
+                                )
                             except OSError:
                                 exported = ""
                             for found_url, params in parse_arjun_json(exported or result.stdout).items():
@@ -784,7 +788,11 @@ class ExternalToolkit:
                                 timeout=self.timeout,
                             )
                             try:
-                                exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
+                                exported = await asyncio.to_thread(
+                                    Path(output_path).read_text,
+                                    encoding="utf-8",
+                                    errors="replace",
+                                )
                             except OSError:
                                 exported = ""
                             for found_url, params in parse_x8_json(exported or result.stdout, url).items():
@@ -864,7 +872,11 @@ class ExternalToolkit:
                 timeout=self.timeout,
             )
             try:
-                exported = Path(output_path).read_text(encoding="utf-8", errors="replace")
+                exported = await asyncio.to_thread(
+                    Path(output_path).read_text,
+                    encoding="utf-8",
+                    errors="replace",
+                )
             except OSError:
                 exported = ""
             return parse_wfuzz_json(exported or result.stdout)
@@ -879,20 +891,20 @@ class ExternalToolkit:
 
 
 __all__ = [
-    "ToolResult",
-    "ExternalFinding",
     "ExternalCrawl",
-    "ToolRunner",
+    "ExternalFinding",
     "ExternalToolkit",
+    "ToolResult",
+    "ToolRunner",
     "available_tools",
+    "parse_arjun_json",
+    "parse_dalfox",
+    "parse_ffuf",
+    "parse_katana",
+    "parse_kxss",
+    "parse_nuclei",
     "parse_subfinder",
     "parse_url_lines",
-    "parse_katana",
-    "parse_dalfox",
-    "parse_nuclei",
-    "parse_ffuf",
-    "parse_arjun_json",
-    "parse_x8_json",
-    "parse_kxss",
     "parse_wfuzz_json",
+    "parse_x8_json",
 ]

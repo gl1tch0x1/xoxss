@@ -32,10 +32,10 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from benchmarks.fixture_server import Handler  # noqa: E402
-from xoxss.core.finding import ScanStats  # noqa: E402
-from xoxss.core.http import HttpEngine  # noqa: E402
-from xoxss.recon.access import AccessBypassEngine, BypassResult  # noqa: E402
+from benchmarks.fixture_server import Handler
+from xoxss.core.finding import ScanStats
+from xoxss.core.http import HttpEngine
+from xoxss.recon.access import AccessBypassEngine, BypassResult
 
 STRONG = {"medium", "high", "confirmed"}
 

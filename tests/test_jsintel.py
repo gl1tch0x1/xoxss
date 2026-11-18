@@ -25,6 +25,19 @@ def test_jsintel_exposures_alias_reads_and_writes() -> None:
     assert intel.to_dict()["secrets"] == []
 
 
+def test_report_serialisation_masks_secrets_by_default() -> None:
+    secret = 'const api_key = "abcd1234efgh5678ijkl";'
+    intel = JSIntel(exposures=extract_secrets(secret))
+
+    masked = intel.to_dict()
+    revealed = intel.to_dict(reveal=True)
+
+    assert masked["secrets"][0]["value"] != "abcd1234efgh5678ijkl"
+    assert masked["secrets"][0]["redacted"] is True
+    assert revealed["secrets"][0]["value"] == "abcd1234efgh5678ijkl"
+    assert revealed["secrets"][0]["redacted"] is False
+
+
 def test_scan_stats_secrets_alias_maps_to_js_exposures() -> None:
     stats = ScanStats()
     stats.secrets = 3

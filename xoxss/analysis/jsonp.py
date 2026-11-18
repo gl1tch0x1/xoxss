@@ -154,7 +154,7 @@ class JSONPAnalyzer:
             List of known gadget URLs that might be usable
         """
         gadgets = []
-        for gadget_name, gadget_url in self.KNOWN_GADGETS.items():
+        for _gadget_name, gadget_url in self.KNOWN_GADGETS.items():
             if domain in gadget_url:
                 gadgets.append(gadget_url)
         return gadgets

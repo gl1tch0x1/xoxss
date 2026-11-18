@@ -410,8 +410,8 @@ def summarize_flows(flows: Sequence[TaintFlow]) -> Dict[str, object]:
 
 
 __all__ = [
-    "SOURCE_PATTERNS",
     "SINK_PATTERNS",
+    "SOURCE_PATTERNS",
     "TaintFlow",
     "analyze_javascript",
     "analyze_javascript_regex",

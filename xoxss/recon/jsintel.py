@@ -147,11 +147,19 @@ class SecretHit:
             return "*" * len(value)
         return f"{value[:4]}…{value[-4:]}"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, *, reveal: bool = False) -> Dict[str, Any]:
+        """Serialise for reports.
+
+        Secret values are masked by default: reports are copied into tickets,
+        chats and client deliverables, and a leaked credential is a live
+        incident.  ``reveal=True`` is only for the operator's own terminal
+        export (``--show-secrets``).
+        """
         return {
             "kind": self.kind,
-            "value": self.value,
+            "value": self.value if reveal else self.masked(),
             "masked": self.masked(),
+            "redacted": not reveal,
             "severity": self.severity,
             "line": self.line,
             "source": self.source,
@@ -199,12 +207,12 @@ class JSIntel:
     def secrets(self, value: List[SecretHit]) -> None:
         self.exposures = list(value or ())
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, *, reveal: bool = False) -> Dict[str, Any]:
         return {
             "url": self.url,
             "endpoints": list(self.endpoints),
             "parameters": list(self.parameters),
-            "secrets": [hit.to_dict() for hit in self.exposures],
+            "secrets": [hit.to_dict(reveal=reveal) for hit in self.exposures],
             "graphql": list(self.graphql),
             "websockets": list(self.websockets),
             "sourcemaps": list(self.sourcemaps),
@@ -480,19 +488,19 @@ def analyze_javascript_intel(
 
 
 __all__ = [
-    "SecretHit",
     "JSIntel",
+    "SecretHit",
     "analyze_javascript_intel",
-    "extract_endpoints",
-    "extract_parameters",
-    "extract_secrets",
-    "extract_graphql",
-    "extract_websockets",
-    "extract_sourcemaps",
-    "extract_chunks",
-    "sources_from_sourcemap",
-    "extract_script_urls",
-    "extract_inline_scripts",
-    "extract_html_parameters",
     "extract_attr_urls",
+    "extract_chunks",
+    "extract_endpoints",
+    "extract_graphql",
+    "extract_html_parameters",
+    "extract_inline_scripts",
+    "extract_parameters",
+    "extract_script_urls",
+    "extract_secrets",
+    "extract_sourcemaps",
+    "extract_websockets",
+    "sources_from_sourcemap",
 ]

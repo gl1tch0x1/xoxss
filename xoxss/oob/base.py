@@ -308,10 +308,10 @@ def parse_generic_payload(text: str, known: Optional[Iterable[str]] = None) -> L
 
 
 __all__ = [
-    "OOBHit",
     "MarkerRegistration",
-    "OOBSource",
+    "OOBHit",
     "OOBManager",
+    "OOBSource",
     "extract_marker",
     "parse_generic_payload",
 ]

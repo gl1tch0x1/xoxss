@@ -273,7 +273,7 @@ def check_vulnerable_libs(script_url: str, script_content: str = "") -> List[Vul
     for lib_name, version in libs_to_check:
         lib_lower = lib_name.lower()
         if lib_lower in VULNERABLE_LIBS:
-            for base_ver, (min_ver, max_ver, cve, severity) in VULNERABLE_LIBS[lib_lower].items():
+            for _base_ver, (min_ver, max_ver, cve, severity) in VULNERABLE_LIBS[lib_lower].items():
                 if version_in_range(version, min_ver, max_ver):
                     vulnerabilities.append(
                         VulnerableLib(
@@ -460,22 +460,22 @@ def build_poc(point: InjectionPoint, payload: str) -> Tuple[str, str]:
 
 
 __all__ = [
+    "JS_ENDPOINT_PATTERNS",
+    "VULNERABLE_LIBS",
     "FormField",
     "InjectionPoint",
     "VulnerableLib",
     "WAFReport",
-    "VULNERABLE_LIBS",
-    "JS_ENDPOINT_PATTERNS",
-    "parse_version",
-    "version_in_range",
-    "extract_lib_version_from_filename",
-    "extract_lib_version_from_content",
+    "build_form_html_poc",
+    "build_poc",
     "check_vulnerable_libs",
     "default_field_value",
     "endpoint_accepts_query_params",
-    "replace_query_param",
-    "merge_query",
     "extract_endpoints_from_text",
-    "build_form_html_poc",
-    "build_poc",
+    "extract_lib_version_from_content",
+    "extract_lib_version_from_filename",
+    "merge_query",
+    "parse_version",
+    "replace_query_param",
+    "version_in_range",
 ]

@@ -461,6 +461,7 @@ class PayloadEngine:
             for context, values in self.payloads.items()
             for payload in values
         }
+        self._total_pool_size: int = len(self._seen)
         if catalog_payloads:
             for context in self.payloads:
                 pool = catalog_by_context(context, auto_only=True, fallback=False)
@@ -481,6 +482,11 @@ class PayloadEngine:
             self._load_file(path, remote=True, quiet=True)
         if lazy_payloads:
             self._load_lazy_corpus()
+
+    @property
+    def total_pool_size(self) -> int:
+        """Return the total number of unique payloads available across all contexts."""
+        return self._total_pool_size
 
     def clone(self) -> "PayloadEngine":
         """Copy the engine so a target can register payloads in isolation.
@@ -822,24 +828,24 @@ class PayloadEngine:
 
 
 __all__ = [
-    "PAYLOAD_SOURCES",
+    "DEFAULT_PAYLOADS",
+    "FUZZ_PARAM_NAMES",
+    "LAZY_PAYLOAD_FILE",
     "MAX_PAYLOAD_BYTES",
     "MAX_REMOTE_PAYLOADS",
-    "PAYLOAD_CACHE_TTL",
-    "PAYLOAD_CACHE_MAX_BYTES",
     "PAYLOAD_CACHE_DIRNAME",
-    "FUZZ_PARAM_NAMES",
-    "DEFAULT_PAYLOADS",
+    "PAYLOAD_CACHE_MAX_BYTES",
+    "PAYLOAD_CACHE_TTL",
+    "PAYLOAD_SOURCES",
+    "PayloadEngine",
     "_plausible_remote_payload",
     "classify_remote_payload",
+    "cleanup_payload_lists",
+    "download_payload_lists",
     "embed_marker",
-    "payload_workdir",
     "payload_cache_path",
+    "payload_workdir",
     "read_payload_cache",
     "write_payload_cache",
-    "download_payload_lists",
-    "cleanup_payload_lists",
-    "LAZY_PAYLOAD_FILE",
-    "PayloadEngine",
 ]
 

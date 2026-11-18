@@ -73,6 +73,7 @@ def run_case(
     browser: str,
     timeout: int,
 ) -> Dict[str, Any]:
+    started = time.monotonic()
     report_dir = Path(tempfile.mkdtemp(prefix=f"xoxss-bench-{case['id']}-"))
     command = [
         sys.executable,
@@ -114,30 +115,147 @@ def run_case(
         )
     except subprocess.TimeoutExpired:
         shutil.rmtree(report_dir, ignore_errors=True)
-        return {"case": case["id"], "status": "timeout", "expected": case.get("expect")}
+        return {
+            "case": case["id"],
+            "status": "timeout",
+            "expected": case.get("expect"),
+            "outcome": "inconclusive",
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "requests": None,
+            "payloads": None,
+            "http_errors": None,
+            "browser_checks": None,
+            "coverage_notes": ["Scanner process exceeded the per-case timeout"],
+        }
     report = latest_report(report_dir)
     findings: List[Dict[str, Any]] = []
+    payload: Dict[str, Any] = {}
     if report is not None:
         try:
-            payload = json.loads(report.read_text(encoding="utf-8"))
-            findings = list(payload.get("findings") or [])
-        except (OSError, ValueError):
-            findings = []
+            decoded = json.loads(report.read_text(encoding="utf-8"))
+            if not isinstance(decoded, dict):
+                raise ValueError("JSON report root must be an object")
+            payload = decoded
+            report_findings = payload.get("findings") or []
+            if not isinstance(report_findings, list):
+                raise ValueError("JSON report findings must be an array")
+            if any(not isinstance(item, dict) for item in report_findings):
+                raise ValueError("JSON report findings must contain objects")
+            findings = report_findings
+        except (OSError, ValueError) as exc:
+            shutil.rmtree(report_dir, ignore_errors=True)
+            return {
+                "case": case["id"],
+                "status": "error",
+                "expected": case.get("expect"),
+                "outcome": "inconclusive",
+                "duration_seconds": round(time.monotonic() - started, 2),
+                "requests": None,
+                "payloads": None,
+                "http_errors": None,
+                "browser_checks": None,
+                "coverage_notes": [f"Could not read scanner report: {exc}"],
+            }
+    if report is None:
+        shutil.rmtree(report_dir, ignore_errors=True)
+        return {
+            "case": case["id"],
+            "status": "error",
+            "expected": case.get("expect"),
+            "outcome": "inconclusive",
+            "duration_seconds": round(time.monotonic() - started, 2),
+            "requests": None,
+            "payloads": None,
+            "http_errors": None,
+            "browser_checks": None,
+            "coverage_notes": ["Scanner did not produce a JSON report"],
+            "exit": completed.returncode,
+            "stderr": completed.stderr[-1200:],
+        }
     confidence = strongest(findings)
+    confidence_counts: Dict[str, int] = {}
+    for finding in findings:
+        grade = str(finding.get("confidence") or "low")
+        confidence_counts[grade] = confidence_counts.get(grade, 0) + 1
     expected = str(case.get("expect") or "finding")
-    ok = (confidence in STRONG) if expected == "finding" else (confidence not in STRONG)
+    outcome = "finding" if confidence in STRONG else "none"
+    ok = outcome == expected
+    stats = payload.get("stats") or {}
+    verification = payload.get("verification") or {}
+    if not isinstance(stats, dict):
+        stats = {}
+    if not isinstance(verification, dict):
+        verification = {}
     result = {
         "case": case["id"],
         "status": "pass" if ok else "fail",
         "expected": expected,
+        "outcome": outcome,
         "confidence": confidence,
+        "confidence_counts": confidence_counts,
         "findings": len(findings),
         "kinds": sorted({str(item.get("kind") or "") for item in findings}),
+        "duration_seconds": round(time.monotonic() - started, 2),
+        "requests": stats.get("requests"),
+        "payloads": stats.get("payloads"),
+        "http_errors": verification.get("http_errors", stats.get("errors")),
+        "browser_checks": verification.get("browser_checks", stats.get("browser_checks")),
+        "coverage_notes": payload.get("coverage_notes") or [],
         "exit": completed.returncode,
         "stderr": completed.stderr[-1200:] if not ok else "",
     }
     shutil.rmtree(report_dir, ignore_errors=True)
     return result
+
+
+def summarize_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    for result in results:
+        expected = result.get("expected")
+        outcome = result.get("outcome")
+        if expected not in ("finding", "none") or outcome not in ("finding", "none"):
+            continue
+        if expected == "finding":
+            counts["tp" if outcome == "finding" else "fn"] += 1
+        else:
+            counts["fp" if outcome == "finding" else "tn"] += 1
+
+    def ratio(numerator: int, denominator: int) -> Optional[float]:
+        return round(numerator / denominator, 4) if denominator else None
+
+    measured = sum(counts.values())
+    return {
+        "measured_cases": measured,
+        "inconclusive_cases": len(results) - measured,
+        **counts,
+        "precision": ratio(counts["tp"], counts["tp"] + counts["fp"]),
+        "recall": ratio(counts["tp"], counts["tp"] + counts["fn"]),
+        "specificity": ratio(counts["tn"], counts["tn"] + counts["fp"]),
+        "false_positive_rate": ratio(counts["fp"], counts["fp"] + counts["tn"]),
+        "duration_seconds": round(
+            sum(float(result.get("duration_seconds") or 0) for result in results), 2
+        ),
+        "requests": sum(
+            int(result["requests"])
+            for result in results
+            if isinstance(result.get("requests"), (int, float))
+        ),
+        "payloads": sum(
+            int(result["payloads"])
+            for result in results
+            if isinstance(result.get("payloads"), (int, float))
+        ),
+        "http_errors": sum(
+            int(result["http_errors"])
+            for result in results
+            if isinstance(result.get("http_errors"), (int, float))
+        ),
+        "browser_checks": sum(
+            int(result["browser_checks"])
+            for result in results
+            if isinstance(result.get("browser_checks"), (int, float))
+        ),
+    }
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -198,9 +316,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(
             f"[{marker}] {result['case']:<28} expected={result['expected']:<7} "
             f"confidence={result.get('confidence', 'n/a'):<9} "
-            f"findings={result.get('findings', 0)}"
+            f"findings={result.get('findings', 0)} "
+            f"requests={result.get('requests', 'n/a')} "
+            f"payloads={result.get('payloads', 'n/a')} "
+            f"seconds={result.get('duration_seconds', 'n/a')}"
         )
     print(f"\n{len(results) - len(failed)}/{len(results)} case(s) passed")
+    summary = summarize_results(results)
+    print(
+        "Measured: "
+        f"TP={summary['tp']} FP={summary['fp']} FN={summary['fn']} TN={summary['tn']} "
+        f"inconclusive={summary['inconclusive_cases']} "
+        f"precision={summary['precision']} recall={summary['recall']} "
+        f"specificity={summary['specificity']} "
+        f"FPR={summary['false_positive_rate']}"
+    )
+    print(
+        f"Totals: {summary['requests']} HTTP requests, {summary['payloads']} payloads, "
+        f"{summary['http_errors']} HTTP errors, {summary['browser_checks']} browser checks, "
+        f"{summary['duration_seconds']} seconds"
+    )
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(results, indent=2), encoding="utf-8")
     return 1 if failed else 0

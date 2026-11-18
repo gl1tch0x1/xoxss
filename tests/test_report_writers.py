@@ -184,6 +184,15 @@ def test_json_report_records_partial_coverage_notes() -> None:
     assert "no browser worker" in notes
 
 
+def test_json_report_records_browser_scope_blocks() -> None:
+    scanner = StubScanner()
+    scanner.pool.engines = [SimpleNamespace(scope_blocked_requests=2)]
+    document = report_payload(scanner)  # type: ignore[arg-type]
+
+    assert document["verification"]["scope_blocked_requests"] == 2
+    assert "2 browser request(s) to out-of-scope URLs were blocked" in document["coverage_notes"]
+
+
 def test_json_report_serialises_but_does_not_escape() -> None:
     # JSON is a data format: the payload stays literal so tooling can replay it.
     document = report_payload(StubScanner())  # type: ignore[arg-type]

@@ -12,7 +12,10 @@ if TYPE_CHECKING:
     from xoxss.scanner import XSSScanner
 
 
-def write_markdown_report(path: Path, scanner: XSSScanner) -> None:
+def write_markdown_report(path: Path, scanner: XSSScanner) -> None:  # noqa: C901
+    # Report rendering is a flat sequence of optional sections; the branch
+    # count is inherent to the report schema rather than tangled logic.
+    # Tracked for section-helper extraction with the other report writers.
     data = report_payload(scanner)
     lines = [
         f"# {APP_NAME} scan report",

@@ -541,11 +541,11 @@ class CSPBypassAutomator:
 
 
 __all__ = [
-    "CSPSeverity",
-    "CSPDirective",
-    "CSPIssue",
-    "CSPBypass",
     "CSPAnalysis",
     "CSPAnalyzer",
+    "CSPBypass",
     "CSPBypassAutomator",
+    "CSPDirective",
+    "CSPIssue",
+    "CSPSeverity",
 ]

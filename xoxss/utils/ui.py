@@ -23,8 +23,18 @@ from typing import Iterable, List, Optional, Sequence
 from xoxss.utils.helpers import strip_ansi
 
 __all__ = [
-    "enabled", "disable", "enable_for", "paint", "rule", "panel", "bar",
-    "glyphs", "SPINNER", "paint_ramp", "strip_ansi", "safe_width",
+    "SPINNER",
+    "bar",
+    "disable",
+    "enable_for",
+    "enabled",
+    "glyphs",
+    "paint",
+    "paint_ramp",
+    "panel",
+    "rule",
+    "safe_width",
+    "strip_ansi",
 ]
 
 #--------------------------------------------------------------------------------------

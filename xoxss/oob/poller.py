@@ -11,8 +11,9 @@ or plain-text file (handy for a local collector or interactsh-client's output).
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from xoxss.oob.base import OOBHit, OOBSource, parse_generic_payload
@@ -104,27 +105,39 @@ class FilePoller(OOBSource):
 
     async def poll(self) -> List[OOBHit]:
         path = Path(self.path)
-        if not path.exists():
+        result = await asyncio.to_thread(self._read_new, path)
+        if result is None:
             return []
+        chunk, offset, inode = result
+        self._offset = offset
+        self._inode = inode
+        if not chunk:
+            return []
+        return parse_generic_payload(chunk)
+
+    def _read_new(self, path: Path) -> Optional[Tuple[str, int, int]]:
+        if not path.exists():
+            return None
         try:
             stat = path.stat()
         except OSError:
-            return []
-        if self._inode is not None and self._inode != getattr(stat, "st_ino", 0):
-            self._offset = 0
-        self._inode = getattr(stat, "st_ino", 0)
-        if stat.st_size < self._offset:
-            self._offset = 0
-        if stat.st_size == self._offset:
-            return []
+            return None
+        inode = getattr(stat, "st_ino", 0)
+        offset = self._offset
+        if self._inode is not None and self._inode != inode:
+            offset = 0
+        if stat.st_size < offset:
+            offset = 0
+        if stat.st_size == offset:
+            return "", offset, inode
         try:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
-                handle.seek(self._offset)
+                handle.seek(offset)
                 chunk = handle.read()
-                self._offset = handle.tell()
+                offset = handle.tell()
         except OSError:
-            return []
-        return parse_generic_payload(chunk)
+            return None
+        return chunk, offset, inode
 
 
 __all__ = ["CallbackPoller", "FilePoller"]

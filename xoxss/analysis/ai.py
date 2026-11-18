@@ -369,11 +369,11 @@ class AIAnalyzer:
 
 
 __all__ = [
-    "AIAnalyzer",
-    "AIResponse",
     "DEFAULT_AI_ENDPOINT",
     "DEFAULT_AI_MODEL",
     "ENV_KEYS",
+    "AIAnalyzer",
+    "AIResponse",
     "build_system_prompt",
     "build_user_prompt",
     "parse_ai_response",

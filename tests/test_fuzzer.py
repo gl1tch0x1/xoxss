@@ -102,7 +102,7 @@ def test_real_pages_are_kept_and_recursion_reaches_children() -> None:
 def test_recursion_stops_at_max_depth() -> None:
     def handler(url: str) -> FakeResponse:
         path = urlsplit(url).path
-        if path.startswith("/a"):
+        if path in {"/a", "/a/a"}:
             return FakeResponse(200, "<h1>Directory</h1><a href='/x'>menu</a>", url)
         return FakeResponse(404, "Not found", url)
 

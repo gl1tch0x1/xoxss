@@ -27,14 +27,19 @@ class Scope:
         allow_subdomains: bool = False,
         include: Optional[Sequence[str]] = None,
         exclude: Optional[Sequence[str]] = None,
+        allow_scheme_downgrade: bool = False,
     ) -> None:
         parts = urlsplit(base_url)
+        self.scheme = (parts.scheme or "https").lower()
         self.host = self._canonical_host(parts.hostname or "")
         try:
             self.base_port = parts.port
         except ValueError:
             self.base_port = -1
         self.allow_subdomains = allow_subdomains
+        # Downgrading an https target to cleartext is never necessary for XSS
+        # testing and leaks cookies/Authorization headers.  Keep it opt-in.
+        self.allow_scheme_downgrade = allow_scheme_downgrade
         self.include: List[re.Pattern] = [re.compile(pattern, re.I) for pattern in (include or [])]
         self.exclude: List[re.Pattern] = [re.compile(pattern, re.I) for pattern in (exclude or [])]
 
@@ -45,6 +50,14 @@ class Scope:
         except (UnicodeError, AttributeError):
             return ""
 
+    @property
+    def origin(self) -> str:
+        """Return the canonical ``scheme://host[:port]`` anchor for credentials."""
+        default_port = 443 if self.scheme == "https" else 80
+        if self.base_port and self.base_port != default_port:
+            return f"{self.scheme}://{self.host}:{self.base_port}"
+        return f"{self.scheme}://{self.host}"
+
     def in_scope(self, url: str) -> bool:
         """Return True if url falls within the configured target scope."""
         try:
@@ -52,6 +65,12 @@ class Scope:
         except ValueError:
             return False
         if parts.scheme not in ("http", "https"):
+            return False
+        if (
+            self.scheme == "https"
+            and parts.scheme == "http"
+            and not self.allow_scheme_downgrade
+        ):
             return False
         if parts.username is not None or parts.password is not None or self.base_port == -1:
             return False
@@ -80,9 +99,9 @@ class Scope:
 
 __all__ = [
     "Scope",
-    "normalize_url",
-    "normalize_scan_url",
     "looks_like_dangerous",
     "looks_like_page",
+    "normalize_scan_url",
+    "normalize_url",
 ]
 

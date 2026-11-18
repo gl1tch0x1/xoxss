@@ -190,7 +190,7 @@ except Exception as _hybrid_exc:  # pragma: no cover
     OracleVerdict = None  # type: ignore
 
 
-from xoxss.reports.sarif import (  # noqa: E402
+from xoxss.reports.sarif import (
     build_sarif_document,
 )
 from xoxss.reports.html import write_html_report
@@ -227,7 +227,6 @@ except Exception:  # pragma: no cover - optional integration edge case
     resolve_ai_model = lambda *args, **kwargs: ""  # type: ignore  # noqa: E731
 from xoxss.core.evidence import (
     canonical_finding_url,
-    parse_curl_request,
     parse_oob_context,
     request_to_dict,
     response_excerpt,
@@ -293,8 +292,11 @@ from xoxss.utils.console import (
     truncate,
     unique_token,
 )
-from xoxss.core.http import HttpEngine, HttpResponse, USER_AGENT
+from xoxss.core.http import HttpEngine, HttpResponse, SENSITIVE_HEADERS, USER_AGENT
 from xoxss.core.state import StateStore
+# Re-exported for ``xoxss.app`` and the CLI; the implementation lives in
+# :mod:`xoxss.replay` so this 6k-line module stays focused on scanning.
+from xoxss.replay import load_replay_finding, run_replay  # noqa: F401
 from xoxss.cli import build_parser as _build_cli_parser
 from xoxss.analysis.mutation_probe import (
     MutationObservation,
@@ -523,6 +525,9 @@ class XSSScanner(CrawlerMixin):
             allow_subdomains=getattr(args, "allow_subdomains", False),
             include=getattr(args, "include", None),
             exclude=getattr(args, "exclude", None),
+            allow_scheme_downgrade=bool(
+                getattr(args, "allow_scheme_downgrade", False)
+            ),
         )
         # Subdomain/external recon is only useful when sibling hosts are in
         # scope; widen the base host to the registrable domain in that mode.
@@ -535,6 +540,25 @@ class XSSScanner(CrawlerMixin):
             if base_domain:
                 self.scope.host = base_domain
                 self.scope.allow_subdomains = True
+        credential_inputs = [
+            str(value)
+            for value in (getattr(args, "headers", None) or [])
+        ]
+        has_credentials = bool(
+            getattr(args, "cookies", None)
+            or getattr(args, "cookie_file", None)
+            or getattr(args, "auth_state", None)
+        ) or any(
+            value.split(":", 1)[0].strip().lower() in SENSITIVE_HEADERS
+            for value in credential_inputs
+            if ":" in value
+        )
+        if has_credentials and (self.scope.allow_subdomains or getattr(args, "subdomains", False)):
+            self.console.warn(
+                f"Credentials are pinned to {self.scope.origin}; sibling hosts in scope "
+                "will be scanned without them",
+                important=False,
+            )
         self.state = StateStore(self.target, args.state_dir, enabled=not args.no_state, console=console)
         # A corpus can hold thousands of entries; when several targets are scanned
         # in one run, parse it once and share the read-only engine.
@@ -549,12 +573,14 @@ class XSSScanner(CrawlerMixin):
                 catalog_payloads=getattr(args, "payload_catalog", True),
             )
             try:
-                setattr(args, "_payload_engine", cached_payloads)
+                args._payload_engine = cached_payloads
             except Exception:
                 pass
         # Framework bypasses are registered per target; fork the cached engine
         # so one target's registrations never leak into the next target's pool.
         self.payloads = cached_payloads.clone()
+        self.stats.payload_pool = cached_payloads.total_pool_size
+        self.stats.payload_pool = cached_payloads.total_pool_size
         
         # Framework bypass detector
         self.framework_exploiter: Optional[Any] = None
@@ -581,6 +607,7 @@ class XSSScanner(CrawlerMixin):
             auth_state=getattr(args, "auth_state", None),
             http2=getattr(args, "http2", False),
             impersonate=getattr(args, "impersonate", None),
+            auth_origin=self.target,
         )
         
         # Enable smart rate limiting if requested
@@ -2182,6 +2209,110 @@ class XSSScanner(CrawlerMixin):
 
         await asyncio.gather(*(worker() for _ in range(min(max(1, self.args.threads), len(urls)))))
 
+    async def _run_advanced_prepass(self, url: str) -> None:
+        """Run the optional per-URL analyzers that must precede injection.
+
+        These analyzers share one property: they inspect the landing page for
+        sinks that are not reachable through parameter reflection (JSONP
+        callbacks, CSP/CORS policy, GraphQL, RPC routes).  Keeping them in a
+        dedicated method gives ``scan_url`` a readable injection flow.
+        """
+        if not HAS_ADVANCED:
+            return
+        if getattr(self.args, "jsonp", False):
+            await self._test_jsonp(url)
+        # CSP analysis also runs the Trusted Types audit.
+        if getattr(self.args, "csp_analyze", False):
+            await self._analyze_csp(url)
+        if getattr(self.args, "cors_analyze", False):
+            await self._analyze_cors(url)
+
+        if getattr(self.args, "graphql", False):
+            cached = await self.fetch_page(url, cache=True)
+            if not cached.error and cached.text:
+                self._analyze_graphql(
+                    url, cached.text, cached.header("content-type", "")
+                )
+
+        if getattr(self.args, "graphql_xss", False) and self.graphql_xss:
+            cached_page = await self.fetch_page(url, cache=True)
+            if (
+                not cached_page.error
+                and cached_page.text
+                and self.graphql_xss.detect_graphql_endpoint(cached_page.text)
+            ):
+                marker = unique_token("graphql", 10)
+                vectors = self.graphql_xss.generate_xss_vectors([], marker)
+                self.console.info(
+                    f"GraphQL XSS: {len(vectors)} vectors detected for {url}"
+                )
+
+        if getattr(self.args, "csp_bypass", False) and self.csp_bypass:
+            await self._report_csp_bypasses(url)
+
+        if getattr(self.args, "proto_pollution", False):
+            await self.test_proto_pollution(url)
+
+        if getattr(self.args, "spa_crawl", False):
+            await self._crawl_spa_routes(url)
+
+    async def _report_csp_bypasses(self, url: str) -> None:
+        bypass = self.csp_bypass
+        if bypass is None:
+            return
+        csp_header = ""
+        try:
+            csp_response = await self.http.get(url, cache=True)
+            if not csp_response.error:
+                csp_header = csp_response.header("content-security-policy", "")
+        except Exception:
+            return
+        if not csp_header:
+            return
+        csp_dict = bypass.parse_csp(csp_header)
+        weaknesses = bypass.analyze_weaknesses(csp_dict)
+        if not weaknesses:
+            return
+        self.console.info(
+            f"CSP: {len(weaknesses)} weakness(es) detected for {url}"
+        )
+        bypasses = bypass.get_applicable_bypasses(
+            csp_dict, unique_token("csp", 8)
+        )
+        if bypasses:
+            self.console.info(
+                f"CSP: {len(bypasses)} bypass technique(s) applicable"
+            )
+
+    async def _crawl_spa_routes(self, url: str) -> None:
+        from xoxss.crawler.spa import SPACrawler
+
+        try:
+            spa_crawler = SPACrawler()
+            page_content = ""
+            try:
+                cached_page = await self.fetch_page(url, cache=True)
+                if not cached_page.error and cached_page.text:
+                    page_content = cached_page.text
+            except Exception:
+                pass
+            routes = spa_crawler.discover_routes(page_content)
+            if not routes:
+                return
+            self.console.info(f"SPA: {len(routes)} route(s) discovered for {url}")
+            for route in routes:
+                if route.router_type == "none":
+                    continue
+                test_url = (
+                    f"{url}#{route.path}"
+                    if route.router_type.value == "hash_router"
+                    else f"{url}/{route.path}"
+                )
+                if not self.state.is_scanned(test_url):
+                    await self.scan_url(test_url)
+        except Exception as exc:
+            self.console.debug(f"SPA crawling failed: {exc}")
+
     async def scan_url(self, url: str) -> None:
         if self._stop.is_set():
             return
@@ -2202,76 +2333,7 @@ class XSSScanner(CrawlerMixin):
             if self.access_bypass is not None:
                 await self.fetch_page(url, cache=True)
 
-            # Advanced: JSONP detection
-            if HAS_ADVANCED and getattr(self.args, 'jsonp', False):
-                await self._test_jsonp(url)
-            
-            # Advanced: CSP analysis (also runs the Trusted Types audit)
-            if HAS_ADVANCED and getattr(self.args, 'csp_analyze', False):
-                await self._analyze_csp(url)
-
-            # Advanced: CORS analysis
-            if HAS_ADVANCED and getattr(self.args, 'cors_analyze', False):
-                await self._analyze_cors(url)
-            
-            # Advanced: GraphQL endpoint detection (uses the cached page when possible)
-            if HAS_ADVANCED and getattr(self.args, 'graphql', False):
-                cached = await self.fetch_page(url, cache=True)
-                if not cached.error and cached.text:
-                    self._analyze_graphql(url, cached.text, cached.header("content-type", ""))
-
-            # Advanced: GraphQL XSS testing
-            if HAS_ADVANCED and getattr(self.args, 'graphql_xss', False) and self.graphql_xss:
-                cached_page = await self.fetch_page(url, cache=True)
-                if not cached_page.error and cached_page.text:
-                    if self.graphql_xss.detect_graphql_endpoint(cached_page.text):
-                        marker = unique_token("graphql", 10)
-                        vectors = self.graphql_xss.generate_xss_vectors([], marker)
-                        self.console.info(f"GraphQL XSS: {len(vectors)} vectors detected for {url}")
-
-            # Advanced: CSP bypass testing
-            if HAS_ADVANCED and getattr(self.args, 'csp_bypass', False) and self.csp_bypass:
-                csp_header = None
-                try:
-                    csp_response = await self.http.get(url, cache=True)
-                    if not csp_response.error:
-                        csp_header = csp_response.header("content-security-policy", "")
-                except Exception:
-                    pass
-                if csp_header:
-                    csp_dict = self.csp_bypass.parse_csp(csp_header)
-                    weaknesses = self.csp_bypass.analyze_weaknesses(csp_dict)
-                    if weaknesses:
-                        self.console.info(f"CSP: {len(weaknesses)} weakness(es) detected for {url}")
-                        bypasses = self.csp_bypass.get_applicable_bypasses(csp_dict, unique_token("csp", 8))
-                        if bypasses:
-                            self.console.info(f"CSP: {len(bypasses)} bypass technique(s) applicable")
-
-            if HAS_ADVANCED and getattr(self.args, "proto_pollution", False):
-                await self.test_proto_pollution(url)
-
-            # Advanced: SPA-aware crawling
-            if HAS_ADVANCED and getattr(self.args, 'spa_crawl', False):
-                from xoxss.crawler.spa import SPACrawler
-                try:
-                    spa_crawler = SPACrawler()
-                    page_content = ""
-                    try:
-                        cached_page = await self.fetch_page(url, cache=True)
-                        if not cached_page.error and cached_page.text:
-                            page_content = cached_page.text
-                    except Exception:
-                        pass
-                    routes = spa_crawler.discover_routes(page_content)
-                    if routes:
-                        self.console.info(f"SPA: {len(routes)} route(s) discovered for {url}")
-                        for route in routes:
-                            if route.router_type != "none":
-                                test_url = f"{url}#{route.path}" if route.router_type.value == "hash_router" else f"{url}/{route.path}"
-                                if not self.state.is_scanned(test_url):
-                                    await self.scan_url(test_url)
-                except Exception as exc:
-                    self.console.debug(f"SPA crawling failed: {exc}")
+            await self._run_advanced_prepass(url)
 
             points = await self.discover_points(url)
             self.console.debug(f"{len(points)} injection point(s) on {url}")
@@ -4927,6 +4989,7 @@ class XSSScanner(CrawlerMixin):
                 f"{total}" + (f"  [{tally}]" if tally else ""),
                 finding_style,
             ),
+            ("PAYLOADS TESTED", f"{stats.payloads} / {stats.payload_pool or 'unknown'}", ""),
         ]
         header_width = max(len(label) for label, _, _ in header)
         for label, value, style in header:
@@ -4942,6 +5005,7 @@ class XSSScanner(CrawlerMixin):
             ("Endpoints", str(len(self.endpoints))),
             ("Subdomains", str(stats.subdomains)),
             ("Passive URLs", str(stats.passive_urls)),
+            ("Fuzz hits / params", f"{stats.fuzzed_paths} / {stats.discovered_params}"),
             ("JS files / secrets", f"{stats.js_files} / {stats.js_exposures}"),
             (
                 "Access bypasses",
@@ -4954,6 +5018,7 @@ class XSSScanner(CrawlerMixin):
             ("Payloads sent", str(stats.payloads)),
             ("HTTP requests", str(stats.requests)),
             ("HTTP errors", str(stats.errors)),
+            ("Redirects blocked", str(stats.redirects_blocked)),
             ("Truncated responses", str(stats.truncated_responses)),
             ("Browser checks", str(stats.browser_checks)),
             ("WAF", self.waf.label()),
@@ -4979,7 +5044,7 @@ class XSSScanner(CrawlerMixin):
         def value_style(label: str, value: str) -> str:
             if label == "WAF" and not waf_clear:
                 return bcolors.WARNING
-            if label in ("HTTP errors", "Truncated responses") and value not in ("0", ""):
+            if label in ("HTTP errors", "Truncated responses", "Redirects blocked") and value not in ("0", ""):
                 return bcolors.WARNING
             if (
                 label in ("Vulnerable libs", "External findings", "JSONP findings")
@@ -5313,6 +5378,9 @@ def apply_god_preset(
         args.discover = True
     args.discover_paths = True
     args.fuzz_paths = True
+    args.fuzz = True
+    bump("fuzz_targets", 16, "--fuzz-targets")
+    bump("fuzz_words", 200, "--fuzz-words")
     if unclaimed("--no-fuzz-params"):
         args.fuzz_params = True
     bump("fuzz_param_limit", 25, "--fuzz-param-limit")
@@ -5757,7 +5825,10 @@ async def run_mass(args: argparse.Namespace, console: Console) -> Tuple[int, int
     if jsonl_path:
         try:
             Path(jsonl_path).parent.mkdir(parents=True, exist_ok=True)
-            jsonl_handle = open(jsonl_path, "a", encoding="utf-8")
+            # Findings stream to a local operator file; each append is a
+            # line-buffered write (microseconds on local disk) and awaiting a
+            # worker thread per finding would serialise the scan hot path.
+            jsonl_handle = open(jsonl_path, "a", encoding="utf-8")  # noqa: ASYNC230
         except OSError as exc:
             console.error(f"Cannot write JSONL output {jsonl_path}: {exc}")
             return 1, 0
@@ -5929,11 +6000,15 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
     try:
         if args.param_input:
             try:
-                with open(args.param_input, "r", encoding="utf-8-sig", errors="replace") as handle:
-                    for line in handle:
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            seed_urls.append(line)
+                text = await asyncio.to_thread(
+                    Path(args.param_input).read_text,
+                    encoding="utf-8-sig",
+                    errors="replace",
+                )
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        seed_urls.append(line)
             except OSError as exc:
                 console.error(f"Cannot read --param-input {args.param_input}: {exc}")
                 return 1, 0
@@ -6093,8 +6168,9 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
     if args.param_output:
         output_path = Path(args.param_output)
         try:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(
+            await asyncio.to_thread(output_path.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(
+                output_path.write_text,
                 json.dumps(audit_payload, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
@@ -6105,10 +6181,17 @@ async def run_param_audit(args: argparse.Namespace, console: Console) -> Tuple[i
     if args.jsonl:
         try:
             jsonl_path = Path(args.jsonl)
-            jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(jsonl_path, "a", encoding="utf-8") as handle:
-                for candidate in candidates:
-                    handle.write(json.dumps(candidate.to_dict(), ensure_ascii=False) + "\n")
+            await asyncio.to_thread(jsonl_path.parent.mkdir, parents=True, exist_ok=True)
+            lines = "".join(
+                json.dumps(candidate.to_dict(), ensure_ascii=False) + "\n"
+                for candidate in candidates
+            )
+
+            def append_lines() -> None:
+                with jsonl_path.open("a", encoding="utf-8") as handle:
+                    handle.write(lines)
+
+            await asyncio.to_thread(append_lines)
             console.info(f"Parameter audit JSONL written to {jsonl_path}", important=False)
         except OSError as exc:
             console.warn(f"Cannot write parameter audit JSONL {args.jsonl}: {exc}")
@@ -6154,13 +6237,8 @@ async def run_targets(args: argparse.Namespace, console: Console) -> Tuple[int, 
 
 
 # --------------------------------------------------------------------------------------
-# Replay: re-run one finding from a prior JSON report
+# Preset post-processing
 # --------------------------------------------------------------------------------------
-
-_REPLAY_TOKEN_RE = re.compile(r"[a-z][a-z0-9]{8,}")
-_REPLAY_COMMENT_TOKEN_RE = re.compile(r"/\*\s*([a-z][a-z0-9]{6,})\s*\*/")
-_REPLAY_CHARCODE_RE = re.compile(r"String\.fromCharCode\(\s*([0-9][0-9,\s]*)\)")
-
 
 def resolve_headless(args: argparse.Namespace, explicit_flags: Set[str]) -> None:
     """Pick headless vs headed unless the operator was explicit.
@@ -6205,306 +6283,6 @@ def resolve_headless(args: argparse.Namespace, explicit_flags: Set[str]) -> None
         or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     )
     args.headless = not (sys.stdout.isatty() and not ci and has_display)
-
-
-def _replay_report_path(args: argparse.Namespace) -> Optional[Path]:
-    explicit = getattr(args, "replay_report", None)
-    if explicit:
-        return Path(explicit)
-    report_dir = Path(getattr(args, "report_dir", os.path.join(DEFAULT_STATE_DIR, "reports")))
-    if not report_dir.is_dir():
-        return None
-
-    def _mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
-
-    candidates = sorted(report_dir.glob("*.json"), key=_mtime, reverse=True)
-    return candidates[0] if candidates else None
-
-
-def load_replay_finding(
-    args: argparse.Namespace,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Path], str]:
-    """Return ``(finding, report_path, error)`` for ``--replay``."""
-    path = _replay_report_path(args)
-    if path is None:
-        return None, None, (
-            "no JSON report found; pass --replay-report PATH or write a report with --report json"
-        )
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except OSError as exc:
-        return None, path, f"cannot read {path}: {exc}"
-    except json.JSONDecodeError as exc:
-        return None, path, f"{path} is not valid JSON: {exc}"
-    findings = data.get("findings")
-    if not isinstance(findings, list) or not findings:
-        return None, path, f"{path} contains no findings"
-    wanted = str(getattr(args, "replay", "") or "").strip().lower()
-    if not wanted:
-        return None, path, "--replay requires a finding id (see the report's finding_id column)"
-    fields = set(Finding.__dataclass_fields__)
-    for item in findings:
-        if not isinstance(item, dict):
-            continue
-        identity = str(item.get("finding_id") or "").strip().lower()
-        if not identity:
-            # Reports written before finding IDs were introduced still carry
-            # every field needed to derive the same stable identity.
-            try:
-                derived = Finding(
-                    **{key: value for key, value in item.items() if key in fields}
-                )
-            except Exception:
-                identity = ""
-            else:
-                identity = derived.finding_id.lower()
-        if identity and (identity == wanted or identity.startswith(wanted)):
-            return item, path, ""
-    return None, path, f"no finding matches '{wanted}' in {path.name}"
-
-
-def _replay_request_args(
-    item: Dict[str, Any],
-) -> Tuple[str, str, Dict[str, str], str]:
-    """Recover ``(method, url, headers, body)`` from a report finding."""
-    request_raw = item.get("request")
-    request: Dict[str, Any] = request_raw if isinstance(request_raw, dict) else {}
-    url = str(request.get("url") or "")
-    method = str(request.get("method") or item.get("method") or "GET").upper()
-    headers = {
-        str(name): str(value)
-        for name, value in (request.get("headers") or {}).items()
-    }
-    body = str(request.get("body") or "")
-    if not url:
-        parsed = parse_curl_request(
-            str(item.get("poc_curl") or item.get("poc_command") or "")
-        )
-        if parsed:
-            url = str(parsed.get("url") or "")
-            method = str(parsed.get("method") or method).upper()
-            headers = dict(parsed.get("headers") or {})
-            body = str(parsed.get("body") or "")
-    if not url:
-        url = str(item.get("poc_url") or item.get("url") or "")
-    # Redacted values are placeholders, not credentials: drop them so the
-    # request is not replayed with the literal string "[REDACTED]".
-    headers = {
-        name: value
-        for name, value in headers.items()
-        if value and value != "[REDACTED]"
-    }
-    return method, url, headers, body
-
-
-def _replay_token(payload: str) -> str:
-    """Pick the strongest marker embedded in a payload for browser matching.
-
-    ``js_marker`` writes the marker both as a ``/*token*/`` comment and as a
-    ``String.fromCharCode`` call.  Preferring those forms avoids mistaking an
-    ordinary long word (``javascript``) for the run's unique marker.
-    """
-    text = payload or ""
-    charcode = _REPLAY_CHARCODE_RE.search(text)
-    if charcode:
-        try:
-            decoded = "".join(
-                chr(int(part))
-                for part in charcode.group(1).replace(" ", "").split(",")
-                if part
-            )
-        except (TypeError, ValueError):
-            decoded = ""
-        # ``js_marker`` pushes a unique token; requiring a digit and some
-        # length avoids mistaking a payload gadget (``String.fromCharCode``
-        # for "alert") for the marker.
-        if (
-            len(decoded) >= 8
-            and re.fullmatch(r"[a-z][a-z0-9]+", decoded)
-            and any(char.isdigit() for char in decoded)
-        ):
-            return decoded
-    comment = _REPLAY_COMMENT_TOKEN_RE.search(text)
-    if comment:
-        return comment.group(1)
-    candidates = _REPLAY_TOKEN_RE.findall(text)
-    if candidates:
-        return max(candidates, key=len)
-    return text
-
-
-def _make_replay_browser(args: argparse.Namespace, console: Console) -> Any:
-    use_playwright = (getattr(args, "browser", "") or "").lower() == "playwright" or bool(
-        getattr(args, "auth_state", None)
-    )
-    engine_class = PlaywrightEngine if use_playwright else BrowserEngine
-    return engine_class(
-        console,
-        kind="playwright" if use_playwright else getattr(args, "browser", "firefox"),
-        headless=getattr(args, "headless", True),
-        page_timeout=max(10.0, getattr(args, "timeout", 20.0)),
-        user_agent=getattr(args, "user_agent", None),
-        proxy=getattr(args, "proxy", None),
-        binary=getattr(args, "binary", None),
-        insecure=getattr(args, "insecure", False),
-        auth_state=getattr(args, "auth_state", None),
-    )
-
-
-async def run_replay(args: argparse.Namespace, console: Console) -> int:
-    """Re-run exactly one reported finding: one request + one browser check."""
-    item, report_path, error = load_replay_finding(args)
-    if item is None:
-        console.error(error)
-        return 1
-    method, url, headers, body = _replay_request_args(item)
-    if not url:
-        console.error("The selected finding has no reproducible URL or curl PoC")
-        return 1
-
-    payload = str(item.get("payload") or "")
-    token = _replay_token(payload)
-    user_headers = XSSScanner._parse_headers(getattr(args, "headers", None))
-    user_cookies = XSSScanner._parse_cookies(getattr(args, "cookies", None), getattr(args, "cookie_file", None))
-    headers.update(user_headers)
-
-    console.rule("replay")
-    console.info(f"Report: {report_path}")
-    console.info(f"Finding: {item.get('finding_id', '?')}  {item.get('kind', '')}")
-    console.info(f"Request: {method} {truncate(url, 160)}")
-    if body:
-        console.info(f"Body: {truncate(body, 200)}", important=False)
-
-    stats = ScanStats(urls_total=1)
-    http = HttpEngine(
-        console,
-        stats,
-        headers=user_headers,
-        cookies=user_cookies,
-        timeout=getattr(args, "timeout", 20.0),
-        retries=0,
-        rate=0.0,
-        concurrency=1,
-        proxy=getattr(args, "proxy", None),
-        insecure=getattr(args, "insecure", False),
-        max_response_bytes=getattr(args, "max_response_bytes", 5 * 1024 * 1024),
-        http2=getattr(args, "http2", False),
-        impersonate=getattr(args, "impersonate", None),
-    )
-
-    response: Optional[HttpResponse] = None
-    try:
-        await http.start()
-        data: Any = None
-        json_body: Optional[Dict[str, Any]] = None
-        if method not in ("GET", "HEAD") and body:
-            stripped = body.lstrip()
-            if stripped[:1] in ("{", "["):
-                try:
-                    json_body = json.loads(body)
-                except json.JSONDecodeError:
-                    data = body
-            elif "=" in stripped:
-                data = body
-            else:
-                data = body
-        response = await http.request(
-            method,
-            url,
-            headers=headers or None,
-            data=data,
-            json_body=json_body,
-            allow_redirects=True,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        console.error(f"Replay request failed: {exc}")
-        return 1
-    finally:
-        await http.close()
-
-    if response is None:
-        console.error("Replay produced no response")
-        return 1
-    if response.error:
-        console.error(f"Replay request error: {response.error}")
-        return 1
-
-    reflected = bool(payload) and payload in (response.text or "")
-    info = None
-    if reflected:
-        info = analyze_reflection(
-            response.text, payload, payload, response.header("content-type", "")
-        )
-    executable = bool(info and info.executable)
-
-    browser_executed = False
-    browser_evidence = ""
-    browser_attempted = False
-    if not getattr(args, "no_browser", False) and getattr(args, "confirm", "auto") != "http":
-        browser_attempted = True
-        engine = _make_replay_browser(args, console)
-        try:
-            if await engine.start():
-                try:
-                    if method in ("GET", "HEAD"):
-                        await engine.navigate(url)
-                    else:
-                        await engine.navigate(str(item.get("url") or url))
-                        await engine.submit_form(0, str(item.get("parameter") or ""), payload)
-                    hit = await engine.check_token(token, timeout=3.0)
-                    if hit:
-                        browser_executed = hit.get("executed") == "yes"
-                        browser_evidence = str(hit.get("evidence") or "")
-                        if hit.get("sink"):
-                            browser_evidence = (
-                                f"sink={hit.get('sink')}"
-                                + (f" at {hit.get('dom_path')}" if hit.get("dom_path") else "")
-                                + (f"; {browser_evidence}" if browser_evidence else "")
-                            )
-                finally:
-                    await engine.stop()
-        except Exception as exc:
-            console.debug(f"Replay browser check failed: {exc}")
-    else:
-        console.warn("Browser check skipped (--no-browser/--confirm http); HTTP evidence only")
-
-    confirmed = browser_executed or executable
-    status = {
-        "finding_id": item.get("finding_id", ""),
-        "kind": item.get("kind", ""),
-        "report": str(report_path),
-        "request": {"method": method, "url": url},
-        "response_status": response.status or 0,
-        "reflected": reflected,
-        "executable": executable,
-        "browser_attempted": browser_attempted,
-        "browser_executed": browser_executed,
-        "browser_evidence": browser_evidence,
-        "context": info.context if info else "",
-        "reproduced": confirmed,
-        "confidence": "confirmed" if browser_executed else ("high" if executable else "low"),
-    }
-    console.event("replay_result", **status)
-    console.raw("")
-    console.raw(json.dumps(status, indent=2, ensure_ascii=False))
-    console.raw("")
-    if browser_executed:
-        console.ok("Replay confirmed: the payload executed in the browser")
-        return 0
-    if executable:
-        console.ok("Replay reproduced HTTP-level execution evidence (browser not confirmed)")
-        return 0
-    if reflected:
-        console.warn("Replay reflected the payload, but it is not executable in this context")
-        return 1
-    console.error("Replay did not reproduce the finding")
-    return 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

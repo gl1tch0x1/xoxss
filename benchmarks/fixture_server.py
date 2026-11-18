@@ -46,7 +46,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(raw_path).path
         return path not in ("/forbidden", "/forbidden/search") and "forbidden" in path.lower()
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         parsed = urlsplit(self.path)
         value = parse_qs(parsed.query, keep_blank_values=True).get("q", [""])[0]
         if parsed.path == "/":
@@ -139,7 +139,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.respond("Not found", 404)
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         if urlsplit(self.path).path != "/stored":
             self.respond("Not found", 404)
             return

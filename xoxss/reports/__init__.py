@@ -6,10 +6,10 @@ from xoxss.reports.markdown import write_markdown_report
 from xoxss.reports.sarif import build_sarif_document, write_sarif_file
 
 __all__ = [
+    "build_sarif_document",
     "report_payload",
+    "write_html_report",
     "write_json_report",
     "write_markdown_report",
-    "write_html_report",
-    "build_sarif_document",
     "write_sarif_file",
 ]

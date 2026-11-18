@@ -359,10 +359,10 @@ class GraphQLAnalyzer:
 
 
 __all__ = [
+    "GraphQLAnalyzer",
+    "GraphQLField",
     "GraphQLInjectionType",
     "GraphQLType",
-    "GraphQLField",
-    "GraphQLXSSVector",
     "GraphQLVulnerability",
-    "GraphQLAnalyzer",
+    "GraphQLXSSVector",
 ]

@@ -94,7 +94,7 @@ def _example_for(schema: Dict[str, Any]) -> str:
         return str(schema["example"])
     if "default" in schema:
         return str(schema["default"])
-    if "enum" in schema and schema["enum"]:
+    if schema.get("enum"):
         return str(schema["enum"][0])
     kind = str(schema.get("type") or "string")
     if kind in ("integer", "number"):
@@ -389,9 +389,9 @@ class OpenAPIFinder:
 
 
 __all__ = [
-    "APIParameter",
-    "APIOperation",
     "SPEC_PATHS",
+    "APIOperation",
+    "APIParameter",
     "OpenAPIFinder",
     "parse_openapi",
     "parse_spec_text",

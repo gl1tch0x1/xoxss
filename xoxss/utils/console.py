@@ -420,9 +420,9 @@ def briefing_rows(args: Any, target: str) -> List[Tuple[str, str]]:
 
     pacing = []
     if getattr(args, "threads", None):
-        pacing.append(f"{getattr(args, 'threads')} workers")
+        pacing.append(f"{args.threads} workers")
     if getattr(args, "concurrency", None):
-        pacing.append(f"{getattr(args, 'concurrency')} req")
+        pacing.append(f"{args.concurrency} req")
     if pacing:
         mode += " / " + " / ".join(str(item) for item in pacing)
 
@@ -479,21 +479,21 @@ def briefing_rows(args: Any, target: str) -> List[Tuple[str, str]]:
 
 
 __all__ = [
-    "bcolors",
-    "Console",
     "APP_NAME",
-    "VERSION",
     "CODENAME",
-    "now_iso",
-    "slugify",
-    "truncate",
-    "strip_ansi",
-    "sanitize_text",
+    "VERSION",
+    "Console",
+    "banner",
+    "bcolors",
+    "briefing_rows",
     "fmt_duration",
-    "unique_token",
     "js_marker",
     "mark_ai_payload",
-    "banner",
-    "briefing_rows",
+    "now_iso",
+    "sanitize_text",
+    "slugify",
+    "strip_ansi",
+    "truncate",
+    "unique_token",
 ]
 

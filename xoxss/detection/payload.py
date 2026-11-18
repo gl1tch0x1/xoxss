@@ -38,6 +38,10 @@ class PayloadGenerator:
     """
     Comprehensive XSS payload generator.
     Generates context-aware payloads with various evasion techniques.
+
+    Payload budget reality: the full corpus (LazyXss + SecLists) contains ~7,000
+    payloads, but only `max_payloads` (default 6) are tested per injection point.
+    The ranking prioritizes context-specific vectors over generic ones.
     """
 
     # Basic HTML payloads

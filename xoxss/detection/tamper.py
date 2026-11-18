@@ -99,13 +99,13 @@ __all__ = [
     "TAMPERS",
     "TAMPER_CHAINS",
     "apply_tamper",
-    "tamper_uppercase",
     "tamper_doubleencode",
     "tamper_hexencode",
-    "tamper_urlencode",
-    "tamper_jsonfuzz",
     "tamper_htmlentities",
-    "tamper_spacetab",
     "tamper_jscomment",
+    "tamper_jsonfuzz",
+    "tamper_spacetab",
+    "tamper_uppercase",
+    "tamper_urlencode",
 ]
 

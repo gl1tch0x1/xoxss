@@ -283,11 +283,11 @@ def describe_encoders() -> str:
 
 __all__ = [
     "Encoder",
-    "register_encoder",
-    "get_encoder",
-    "apply_encoder",
     "apply_chain",
-    "list_encoders",
-    "encoder_names",
+    "apply_encoder",
     "describe_encoders",
+    "encoder_names",
+    "get_encoder",
+    "list_encoders",
+    "register_encoder",
 ]

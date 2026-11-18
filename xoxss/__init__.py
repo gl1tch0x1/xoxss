@@ -18,7 +18,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # ``main`` is exposed lazily to keep ``import xoxss`` cheap.
 _SCANNER_EXPORTS = {"main": "xoxss.scanner"}
 
-__all__ = ["main", "__version__"]
+__all__ = ["__version__", "main"]
 
 
 def __getattr__(name: str):

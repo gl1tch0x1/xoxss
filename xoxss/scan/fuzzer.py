@@ -258,10 +258,20 @@ class DirFuzzer:
             source="dir",
         )
 
-    async def discover(self, target: str, *, recursive: bool = False, max_depth: int = 1) -> List[FuzzResult]:
+    async def discover(
+        self,
+        target: str,
+        *,
+        recursive: bool = False,
+        max_depth: int = 1,
+        base_path: str = "",
+    ) -> List[FuzzResult]:
         origin = _origin(target)
         baseline = await self._baseline(origin)
-        queue: List[Tuple[str, int]] = [(origin + "/", 0)]
+        start = origin + "/"
+        if base_path.strip("/"):
+            start = origin + "/" + base_path.strip("/") + "/"
+        queue: List[Tuple[str, int]] = [(start, 0)]
         seen: Set[str] = set()
         probed: Set[str] = set()
         results: List[FuzzResult] = []
@@ -273,8 +283,10 @@ class DirFuzzer:
                 continue
             seen.add(base)
 
-            async def probe(path: str) -> Optional[FuzzResult]:
-                url = urljoin(base, path)
+            async def probe(
+                path: str, base_url: str = base
+            ) -> Optional[FuzzResult]:
+                url = urljoin(base_url, path)
                 if url in probed:
                     return None
                 probed.add(url)
@@ -411,13 +423,13 @@ class ParameterMiner:
 
 
 __all__ = [
-    "FuzzResult",
-    "DiscoveredParameter",
-    "DirFuzzer",
-    "ParameterMiner",
     "DIR_WORDS",
-    "PARAM_WORDS",
     "FUZZ_EXTENSIONS",
-    "load_wordlist",
+    "PARAM_WORDS",
+    "DirFuzzer",
+    "DiscoveredParameter",
+    "FuzzResult",
+    "ParameterMiner",
     "expand_paths",
+    "load_wordlist",
 ]

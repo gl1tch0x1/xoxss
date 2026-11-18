@@ -19,6 +19,7 @@ import re
 import socket
 import string
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import quote
 
@@ -307,11 +308,15 @@ class SubdomainFinder:
         words: List[str] = list(_BUILTIN_WORDS)
         if wordlist:
             try:
-                with open(wordlist, "r", encoding="utf-8-sig", errors="replace") as handle:
-                    for line in handle:
-                        word = line.strip()
-                        if word and not word.startswith("#"):
-                            words.append(word.split(".", 1)[0])
+                text = await asyncio.to_thread(
+                    Path(wordlist).read_text,
+                    encoding="utf-8-sig",
+                    errors="replace",
+                )
+                for line in text.splitlines():
+                    word = line.strip()
+                    if word and not word.startswith("#"):
+                        words.append(word.split(".", 1)[0])
             except OSError as exc:
                 self.console.warn(f"Cannot read subdomain wordlist {wordlist}: {exc}")
         seen: Set[str] = set()
@@ -436,15 +441,15 @@ def builtin_words() -> Tuple[str, ...]:
 
 
 __all__ = [
-    "SubdomainReport",
     "SubdomainFinder",
+    "SubdomainReport",
+    "builtin_words",
     "normalize_host",
-    "root_domain",
-    "parse_crtsh",
     "parse_certspotter",
+    "parse_crtsh",
     "parse_hackertarget",
     "parse_otx",
-    "parse_urlscan",
     "parse_rapiddns",
-    "builtin_words",
+    "parse_urlscan",
+    "root_domain",
 ]

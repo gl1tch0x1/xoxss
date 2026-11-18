@@ -1,4 +1,4 @@
-"""CLI application layer for XOX$$.
+"""CLI application layer for XOXSS.
 
 ``xoxss.scanner`` owns the scanning engine; this module owns the command-line
 entry point: argument parsing, profile/limit normalisation, mode dispatch and
@@ -217,6 +217,11 @@ def _normalize_limits(args: argparse.Namespace, console: Console) -> None:
         args.js_files = 0
     if args.fuzz_param_limit < 1:
         args.fuzz_param_limit = 1
+    if getattr(args, "fuzz", None) is None:
+        args.fuzz = bool(args.crawl)
+    for name in ("fuzz_targets", "fuzz_words", "fuzz_budget", "fuzz_param_targets"):
+        if int(getattr(args, name, 1) or 0) < 1:
+            setattr(args, name, 1)
     if args.subdomain_brute < 0:
         args.subdomain_brute = 0
     if args.oob_interval < 1:
@@ -233,6 +238,9 @@ def _apply_deep_mode(args: argparse.Namespace, explicit_flags: Set[str]) -> None
     args.max_urls = max(args.max_urls, 1500)
     args.discover = True
     args.discover_paths = True
+    args.fuzz = True
+    args.fuzz_targets = max(int(getattr(args, "fuzz_targets", 8) or 8), 12)
+    args.fuzz_words = max(int(getattr(args, "fuzz_words", 100) or 100), 150)
     args.fuzz_params = True
     if "--no-path-xss" not in explicit_flags:
         args.path_xss = True

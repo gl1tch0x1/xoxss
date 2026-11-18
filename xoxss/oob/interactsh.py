@@ -376,8 +376,8 @@ __all__ = [
     "InteractshClient",
     "InteractshConfig",
     "correlation_id",
-    "zbase32",
-    "generate_keypair",
-    "encrypt_message",
     "decrypt_message",
+    "encrypt_message",
+    "generate_keypair",
+    "zbase32",
 ]

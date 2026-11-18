@@ -101,7 +101,10 @@ def _card(label: str, value: Any) -> str:
     return f'<div class="card"><div class="k">{html_lib.escape(str(label))}</div><div class="v">{html_lib.escape(str(value))}</div></div>'
 
 
-def write_html_report(path: Path, scanner: XSSScanner) -> None:
+def write_html_report(path: Path, scanner: XSSScanner) -> None:  # noqa: C901
+    # One optional section per finding class; the complexity is data-driven
+    # report schema, not control flow.  Tracked with the other writers for
+    # section-helper extraction.
     cards = "".join(
         [
             _card("Duration", fmt_duration(scanner.stats.elapsed)),

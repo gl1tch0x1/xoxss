@@ -168,7 +168,7 @@ class DfgSlicer:
         self._link_async_callbacks(nodes_by_var)
 
         # Match sinks and traverse DFG backwards to source
-        for sink_name, pattern, context, needs_string in SINK_PATTERNS:
+        for sink_name, pattern, _context, _needs_string in SINK_PATTERNS:
             for match in re.finditer(pattern, self.code, re.IGNORECASE):
                 rhs = (match.group(1) if match.groups() else "").strip()
                 if not rhs or is_static_or_feature_detection(rhs):
@@ -345,7 +345,7 @@ class DfgSlicer:
                         preceding[-1], nodes_by_var, visited, depth + 1
                     )
                     if src_node:
-                        return [token] + sub_path, src_node, (is_node_async or sub_async)
+                        return [token, *sub_path], src_node, (is_node_async or sub_async)
 
         return [], None, is_node_async
 
