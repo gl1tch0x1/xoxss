@@ -444,6 +444,9 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--fuzz-extensions EXT ...` | Extensions appended during path fuzzing (e.g. `--fuzz-extensions .php .bak`). |
 | `--fuzz-recursive` | Recurse into directory-like hits, bounded by `--crawl-depth`; probes are de-duplicated. |
 | `--mine-params` | Probe high-signal parameter names and keep ones that affect the response. |
+| `--fuzz` / `--no-fuzz` | Post-crawl fuzzing phase seeded from crawl results: directory fuzzing plus hidden-parameter mining (default: on with `--crawl`). |
+| `--fuzz-targets N` / `--fuzz-words N` | Directories fuzzed per crawl (default `8`) and wordlist entries tried per directory (default `100`). |
+| `--fuzz-budget N` / `--fuzz-param-targets N` | Hard request cap for the phase (default `400`) and endpoints mined for hidden parameters (default `25`). |
 | `--external-tools` | Use installed external recon/verification binaries. |
 | `--allow-subdomains` / `--include REGEX` / `--exclude REGEX` | Scope control; subdomains are auto-enabled for recon. |
 
@@ -480,6 +483,9 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--proto-pollution` | Runtime prototype-pollution proof, gadget fingerprinting, gadget URLs. |
 | `--polyglot` | Polyglot payloads for faster coverage. |
 | `--per-char-probe` | Per-character probing for precise context detection. |
+| `--dangling-markup` / `--no-dangling-markup` | Probe for dangling markup injection: an injected tag attribute that swallows following server markup, capturing CSRF tokens and PII (default: on). |
+| `--header-injection` / `--no-header-injection` | Probe query parameters for CRLF injection / HTTP response splitting into `Location`, `Set-Cookie` and other headers (default: on). |
+| `--header-injection-limit N` / `--header-injection-budget N` | Parameters probed per URL (default `12`) and the per-scan request budget (default `150`). |
 | `--ai` / `--ai-only` | Opt-in LLM fallback for contexts the corpus misses. AI output is candidate-only: deterministic reflection with surviving delimiters (and browser execution when available) is still required. `--ai-only` skips the built-in corpus. |
 | `--ai-key KEY` / `--ai-model ID` / `--ai-url URL` / `--ai-timeout S` | Credentials and endpoint override (default: OpenRouter, `deepseek/deepseek-chat`, 60s). The key also reads `XOXSS_AI_KEY`, `OPENROUTER_API_KEY`, `XSSR_AI_KEY` or `.env`. |
 | `--smart-rate` | Adaptive rate limiting instead of a fixed token bucket. |

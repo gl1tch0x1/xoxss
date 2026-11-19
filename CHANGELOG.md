@@ -4,6 +4,41 @@ All notable changes to XOX$$ are documented here.  The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Dangling markup injection detection** (`xoxss/analysis/dangling.py`). A
+  browser-shaped tag/attribute tokenizer walks the injected tag the way an
+  HTML5 parser does (quoted values swallow `>` and `<`; an unclosed quote runs
+  to end of document), then reports how much server-generated markup the
+  attribute captured. Probes point at a same-page `#token` fragment, so a scan
+  never exfiltrates data to a third party; the finding explains how to swap the
+  fragment for an attacker URL. Enabled by default
+  (`--no-dangling-markup` disables), reported as `Dangling Markup Injection`
+  with `HIGH` confidence and a captured-length/preview evidence line.
+- **HTTP response splitting / CRLF header injection probes**
+  (`xoxss/detection/header_injection.py`). Redirect-like parameters are probed
+  first with `\r\n`, bare `\n` and obsolete-fold variants; a finding requires
+  the injected header to be *parsed as a header* by the HTTP client, not merely
+  echoed inside an existing value. `--no-header-injection` disables,
+  `--header-injection-limit` and `--header-injection-budget` bound the work.
+- **CSP3 semantics**: `script-src` falls back to `default-src` correctly,
+  `'strict-dynamic'` with a nonce/hash suppresses the `unsafe-inline` false
+  positive, short nonces are reported as guessable, `base-uri` absence is a
+  `HIGH` issue with a bypass, and `object-src`/`unsafe-eval`/`base-uri` bypass
+  gating is directive-aware. Enforcement and `Content-Security-Policy-Report-Only`
+  policies are both analyzed.
+- **Modern DOM sinks/sources**: `setHTMLUnsafe`, `Element.setHTML`,
+  `parseHTMLUnsafe`, `createContextualFragment`, `parseFromString`,
+  `execCommand('insertHTML')`, `importScripts`, `Worker`, `window.open`,
+  `setAttribute` attribute sinks, plus `URLSearchParams`, `location.ancestorOrigins`,
+  `messageEvent.data`, `caches`, `indexedDB` and `dataset` sources.
+- `tests/test_dangling.py`, `tests/test_header_injection.py`,
+  `tests/test_dom_sinks.py`; CSP tests extended for the new semantics.
+- Stats/summary/report rows: "Dangling markup", "Response splitting" and
+  "Redirects blocked" counters (also serialized through `stats` in JSON).
+
 ## [2.0.1] - 2026-11-16
 
 ### Added

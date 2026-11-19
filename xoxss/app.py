@@ -222,6 +222,10 @@ def _normalize_limits(args: argparse.Namespace, console: Console) -> None:
     for name in ("fuzz_targets", "fuzz_words", "fuzz_budget", "fuzz_param_targets"):
         if int(getattr(args, name, 1) or 0) < 1:
             setattr(args, name, 1)
+    if int(getattr(args, "header_injection_limit", 1) or 0) < 1:
+        args.header_injection_limit = 1
+    if int(getattr(args, "header_injection_budget", 1) or 0) < 1:
+        args.header_injection_budget = 1
     if args.subdomain_brute < 0:
         args.subdomain_brute = 0
     if args.oob_interval < 1:

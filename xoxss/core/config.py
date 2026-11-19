@@ -159,6 +159,10 @@ class ScanConfig:
     param_wordlist: Optional[str] = None
     param_wordlist_limit: int = 50
     dom: bool = True
+    dangling_markup: bool = True
+    header_injection: bool = True
+    header_injection_limit: int = 12
+    header_injection_budget: int = 150
     stored: bool = False
     stored_pages: int = 10
     report_reflections: bool = False

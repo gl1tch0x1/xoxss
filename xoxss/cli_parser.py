@@ -541,6 +541,41 @@ def build_parser(
     advanced.add_argument("--framework-bypass", action="store_true", help="enable framework-specific XSS bypass testing (React, Vue, Angular)")
     advanced.add_argument("--spa-crawl", action="store_true", help="enable SPA-aware hash route navigation and dynamic content discovery")
     advanced.add_argument("--csp-bypass", action="store_true", help="enable automated CSP bypass testing and payload generation")
+    advanced.add_argument(
+        "--dangling-markup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "probe for dangling markup injection (attribute capture) when "
+            "markup delimiters survive (default: on; --no-dangling-markup disables)"
+        ),
+    )
+    advanced.add_argument(
+        "--header-injection",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "probe query parameters for CRLF injection / HTTP response splitting "
+            "(default: on; --no-header-injection disables)"
+        ),
+    )
+    advanced.add_argument(
+        "--header-injection-limit",
+        type=int,
+        default=12,
+        metavar="N",
+        help="maximum query parameters probed for header injection per URL (default: 12)",
+    )
+    advanced.add_argument(
+        "--header-injection-budget",
+        type=int,
+        default=150,
+        metavar="N",
+        help=(
+            "maximum CRLF/response-splitting requests per scan, so a large "
+            "crawl cannot turn header probing into a flood (default: 150)"
+        ),
+    )
     advanced.add_argument("--graphql-xss", action="store_true", help="enable GraphQL schema introspection and XSS testing")
     advanced.add_argument("--enhanced-sinks", action="store_true", help="enable tracking of additional sinks (postMessage, Web Speech, WebGL, etc.)")
     advanced.add_argument("--storage-xss", action="store_true", help="enable storage-based XSS discovery (localStorage, sessionStorage, IndexedDB)")

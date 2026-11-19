@@ -37,6 +37,16 @@ class DOMSink(Enum):
     SRCDOC = "srcdoc"
     FRAME_SRC = "frame.src"
     SCRIPT_SRC = "script.src"
+    SET_HTML_UNSAFE = "setHTMLUnsafe"
+    SET_HTML = "Element.setHTML"
+    PARSE_HTML_UNSAFE = "parseHTMLUnsafe"
+    CREATE_CONTEXTUAL_FRAGMENT = "createContextualFragment"
+    PARSE_FROM_STRING = "parseFromString"
+    EXEC_COMMAND = "execCommand(insertHTML)"
+    WINDOW_OPEN = "window.open"
+    IMPORT_SCRIPTS = "importScripts"
+    WORKER = "Worker"
+    SET_ATTRIBUTE = "setAttribute"
 
 
 class DOMSource(Enum):
@@ -54,6 +64,13 @@ class DOMSource(Enum):
     COOKIE = "document.cookie"
     HISTORY_STATE = "history.state"
     WEB_SOCKET = "WebSocket"
+    WINDOW_OPENER = "window.opener"
+    URL_SEARCH_PARAMS = "URLSearchParams"
+    ANCESTOR_ORIGINS = "location.ancestorOrigins"
+    MESSAGE_DATA = "messageEvent.data"
+    CACHES = "caches"
+    INDEXED_DB = "indexedDB"
+    DATASET = "dataset"
 
 
 @dataclass
@@ -120,6 +137,16 @@ class DOMAnalyzer:
         DOMSink.SRCDOC: r'\.srcdoc\s*=',
         DOMSink.FRAME_SRC: r'\.src\s*=',
         DOMSink.SCRIPT_SRC: r'\.src\s*=',
+        DOMSink.SET_HTML_UNSAFE: r'\.setHTMLUnsafe\s*\(',
+        DOMSink.SET_HTML: r'\.setHTML\s*\(',
+        DOMSink.PARSE_HTML_UNSAFE: r'\.parseHTMLUnsafe\s*\(',
+        DOMSink.CREATE_CONTEXTUAL_FRAGMENT: r'createContextualFragment\s*\(',
+        DOMSink.PARSE_FROM_STRING: r'\.parseFromString\s*\(',
+        DOMSink.EXEC_COMMAND: r"""execCommand\s*\(\s*['"]insertHTML""",
+        DOMSink.WINDOW_OPEN: r'window\.open\s*\(',
+        DOMSink.IMPORT_SCRIPTS: r'importScripts\s*\(',
+        DOMSink.WORKER: r'new\s+(?:Shared)?Worker\s*\(',
+        DOMSink.SET_ATTRIBUTE: r"""\.setAttribute\s*\(\s*['"](?:href|src|srcdoc|action|formaction|style|on\w+)['"]""",
     }
 
     # Source patterns
@@ -137,6 +164,13 @@ class DOMAnalyzer:
         DOMSource.COOKIE: r'document\.cookie',
         DOMSource.HISTORY_STATE: r'history\.state',
         DOMSource.WEB_SOCKET: r'WebSocket',
+        DOMSource.WINDOW_OPENER: r'window\.opener',
+        DOMSource.URL_SEARCH_PARAMS: r'URLSearchParams',
+        DOMSource.ANCESTOR_ORIGINS: r'location\.ancestorOrigins',
+        DOMSource.MESSAGE_DATA: r'(?:message|event)\.data',
+        DOMSource.CACHES: r'\bcaches\b',
+        DOMSource.INDEXED_DB: r'\bindexedDB\b',
+        DOMSource.DATASET: r'\.dataset\b',
     }
 
     # Sanitizer patterns
@@ -262,11 +296,44 @@ class DOMAnalyzer:
 
     def generate_dom_payload(self, flow: DOMTaintFlow, marker: str) -> str:
         """Generate a DOM XSS payload for a specific taint flow."""
-        if flow.sink.sink_type in (DOMSink.INNER_HTML, DOMSink.OUTER_HTML):
+        html_sinks = {
+            DOMSink.INNER_HTML,
+            DOMSink.OUTER_HTML,
+            DOMSink.INSERT_ADJACENT_HTML,
+            DOMSink.DOCUMENT_WRITE,
+            DOMSink.DOCUMENT_WRITELN,
+            DOMSink.JQUERY_HTML,
+            DOMSink.JQUERY_APPEND,
+            DOMSink.JQUERY_PREPEND,
+            DOMSink.JQUERY_REPLACE_WITH,
+            DOMSink.JQUERY_AFTER,
+            DOMSink.JQUERY_BEFORE,
+            DOMSink.JQUERY_INSERT_AFTER,
+            DOMSink.JQUERY_INSERT_BEFORE,
+            DOMSink.SRCDOC,
+            DOMSink.SET_HTML_UNSAFE,
+            DOMSink.SET_HTML,
+            DOMSink.PARSE_HTML_UNSAFE,
+            DOMSink.CREATE_CONTEXTUAL_FRAGMENT,
+            DOMSink.PARSE_FROM_STRING,
+            DOMSink.EXEC_COMMAND,
+            DOMSink.SET_ATTRIBUTE,
+        }
+        code_sinks = {
+            DOMSink.EVAL,
+            DOMSink.FUNCTION,
+            DOMSink.SET_TIMEOUT,
+            DOMSink.SET_INTERVAL,
+            DOMSink.LOCATION_HREF,
+            DOMSink.LOCATION,
+            DOMSink.WINDOW_OPEN,
+            DOMSink.IMPORT_SCRIPTS,
+            DOMSink.WORKER,
+        }
+        if flow.sink.sink_type in html_sinks:
             return f"<img src=x onerror=window.__xoxss_dom_hits.push('{marker}')>"
-        elif flow.sink.sink_type == DOMSink.EVAL:
+        if flow.sink.sink_type in code_sinks:
             return f"window.__xoxss_dom_hits.push('{marker}')"
-        elif flow.sink.sink_type == DOMSink.LOCATION:
+        if flow.sink.sink_type in (DOMSink.FRAME_SRC, DOMSink.SCRIPT_SRC):
             return f"javascript:window.__xoxss_dom_hits.push('{marker}')"
-        else:
-            return f"<script>window.__xoxss_dom_hits.push('{marker}')</script>"
+        return f"<script>window.__xoxss_dom_hits.push('{marker}')</script>"

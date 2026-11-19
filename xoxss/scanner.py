@@ -202,6 +202,12 @@ from xoxss.scan.reflection import (
     browser_prequalified,
     http_executable,
 )
+from xoxss.analysis.dangling import build_dangling_payloads, detect_dangling
+from xoxss.detection.header_injection import (
+    build_split_values,
+    find_injected_header,
+    rank_header_candidates,
+)
 from xoxss.detection.matrix import (
     analyze_character_matrix,
     build_matrix_probe,
@@ -353,6 +359,19 @@ def _soup(html_text: str) -> BeautifulSoupType:
 
 DEFAULT_STATE_DIR = ".xoxss"
 
+#: Reflection contexts in which a delimiting prefix can open a real tag.  The
+#: dangling-markup probe is skipped everywhere else (JSON, URL, inert zones).
+_DANGLING_CONTEXTS = {
+    "html",
+    "attr_double",
+    "attr_single",
+    "attr_unquoted",
+    "script",
+    "style",
+    "textarea",
+    "comment",
+}
+
 
 # DOM analysis (static hints + runtime sink instrumentation)
 # --------------------------------------------------------------------------------------
@@ -364,13 +383,18 @@ DOM_SOURCES = [
     "location.hash",
     "location.search",
     "location.href",
+    "location.ancestororigins",
     "document.referrer",
     "window.name",
+    "window.opener",
     "document.cookie",
     "localstorage",
     "sessionstorage",
     "history.state",
     "postmessage",
+    "event.data",
+    "messageevent",
+    "urlsearchparams",
     "window.location",
 ]
 
@@ -378,6 +402,11 @@ DOM_SINKS = [
     ("innerHTML", r"\.innerHTML\s*="),
     ("outerHTML", r"\.outerHTML\s*="),
     ("insertAdjacentHTML", r"insertAdjacentHTML\s*\("),
+    ("setHTMLUnsafe", r"\.setHTMLUnsafe\s*\("),
+    ("setHTML", r"\.setHTML\s*\("),
+    ("parseHTMLUnsafe", r"\.parseHTMLUnsafe\s*\("),
+    ("createContextualFragment", r"createContextualFragment\s*\("),
+    ("parseFromString", r"\.parseFromString\s*\("),
     ("document.write", r"document\.write\s*\("),
     ("document.writeln", r"document\.writeln\s*\("),
     ("eval", r"\beval\s*\("),
@@ -385,8 +414,15 @@ DOM_SINKS = [
     ("setTimeout", r"\bsetTimeout\s*\("),
     ("setInterval", r"\bsetInterval\s*\("),
     ("location.assign", r"location\.(?:assign|replace)\s*\("),
-    ("jQuery.html", r"\.html\s*\("),
-    ("jQuery.append", r"\.(?:append|prepend|after|before)\s*\("),
+    ("window.open", r"window\.open\s*\("),
+    ("jQuery.html", r"(?:\$|jQuery)\s*\([^)]*\)\s*\.\s*html\s*\("),
+    ("jQuery.append", r"(?:\$|jQuery)\s*\([^)]*\)\s*\.\s*(?:append|prepend|after|before)\s*\("),
+    ("jQuery.parseHTML", r"(?:\$|jQuery)\.parseHTML\s*\("),
+    ("jQuery.globalEval", r"(?:\$|jQuery)\.globalEval\s*\("),
+    ("execCommand", r"execCommand\s*\(\s*['\"]insertHTML"),
+    ("importScripts", r"importScripts\s*\("),
+    ("Worker", r"new\s+(?:Shared)?Worker\s*\("),
+    ("setAttribute", r"\.setAttribute\s*\(\s*['\"](?:href|src|srcdoc|action|formaction|style|on\w+)['\"]"),
     ("srcdoc", r"\.srcdoc\s*="),
 ]
 
@@ -2335,6 +2371,12 @@ class XSSScanner(CrawlerMixin):
 
             await self._run_advanced_prepass(url)
 
+            # CRLF/header injection is independent of body reflection: it only
+            # needs the URL's own query parameters, so it runs before payload
+            # discovery and cannot be reached by the reflection pipeline.
+            if getattr(self.args, "header_injection", True):
+                await self.test_response_splitting(url)
+
             points = await self.discover_points(url)
             self.console.debug(f"{len(points)} injection point(s) on {url}")
             for point in points:
@@ -2971,6 +3013,86 @@ class XSSScanner(CrawlerMixin):
         # the injection point is never left untested.
         return bool(polyglots)
 
+    async def _probe_dangling(
+        self,
+        point: InjectionPoint,
+        info: ReflectionInfo,
+        response: Optional[HttpResponse],
+        location: str,
+    ) -> bool:
+        """Try to capture server-generated markup in an injected tag attribute.
+
+        Dangling markup is the fallback when markup survives but a complete
+        executable tag does not (for example, ``<`` and quotes pass through
+        while ``>`` is stripped).  The probe attribute points at a fragment on
+        the current page, so nothing is sent to a third party during the scan;
+        the finding explains how to turn the fragment into an exfiltration URL.
+        """
+        if not getattr(self.args, "dangling_markup", True):
+            return False
+        if info.context not in _DANGLING_CONTEXTS or info.static_dead_zone:
+            return False
+        # Without a surviving ``<`` no new tag can be parsed, so no attribute
+        # can dangle.  This also keeps the probe off JSON and URL contexts.
+        if "<" not in info.raw_specials:
+            return False
+        content_type = response.header("content-type", "") if response else ""
+        mime = (content_type or "").split(";", 1)[0].strip().lower()
+        if mime not in {"", "text/html", "application/xhtml+xml", "image/svg+xml"}:
+            return False
+
+        token = unique_token("d", 10)
+        for payload, tag, attribute in build_dangling_payloads(info.context, token):
+            if self._stop.is_set():
+                return False
+            result = await self.send_point(point, payload)
+            if result is None or result.error or not result.text:
+                continue
+            self.stats.payloads += 1
+            capture = detect_dangling(result.text, payload, token)
+            if not capture.detected:
+                self.console.debug(
+                    f"Dangling markup probe rejected ({capture.reason}): {location}"
+                )
+                continue
+
+            self.stats.dangling_hits += 1
+            poc_url, poc_command = self.poc_for_point(point, payload)
+            self.console.warn(
+                f"Dangling markup injection: {location} "
+                f"({capture.captured_length} chars captured into {tag}[{attribute}])"
+            )
+            self.add_finding(
+                Finding(
+                    kind="Dangling Markup Injection",
+                    url=point.url,
+                    parameter=point.param,
+                    method=point.method.upper(),
+                    payload=payload,
+                    evidence=(
+                        f"{capture.tag}[{capture.attribute}] captured "
+                        f"{capture.captured_length} character(s) of following markup: "
+                        f"{capture.captured_preview}"
+                    ),
+                    confidence="high",
+                    confidence_rationale=(
+                        "The injected tag is parsed as a real element and its attribute "
+                        "swallowed server-generated markup. A browser loads this element, "
+                        "so replacing the same-page fragment with an attacker URL "
+                        "exfiltrates the captured content."
+                    ),
+                    context=info.context,
+                    detail="dangling markup (attribute capture)",
+                    poc_url=poc_url,
+                    poc_command=poc_command,
+                    source=point.source,
+                    param_source=getattr(point, "param_source", "discovered"),
+                    **self.evidence_from_response(result, token, point.param),
+                )
+            )
+            return True
+        return False
+
     async def test_point(self, point: InjectionPoint) -> None:
         self.stats.points += 1
         location = f"{point.method} {point.param} @ {truncate(point.url, 110)}"
@@ -3001,6 +3123,13 @@ class XSSScanner(CrawlerMixin):
             self.console.debug(
                 f"Context {info.context} already confirmed on {canonical_ep} ({point.param}); skipping"
             )
+            return
+
+        # Dangling markup is tested before the payload corpus: it is the only
+        # class that can succeed when ``<`` survives but ``>`` (or the event
+        # handler/``javascript:`` needed for execution) is filtered.
+        if await self._probe_dangling(point, info, response, location):
+            self._confirmed_contexts.add(dedup_key)
             return
 
         # Strongest executable reflection that no browser confirmed.  Tracked
@@ -3601,6 +3730,86 @@ class XSSScanner(CrawlerMixin):
         self.console.event("finding", target=self.target, finding=finding.to_dict())
         self.console.finding(finding)
         return True
+
+    # -- response splitting / CRLF header injection -----------------------------------
+    async def test_response_splitting(self, url: str) -> None:
+        """Probe query parameters for CRLF injection into response headers.
+
+        Only parsed headers count: a payload echoed *inside* an existing header
+        value is a lead, not a split.  Redirect-like parameter names are tried
+        first because they are the ones that reach ``Location``/``Set-Cookie``.
+        """
+        if not getattr(self.args, "header_injection", True):
+            return
+        pairs = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+        if not pairs:
+            return
+        originals = {}
+        for name, value in pairs:
+            originals.setdefault(name, value)
+        limit = max(1, int(getattr(self.args, "header_injection_limit", 12) or 12))
+        budget = max(
+            1, int(getattr(self.args, "header_injection_budget", 150) or 150)
+        )
+        for name in rank_header_candidates(list(originals))[:limit]:
+            if self._stop.is_set():
+                return
+            token = unique_token("h", 10)
+            for label, payload in build_split_values(token):
+                if self.stats.header_injection_probes >= budget:
+                    self.console.debug(
+                        f"Header-injection budget ({budget}) reached; "
+                        "raise --header-injection-budget to probe further"
+                    )
+                    return
+                probe_url = merge_query(url, {name: f"{originals[name]}{payload}"})
+                try:
+                    response = await self.http.get(
+                        probe_url, cache=False, allow_redirects=False
+                    )
+                except Exception as exc:
+                    self.console.debug(
+                        f"CRLF probe failed for {truncate(probe_url, 100)}: {exc}"
+                    )
+                    continue
+                self.stats.header_injection_probes += 1
+                if response is None or response.error:
+                    continue
+                injected = find_injected_header(response.headers, token)
+                if not injected:
+                    continue
+                self.stats.response_splitting_hits += 1
+                self.console.warn(
+                    f"HTTP response splitting: parameter {name!r} on "
+                    f"{truncate(url, 100)} ({label} variant)"
+                )
+                self.add_finding(
+                    Finding(
+                        kind="HTTP Response Splitting (CRLF injection)",
+                        url=url,
+                        parameter=name,
+                        method="GET",
+                        payload=payload,
+                        evidence=(
+                            f"injected header {injected!r} parsed by the HTTP client "
+                            f"({label} variant)"
+                        ),
+                        confidence="high",
+                        confidence_rationale=(
+                            "The CRLF sequence was decoded and emitted into a response "
+                            "header; a second sequence allows an attacker-controlled "
+                            "response body, which is reflected XSS."
+                        ),
+                        context="header",
+                        detail="response header injection",
+                        poc_url=probe_url,
+                        poc_command=f"curl -sk '{probe_url}' -D -",
+                        source="query",
+                        param_source="discovered",
+                        **self.evidence_from_response(response, token, name),
+                    )
+                )
+                return
 
     # -- header injection -------------------------------------------------------------
     async def test_headers(self, url: str) -> None:
@@ -4546,51 +4755,71 @@ class XSSScanner(CrawlerMixin):
         if response.error:
             return
         
-        # Extract CSP header
+        # Extract both enforced and report-only policies.  A report-only policy
+        # provides no protection, so its weaknesses are still actionable.
         csp_header = response.header("content-security-policy", "")
-        if not csp_header:
+        report_only = response.header("content-security-policy-report-only", "")
+        if not csp_header and not report_only:
             return
-        
-        analysis = analyzer.analyze_csp(csp_header)
-        if analysis.bypass_possible:
-            self.csp_issues.append({
-                'url': url,
-                'csp': csp_header,
-                'issues': [f"{i.issue_type}: {i.description}" for i in analysis.issues],
-            })
-            self.console.warn(f"CSP bypass possible: {url}")
-            
-            # Suggest bypass payloads
-            marker = unique_token()
-            bypasses = analyzer.suggest_bypass_payloads(analysis, marker)
-            for bypass in bypasses:
-                self.console.debug(f"CSP bypass suggestion: {bypass[:60]}...")
 
-            try:
-                from xoxss.analysis.csp import CSPBypassAutomator
+        policies = []
+        if csp_header:
+            policies.append(("enforced", csp_header))
+        if report_only:
+            policies.append(("report-only", report_only))
 
-                automator = CSPBypassAutomator()
-                parsed_policy = automator.parse_csp(csp_header)
-                applicable = automator.get_applicable_bypasses(parsed_policy, marker)
-                extra_payloads = automator.generate_bypass_payloads(applicable, marker)
-                for bp in extra_payloads:
-                    self.console.debug(f"Automated CSP vector: {bp[:60]}...")
-            except Exception:
-                pass
-
-        # Trusted Types directive audit (--trusted-types)
-        if getattr(self.args, "trusted_types", False):
-            from xoxss.analysis.trusted_types import TrustedTypesAnalyzer
-            tt_analysis = TrustedTypesAnalyzer().analyze_trusted_types(csp_header)
-            if tt_analysis.issues:
-                self.policy_issues.append({
+        for mode, header in policies:
+            analysis = analyzer.analyze_csp(header)
+            if analysis.bypass_possible or mode == "report-only":
+                self.csp_issues.append({
                     'url': url,
-                    'issues': [
-                        f"{issue.issue_type} ({issue.severity}): {issue.description}"
-                        for issue in tt_analysis.issues
-                    ],
+                    'csp': header,
+                    'mode': mode,
+                    'issues': [f"{i.issue_type}: {i.description}" for i in analysis.issues],
+                    'bypasses': [b.technique for b in analysis.bypasses],
                 })
-                self.console.debug(f"Trusted Types audit: {len(tt_analysis.issues)} issue(s) on {url}")
+                if analysis.bypass_possible:
+                    self.console.warn(
+                        f"CSP bypass possible ({mode}): {url} "
+                        f"[{', '.join(b.technique for b in analysis.bypasses)}]"
+                    )
+                elif mode == "report-only":
+                    self.console.info(
+                        f"CSP is report-only (not enforced): {url}", important=False
+                    )
+
+                # Suggest bypass payloads
+                marker = unique_token()
+                bypasses = analyzer.suggest_bypass_payloads(analysis, marker)
+                for bypass in bypasses:
+                    self.console.debug(f"CSP bypass suggestion: {bypass[:60]}...")
+
+                try:
+                    from xoxss.analysis.csp import CSPBypassAutomator
+
+                    automator = CSPBypassAutomator()
+                    parsed_policy = automator.parse_csp(header)
+                    applicable = automator.get_applicable_bypasses(parsed_policy, marker)
+                    extra_payloads = automator.generate_bypass_payloads(applicable, marker)
+                    for bp in extra_payloads:
+                        self.console.debug(f"Automated CSP vector: {bp[:60]}...")
+                except Exception:
+                    pass
+
+            # Trusted Types directive audit (--trusted-types)
+            if getattr(self.args, "trusted_types", False):
+                from xoxss.analysis.trusted_types import TrustedTypesAnalyzer
+                tt_analysis = TrustedTypesAnalyzer().analyze_trusted_types(header)
+                if tt_analysis.issues:
+                    self.policy_issues.append({
+                        'url': url,
+                        'mode': mode,
+                        'issues': [
+                            f"{issue.issue_type} ({issue.severity}): {issue.description}"
+                            for issue in tt_analysis.issues
+                        ],
+                    })
+                    self.console.debug(f"Trusted Types audit: {len(tt_analysis.issues)} issue(s) on {url}")
 
     def _analyze_graphql(self, url: str, body: str, content_type: str) -> None:
         """Detect GraphQL endpoints and flag open introspection (--graphql)."""
@@ -5019,6 +5248,8 @@ class XSSScanner(CrawlerMixin):
             ("HTTP requests", str(stats.requests)),
             ("HTTP errors", str(stats.errors)),
             ("Redirects blocked", str(stats.redirects_blocked)),
+            ("Dangling markup", str(stats.dangling_hits)),
+            ("Response splitting", str(stats.response_splitting_hits)),
             ("Truncated responses", str(stats.truncated_responses)),
             ("Browser checks", str(stats.browser_checks)),
             ("WAF", self.waf.label()),
@@ -5044,7 +5275,13 @@ class XSSScanner(CrawlerMixin):
         def value_style(label: str, value: str) -> str:
             if label == "WAF" and not waf_clear:
                 return bcolors.WARNING
-            if label in ("HTTP errors", "Truncated responses", "Redirects blocked") and value not in ("0", ""):
+            if label in (
+                "HTTP errors",
+                "Truncated responses",
+                "Redirects blocked",
+                "Dangling markup",
+                "Response splitting",
+            ) and value not in ("0", ""):
                 return bcolors.WARNING
             if (
                 label in ("Vulnerable libs", "External findings", "JSONP findings")

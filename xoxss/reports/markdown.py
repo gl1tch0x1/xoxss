@@ -34,6 +34,9 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:  # noqa: C90
         f"- **JSONP findings:** {len(scanner.jsonp_findings)}",
         f"- **CSP issues:** {len(scanner.csp_issues)}",
         f"- **CORS issues:** {len(scanner.cors_issues)}",
+        f"- **Redirects blocked:** {scanner.stats.redirects_blocked}",
+        f"- **Dangling markup:** {scanner.stats.dangling_hits}",
+        f"- **Response splitting:** {scanner.stats.response_splitting_hits}",
         f"- **XSS Findings:** {len(scanner.findings)}",
         "",
     ]

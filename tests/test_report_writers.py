@@ -184,6 +184,23 @@ def test_json_report_records_partial_coverage_notes() -> None:
     assert "no browser worker" in notes
 
 
+def test_json_report_notes_disabled_probes_and_serialises_counters() -> None:
+    scanner = StubScanner()
+    scanner.args.dangling_markup = False
+    scanner.args.header_injection = False
+    scanner.stats.dangling_hits = 2
+    scanner.stats.response_splitting_hits = 1
+    scanner.stats.header_injection_probes = 5
+    document = report_payload(scanner)  # type: ignore[arg-type]
+
+    notes = "\n".join(document["coverage_notes"])
+    assert "Dangling markup injection probes were disabled" in notes
+    assert "CRLF/HTTP response-splitting probes were disabled" in notes
+    assert document["stats"]["dangling_hits"] == 2
+    assert document["stats"]["response_splitting_hits"] == 1
+    assert document["stats"]["header_injection_probes"] == 5
+
+
 def test_json_report_records_browser_scope_blocks() -> None:
     scanner = StubScanner()
     scanner.pool.engines = [SimpleNamespace(scope_blocked_requests=2)]

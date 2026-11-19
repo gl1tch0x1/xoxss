@@ -10,6 +10,7 @@ from __future__ import annotations
 from xoxss.analysis.csp import (
     CSPAnalyzer,
     CSPBypassAutomator,
+    CSPSeverity,
     _is_scheme_source,
     _source_allows_host,
 )
@@ -110,3 +111,54 @@ def test_jsonp_gadget_detection_parses_hostnames() -> None:
         "script-src https://evil.example/?next=https://ajax.googleapis.com"
     )
     assert not any(issue.issue_type == "jsonp_gadget_domain" for issue in query.issues)
+
+
+# -- CSP3 strict-dynamic, nonce and base-uri semantics ------------------------
+
+
+def test_parse_csp_normalizes_names_and_merges_duplicates() -> None:
+    directives = CSPAnalyzer().parse_csp(
+        "Script-Src 'self'; script-src https://cdn.example; BASE-URI 'none'"
+    )
+    assert directives["script-src"] == ["'self'", "https://cdn.example"]
+    assert "base-uri" in directives
+
+
+def test_strict_dynamic_ignores_unsafe_inline_instead_of_reporting_bypass() -> None:
+    analysis = CSPAnalyzer().analyze_csp(
+        "script-src 'nonce-abcdefghijklmnopqrstuvwxyz' 'strict-dynamic' 'unsafe-inline'"
+    )
+    techniques = {bypass.technique for bypass in analysis.bypasses}
+
+    assert "unsafe-inline bypass" not in techniques
+    assert any(issue.issue_type == "strict_dynamic" for issue in analysis.issues)
+    assert not any(
+        issue.issue_type == "dangerous_value"
+        and issue.severity == CSPSeverity.HIGH
+        and "unsafe-inline" in issue.description
+        for issue in analysis.issues
+    )
+
+
+def test_short_nonce_is_reported_as_weak() -> None:
+    analysis = CSPAnalyzer().analyze_csp("script-src 'nonce-short'")
+    assert any(issue.issue_type == "weak_nonce" for issue in analysis.issues)
+    assert any(bypass.technique == "Weak nonce prediction" for bypass in analysis.bypasses)
+
+
+def test_missing_base_uri_is_a_high_severity_hijack() -> None:
+    analysis = CSPAnalyzer().analyze_csp(
+        "script-src 'self'; object-src 'none'; form-action 'self'; frame-ancestors 'none'"
+    )
+    assert any(
+        issue.issue_type == "missing_base_uri"
+        and issue.severity == CSPSeverity.HIGH
+        for issue in analysis.issues
+    )
+    assert any(bypass.technique == "base-uri hijack" for bypass in analysis.bypasses)
+
+
+def test_automator_applies_base_uri_and_unsafe_eval_bypasses() -> None:
+    assert "base_tag_injection" in bypasses_for("script-src 'self'")
+    assert "unsafe_eval" in bypasses_for("script-src 'unsafe-eval'")
+

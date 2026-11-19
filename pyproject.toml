@@ -108,8 +108,9 @@ omit = ["*/__main__.py"]
 show_missing = true
 # Ratchet: slightly below the measured total so refactors cannot silently drop
 # coverage while new code is still being test-covered module by module.
-# Measured 2026-11: 38.4% total (was 30.9% before the P0/P1 work).
-fail_under = 37
+# Measured 2026-11: 39.9% total (38.4% before the dangling-markup, CRLF, CSP
+# and DOM-sink work; 30.9% at the audit baseline).
+fail_under = 39
 exclude_lines = [
     "pragma: no cover",
     "if TYPE_CHECKING:",

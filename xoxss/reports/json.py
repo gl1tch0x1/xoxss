@@ -40,6 +40,10 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
         coverage_notes.append("Stored-XSS follow-up checks were disabled")
     if not bool(getattr(args, "dom_source_probes", False)):
         coverage_notes.append("Storage, window.name, and postMessage DOM source probes were disabled")
+    if not bool(getattr(args, "dangling_markup", True)):
+        coverage_notes.append("Dangling markup injection probes were disabled")
+    if not bool(getattr(args, "header_injection", True)):
+        coverage_notes.append("CRLF/HTTP response-splitting probes were disabled")
     if not bool(getattr(args, "external_tools", False)):
         coverage_notes.append("Optional external recon and verification tools were disabled")
     if not getattr(args, "auth_state", None) and not (
