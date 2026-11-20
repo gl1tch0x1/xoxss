@@ -4270,7 +4270,8 @@ class XSSScanner(CrawlerMixin):
         # Web Speech, WebGL, SVG, CSS, worker), storage reads, and service
         # workers registered by the page.
         candidates.extend(self._static_enhanced_candidates(url, scripts))
-        await self._analyze_service_workers(url, scripts)
+        if getattr(self.args, "service_worker", False):
+            await self._analyze_service_workers(url, scripts)
         inline_sink = any(has_dom_sink(script.content) for script in scripts if script.content)
 
         await self._analyze_script_sinks(url, scripts, response)
@@ -5586,17 +5587,25 @@ def apply_god_preset(
     console: "Console",
     user_flags: Set[str],
 ) -> None:
-    """``--god`` / ``--yolo`` preset: every capability on without further input.
+    """``--god`` / ``--yolo``: every capability on, budgets at the ceiling.
 
-    Budgets are raised to aggressive-but-safe maximums; explicit command-line
-    flags always win so the user can still pin individual settings.
+    God mode is the supreme preset: every HTTP-level scanner, static analyser,
+    browser verifier, out-of-band channel and corpus is enabled, and every
+    budget is raised.  Explicit command-line flags always win, including the
+    ``--no-*`` opt-outs, so ``--god --no-browser`` is still an HTTP-only scan
+    and ``--god --max-urls 500`` keeps the tighter budget.
     """
 
-    def unclaimed(*flags: str) -> bool:
-        return not any(flag in user_flags for flag in flags)
+    def claimed(*flags: str) -> bool:
+        return any(flag in user_flags for flag in flags)
+
+    def enable(dest: str) -> None:
+        """Enable a capability unless the user passed its ``--no-*`` form."""
+        if not claimed(f"--no-{dest.replace('_', '-')}"):
+            setattr(args, dest, True)
 
     def bump(attr: str, value: Any, flag: Optional[str] = None) -> None:
-        if flag and not unclaimed(flag):
+        if flag and claimed(flag):
             return
         current = getattr(args, attr, None)
         if current is None:
@@ -5606,52 +5615,59 @@ def apply_god_preset(
 
     recon = HAS_RECON
 
-    # -- discovery ----------------------------------------------------------------------
+    # -- discovery: map the whole attack surface first ------------------------------------
     args.crawl = True
-    bump("crawl_depth", 6, "--crawl-depth")
-    bump("max_urls", 3000, "--max-urls")
-    bump("js_files", 60, "--js-files")
-    if unclaimed("--no-discover"):
-        args.discover = True
+    enable("discover")
     args.discover_paths = True
+    bump("crawl_depth", 8, "--crawl-depth")
+    bump("max_urls", 5000, "--max-urls")
+    bump("js_files", 100, "--js-files")
+    bump("cluster_limit", 25, "--cluster-limit")
     args.fuzz_paths = True
-    args.fuzz = True
-    bump("fuzz_targets", 16, "--fuzz-targets")
-    bump("fuzz_words", 200, "--fuzz-words")
-    if unclaimed("--no-fuzz-params"):
-        args.fuzz_params = True
-    bump("fuzz_param_limit", 25, "--fuzz-param-limit")
+    enable("fuzz")
     args.fuzz_recursive = True
-    if unclaimed("--no-bypass-403"):
-        args.bypass_403 = True
-    bump("bypass_attempts", 48, "--bypass-attempts")
+    enable("fuzz_params")
+    bump("fuzz_targets", 24, "--fuzz-targets")
+    bump("fuzz_words", 300, "--fuzz-words")
+    bump("fuzz_param_limit", 40, "--fuzz-param-limit")
+    bump("fuzz_budget", 1500, "--fuzz-budget")
+    bump("fuzz_param_targets", 40, "--fuzz-param-targets")
+    enable("bypass_403")
     args.bypass_aggressive = True
+    bump("bypass_attempts", 64, "--bypass-attempts")
     if recon:
-        args.subdomains = True
-        args.passive_urls = True
-        args.openapi = True
-        args.mine_params = True
-        args.allow_subdomains = True
-        bump("subdomain_brute", 50, "--subdomain-brute")
+        enable("subdomains")
+        enable("passive_urls")
+        enable("openapi")
+        enable("mine_params")
+        if args.subdomains:
+            args.allow_subdomains = True
+            bump("subdomain_brute", 100, "--subdomain-brute")
 
-    # -- injection ----------------------------------------------------------------------
-    bump("max_payloads", 16, "--max-payloads")
+    # -- injection: full corpus, every context, every encoding ----------------------------
+    bump("max_payloads", 24, "--max-payloads")
     if getattr(args, "remote_payloads", True):
-        bump("payload_limit", 1500, "--payload-limit")
+        bump("payload_limit", 2500, "--payload-limit")
     args.scan_headers = True
     args.stored = True
-    bump("stored_pages", 20, "--stored-pages")
+    bump("stored_pages", 30, "--stored-pages")
     args.report_reflections = True
     args.mutation_probes = True
     args.adaptive_payloads = True
     args.char_matrix = True
-    if unclaimed("--path-xss", "--no-path-xss"):
-        args.path_xss = True
+    args.per_char_probe = True
+    enable("path_xss")
+    enable("dangling_markup")
+    enable("header_injection")
+    bump("header_injection_limit", 25, "--header-injection-limit")
+    bump("header_injection_budget", 1000, "--header-injection-budget")
+    bump("param_wordlist_limit", 150, "--param-wordlist-limit")
 
-    # -- advanced analysis (cheap, HTTP-level) -------------------------------------------
+    # -- analyzers: every static/HTTP-level detector --------------------------------------
     args.polyglot = True
     args.jsonp = True
     args.csp_analyze = True
+    args.csp_bypass = True
     args.cors_analyze = True
     args.proto_pollution = True
     args.mxss = True
@@ -5659,26 +5675,44 @@ def apply_god_preset(
     args.dom_clobbering = True
     args.trusted_types = True
     args.graphql = True
+    args.graphql_xss = True
     args.websocket = True
+    args.ws_active = True
     args.file_upload = True
     args.postmessage = True
+    enable("service_worker")
+    args.enhanced_sinks = True
+    args.storage_xss = True
+    args.framework_bypass = True
+    args.dom_source_probes = True
+    enable("dom")
+    enable("ast_analysis")
+    enable("check_libs")
 
-    # -- network -------------------------------------------------------------------------
-    bump("threads", 20, "--threads")
-    bump("concurrency", 32, "--concurrency")
-    bump("timeout", 30.0, "--timeout")
-    bump("retries", 2, "--retries")
+    # -- transport and verification -------------------------------------------------------
+    args.http2 = True
+    if HAS_HYBRID:
+        args.hybrid = True
+        args.oracle_verify = True
 
-    # -- browser / evidence ---------------------------------------------------------------
-    if args.no_browser or not unclaimed("--no-browser"):
+    # -- network: aggressive but bounded ----------------------------------------------------
+    bump("threads", 32, "--threads")
+    bump("concurrency", 48, "--concurrency")
+    bump("timeout", 45.0, "--timeout")
+    bump("retries", 3, "--retries")
+
+    # -- browser / evidence -----------------------------------------------------------------
+    browser_off = bool(args.no_browser) or claimed("--no-browser")
+    http_only = claimed("--confirm") and str(getattr(args, "confirm", "")).lower() == "http"
+    if browser_off or http_only:
         args.confirm = "http"
     else:
-        if unclaimed("--browser"):
+        if not claimed("--browser"):
             choice = _god_browser_choice()
             if choice is not None:
                 kind, binary = choice
                 args.browser = kind
-                if binary and not args.binary and unclaimed("--binary"):
+                if binary and not args.binary and not claimed("--binary"):
                     args.binary = binary
             else:
                 console.warn(
@@ -5686,11 +5720,23 @@ def apply_god_preset(
                 )
                 args.no_browser = True
                 args.confirm = "http"
-        if not args.no_browser:
-            bump("browser_workers", 2, "--browser-workers")
-            args.headless = True
-            args.screenshot = True
-            args.fragment_xss = True
+    if not args.no_browser and not http_only:
+        bump("browser_workers", 3, "--browser-workers")
+        bump("browser_discovery_pages", 25, "--browser-discovery-pages")
+        args.headless = True
+        args.screenshot = True
+        args.browser_discovery = True
+        args.spa_crawl = True
+        args.fragment_xss = True
+
+    # -- AI fallback: only when a key is actually configured -------------------------------
+    if HAS_AI and not claimed("--no-ai") and not getattr(args, "ai", False):
+        ai_key = ""
+        with suppress(Exception):
+            ai_key = resolve_ai_key(getattr(args, "ai_key", None)) or ""
+        if ai_key:
+            args.ai = True
+            bump("ai_timeout", 90, "--ai-timeout")
 
     # -- blind XSS / out-of-band -----------------------------------------------------------
     configured_oob = bool(
@@ -5703,7 +5749,7 @@ def apply_god_preset(
         not configured_oob
         and recon
         and InteractshClient is not None
-        and unclaimed("--interactsh")
+        and not claimed("--interactsh")
     ):
         try:
             import cryptography  # noqa: F401  # type: ignore[reportMissingImports]
@@ -5711,10 +5757,15 @@ def apply_god_preset(
             console.warn("God mode: cryptography missing - automatic blind-XSS callbacks disabled")
         else:
             args.interactsh = "oast.pro"
-            bump("oob_wait", 45.0, "--oob-wait")
+            bump("oob_wait", 60.0, "--oob-wait")
 
     # -- external tools ---------------------------------------------------------------------
-    if HAS_RECON and ExternalToolkit is not None and unclaimed("--external-tools") and not args.external_tools:
+    if (
+        HAS_RECON
+        and ExternalToolkit is not None
+        and not claimed("--no-external-tools")
+        and not getattr(args, "external_tools", False)
+    ):
         tools: Dict[str, Any] = {}
         with suppress(Exception):
             tools = available_tools() or {}

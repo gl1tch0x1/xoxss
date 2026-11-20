@@ -144,8 +144,9 @@ def build_parser(
         "--yolo",
         dest="god",
         action="store_true",
-        help="full-automatic maximum-aggression preset: recon + deep crawl + fuzzing + browser "
-        "verification + interactsh blind-XSS + external tools; no other flags needed",
+        help="supreme preset: every scanner, analyser, browser verifier and OOB channel "
+        "with maximum budgets and no other flags needed (explicit flags and --no-* "
+        "opt-outs still win)",
     )
     crawl.add_argument("--crawl-depth", type=int, default=3, help="crawl depth (default: 3)")
     crawl.add_argument("--max-urls", type=int, default=500, help="maximum URLs to scan (default: 500)")
@@ -162,11 +163,11 @@ def build_parser(
     crawl.add_argument(
         "--discover",
         dest="discover",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=True,
-        help="discover endpoints from robots.txt, sitemaps and JavaScript (default: on when crawling)",
+        help="discover endpoints from robots.txt, sitemaps and JavaScript "
+        "(default: on; --no-discover disables)",
     )
-    crawl.add_argument("--no-discover", dest="discover", action="store_false", help="disable robots/sitemap/JS discovery")
     crawl.add_argument("--discover-paths", action="store_true", help="probe common endpoint paths")
     crawl.add_argument("--endpoint-wordlist", help="extra endpoint paths to probe, one per line")
     crawl.add_argument("--js-files", type=int, default=25, help="maximum JavaScript files parsed per scan (default: 25)")
@@ -192,7 +193,8 @@ def build_parser(
     )
     crawl.add_argument(
         "--subdomains",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="enumerate passive subdomains (crt.sh, certspotter, OTX, urlscan) before scanning",
     )
     crawl.add_argument(
@@ -204,12 +206,14 @@ def build_parser(
     )
     crawl.add_argument(
         "--passive-urls",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="collect historic URLs from Wayback, Common Crawl, urlscan and OTX",
     )
     crawl.add_argument(
         "--openapi",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="discover OpenAPI/Swagger documents and test their query/body parameters",
     )
     crawl.add_argument(
@@ -220,15 +224,16 @@ def build_parser(
     crawl.add_argument(
         "--fuzz",
         dest="fuzz",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         default=None,
-        help="fuzz the crawled surface (paths + hidden parameters) before injection; on by default with --crawl",
+        help="fuzz the crawled surface (paths + hidden parameters) before injection; "
+        "on by default with --crawl (--no-fuzz disables)",
     )
     crawl.add_argument(
-        "--no-fuzz",
-        dest="fuzz",
-        action="store_false",
-        help="disable the post-crawl fuzzing phase",
+        "--cluster-limit",
+        type=int,
+        default=5,
+        help="maximum sampled URLs per URL cluster during crawling (default: 5)",
     )
     crawl.add_argument(
         "--fuzz-targets",
@@ -256,12 +261,14 @@ def build_parser(
     )
     crawl.add_argument(
         "--mine-params",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="mine hidden query parameters by response delta and reflection",
     )
     crawl.add_argument(
         "--external-tools",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="use installed recon, parameter discovery (arjun/x8), and XSS verification tools",
     )
     crawl.add_argument(
@@ -456,9 +463,11 @@ def build_parser(
     ai_group = parser.add_argument_group("ai fallback", "LLM candidates, still evidence-gated")
     ai_group.add_argument(
         "--ai",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help="ask an LLM for breakout payloads when the standard corpus fails "
-        "(candidates still require deterministic reflection/execution evidence)",
+        "(candidates still require deterministic reflection/execution evidence); "
+        "god mode enables it when a key is configured, --no-ai forces it off",
     )
     ai_group.add_argument(
         "--ai-only",
@@ -579,7 +588,15 @@ def build_parser(
     advanced.add_argument("--graphql-xss", action="store_true", help="enable GraphQL schema introspection and XSS testing")
     advanced.add_argument("--enhanced-sinks", action="store_true", help="enable tracking of additional sinks (postMessage, Web Speech, WebGL, etc.)")
     advanced.add_argument("--storage-xss", action="store_true", help="enable storage-based XSS discovery (localStorage, sessionStorage, IndexedDB)")
-    advanced.add_argument("--service-worker", action="store_true", help="enable Service Worker XSS detection and cache poisoning analysis")
+    advanced.add_argument(
+        "--service-worker",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Service Worker XSS detection and cache-poisoning analysis "
+            "(default: on; --no-service-worker disables)"
+        ),
+    )
     advanced.add_argument(
         "--bypass-403",
         action=argparse.BooleanOptionalAction,

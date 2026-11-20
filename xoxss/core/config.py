@@ -133,6 +133,14 @@ class ScanConfig:
     fuzz_params: bool = False
     fuzz_param_limit: int = 10
     fuzz_paths: bool = False
+    fuzz: Optional[bool] = None
+    fuzz_targets: int = 8
+    fuzz_words: int = 100
+    fuzz_budget: int = 400
+    fuzz_param_targets: int = 25
+    fuzz_extensions: Optional[str] = None
+    fuzz_recursive: bool = False
+    cluster_limit: int = 5
     mine_params: bool = False
     subdomains: bool = False
     subdomain_brute: int = 0
@@ -143,7 +151,7 @@ class ScanConfig:
     # Injection
     payload_file: Optional[str] = None
     remote_payloads: bool = True
-    payload_sources: List[str] = field(default_factory=list)
+    payload_source: List[str] = field(default_factory=list)
     payload_limit: int = 600
     payload_tmp_dir: Optional[str] = None
     keep_payloads: bool = False
@@ -158,6 +166,7 @@ class ScanConfig:
     char_matrix: bool = False
     param_wordlist: Optional[str] = None
     param_wordlist_limit: int = 50
+    param_subs: bool = True
     dom: bool = True
     dangling_markup: bool = True
     header_injection: bool = True
@@ -180,11 +189,18 @@ class ScanConfig:
     payload_files: List[str] = field(default_factory=list)
     _payload_engine: Optional[Any] = None
 
+    # Access bypass (401/403 routes)
+    bypass_403: bool = True
+    bypass_aggressive: bool = False
+    bypass_attempts: int = 24
+    bypass_techniques: List[str] = field(default_factory=list)
+
     # Advanced Detection
     polyglot: bool = False
     per_char_probe: bool = False
     jsonp: bool = False
     csp_analyze: bool = False
+    csp_bypass: bool = False
     mxss: bool = False
     proto_pollution: bool = False
     cors_analyze: bool = False
@@ -192,12 +208,17 @@ class ScanConfig:
     dom_clobbering: bool = False
     trusted_types: bool = False
     graphql: bool = False
+    graphql_xss: bool = False
     websocket: bool = False
+    ws_active: bool = False
     file_upload: bool = False
     postmessage: bool = False
+    enhanced_sinks: bool = False
+    storage_xss: bool = False
+    service_worker: bool = True
+    framework_bypass: bool = False
     ast_analysis: bool = True
     dom_source_probes: bool = False
-    ws_active: bool = False
 
     # AI fallback
     ai: bool = False
@@ -221,7 +242,9 @@ class ScanConfig:
     show_browser: bool = False
     no_browser: bool = False
     browser_workers: int = 1
+    browser_discovery: bool = False
     browser_discovery_pages: int = 10
+    spa_crawl: bool = False
     confirm: VerificationStrategy = VerificationStrategy.AUTO
     screenshot: bool = False
     binary: Optional[str] = None
@@ -244,6 +267,7 @@ class ScanConfig:
     rate_limit: float = 0.0
     proxy: Optional[str] = None
     insecure: bool = False
+    allow_scheme_downgrade: bool = False
     headers: Dict[str, str] = field(default_factory=dict)
     cookies: Dict[str, str] = field(default_factory=dict)
     cookie_file: Optional[str] = None
@@ -268,6 +292,7 @@ class ScanConfig:
     output: Optional[str] = None
     report: str = "all"
     report_dir: str = ".xoxss/reports"
+    show_secrets: bool = False
     verbose: bool = False
     quiet: bool = False
     no_color: bool = False
@@ -296,15 +321,16 @@ class ScanConfig:
             except ValueError:
                 raise ValueError(f"unknown verification strategy: {self.confirm!r}") from None
         if self.deep:
-            self.crawl_depth = 5
-            self.max_urls = 1500
+            self.crawl_depth = max(self.crawl_depth, 5)
+            self.max_urls = max(self.max_urls, 1500)
             self.discover = True
             self.discover_paths = True
             self.fuzz_params = True
             self.path_xss = True
 
         if self.no_browser:
-            self.dom = False
+            # DOM analysis runs static source/sink matching without a browser;
+            # only execution confirmation requires one, so keep ``dom`` enabled.
             self.confirm = VerificationStrategy.HTTP
 
         bounded_positive = {
@@ -314,12 +340,19 @@ class ScanConfig:
             "concurrency": self.concurrency,
             "browser_workers": self.browser_workers,
             "timeout": self.timeout,
+            "fuzz_targets": self.fuzz_targets,
+            "fuzz_words": self.fuzz_words,
+            "fuzz_budget": self.fuzz_budget,
+            "fuzz_param_targets": self.fuzz_param_targets,
+            "cluster_limit": self.cluster_limit,
         }
         invalid = [name for name, value in bounded_positive.items() if value <= 0]
         if invalid:
             raise ValueError("configuration values must be positive: " + ", ".join(invalid))
         if self.retries < 0 or self.rate_limit < 0 or self.oob_interval <= 0 or self.oob_wait < 0:
             raise ValueError("retries, rate limits, and OOB timing must be non-negative (interval must be positive)")
+        if self.bypass_attempts < 0:
+            raise ValueError("bypass_attempts must be non-negative")
         if not 0 <= self.mutation_probe_limit <= 14:
             raise ValueError("mutation_probe_limit must be between 0 and 14")
         if not 1 <= self.param_batch_size <= 100:
@@ -338,11 +371,17 @@ class ScanConfig:
         known = {f.name for f in dataclasses.fields(cls)}
         values: Dict[str, Any] = {}
         for name in known:
+            if name == "target":
+                continue
             if hasattr(namespace, name):
                 val = getattr(namespace, name)
                 if val is not None:
                     values[name] = val
-        values.setdefault("target", getattr(namespace, "target", "") or "")
+        # ``target`` is nargs="*" on the CLI; ScanConfig keeps the single URL.
+        target = getattr(namespace, "target", "")
+        if isinstance(target, (list, tuple)):
+            target = target[0] if target else ""
+        values["target"] = str(target or "")
         return cls(**values)
 
 

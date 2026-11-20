@@ -310,6 +310,9 @@ Once installed, convenient root launchers are generated automatically:
 - **Windows:** Run `.\xoxss.bat --help` or `.\xoxss.bat example.com --god`
 - **Linux / macOS:** Run `./xoxss --help` or `./xoxss example.com --god`
 
+Interactive scans start with a clean terminal and a fresh XOXSS banner. Help,
+diagnostic, listing, and piped-output commands retain their existing output.
+
 *(You can also activate the virtual environment manually via `.venv\Scripts\activate` on Windows or `source .venv/bin/activate` on Linux/macOS. Use `--no-venv` with `installer.py` if installing directly into a global container or system environment).*
 
 ### 2. Manual Installation
@@ -437,17 +440,17 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--endpoint-wordlist PATH` | Extra paths for `--discover-paths`. |
 | `--js-files N` | Maximum JavaScript files parsed per scan (default `25`). |
 | `--fuzz-params` / `--fuzz-param-limit N` | Append common parameter names to parameterless endpoints (default off, 10 names). |
-| `--subdomains` / `--subdomain-brute N` | Passive subdomain enumeration / also resolve the first N brute-force candidates. |
-| `--passive-urls` | Mine Wayback, Common Crawl, urlscan and OTX for historic URLs. |
-| `--openapi` | Discover OpenAPI/Swagger documents and expand their operations. |
+| `--subdomains` / `--no-subdomains` / `--subdomain-brute N` | Passive subdomain enumeration / also resolve the first N brute-force candidates. |
+| `--passive-urls` / `--no-passive-urls` | Mine Wayback, Common Crawl, urlscan and OTX for historic URLs. |
+| `--openapi` / `--no-openapi` | Discover OpenAPI/Swagger documents and expand their operations. |
 | `--fuzz-paths` | Run the internal soft-404-aware path fuzzer. |
 | `--fuzz-extensions EXT ...` | Extensions appended during path fuzzing (e.g. `--fuzz-extensions .php .bak`). |
 | `--fuzz-recursive` | Recurse into directory-like hits, bounded by `--crawl-depth`; probes are de-duplicated. |
-| `--mine-params` | Probe high-signal parameter names and keep ones that affect the response. |
+| `--mine-params` / `--no-mine-params` | Probe high-signal parameter names and keep ones that affect the response. |
 | `--fuzz` / `--no-fuzz` | Post-crawl fuzzing phase seeded from crawl results: directory fuzzing plus hidden-parameter mining (default: on with `--crawl`). |
 | `--fuzz-targets N` / `--fuzz-words N` | Directories fuzzed per crawl (default `8`) and wordlist entries tried per directory (default `100`). |
 | `--fuzz-budget N` / `--fuzz-param-targets N` | Hard request cap for the phase (default `400`) and endpoints mined for hidden parameters (default `25`). |
-| `--external-tools` | Use installed external recon/verification binaries. |
+| `--external-tools` / `--no-external-tools` | Use installed external recon/verification binaries. |
 | `--allow-subdomains` / `--include REGEX` / `--exclude REGEX` | Scope control; subdomains are auto-enabled for recon. |
 
 ### Injection and payloads
@@ -486,7 +489,7 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--dangling-markup` / `--no-dangling-markup` | Probe for dangling markup injection: an injected tag attribute that swallows following server markup, capturing CSRF tokens and PII (default: on). |
 | `--header-injection` / `--no-header-injection` | Probe query parameters for CRLF injection / HTTP response splitting into `Location`, `Set-Cookie` and other headers (default: on). |
 | `--header-injection-limit N` / `--header-injection-budget N` | Parameters probed per URL (default `12`) and the per-scan request budget (default `150`). |
-| `--ai` / `--ai-only` | Opt-in LLM fallback for contexts the corpus misses. AI output is candidate-only: deterministic reflection with surviving delimiters (and browser execution when available) is still required. `--ai-only` skips the built-in corpus. |
+| `--ai` / `--no-ai` / `--ai-only` | Opt-in LLM fallback for contexts the corpus misses. AI output is candidate-only: deterministic reflection with surviving delimiters (and browser execution when available) is still required. `--ai-only` skips the built-in corpus; `--no-ai` forces the fallback off (including under `--god`). |
 | `--ai-key KEY` / `--ai-model ID` / `--ai-url URL` / `--ai-timeout S` | Credentials and endpoint override (default: OpenRouter, `deepseek/deepseek-chat`, 60s). The key also reads `XOXSS_AI_KEY`, `OPENROUTER_API_KEY`, `XSSR_AI_KEY` or `.env`. |
 | `--smart-rate` | Adaptive rate limiting instead of a fixed token bucket. |
 | `--dom-clobbering` | DOM clobbering analysis. |
@@ -494,6 +497,9 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--graphql` | GraphQL endpoint detection and introspection exposure. |
 | `--websocket` | WebSocket sink analysis (`onmessage`/`eval` flows). |
 | `--ws-active` | Actively inject marker frames into WebSocket endpoints discovered in page JavaScript (requires `--websocket`). Frame reflections are reported conservatively; they still require handler verification. |
+| `--enhanced-sinks` | Track additional sinks: `postMessage`, Web Speech, WebGL, SVG and worker paths. |
+| `--storage-xss` | Storage-based XSS discovery (`localStorage`, `sessionStorage`, `indexedDB`). |
+| `--service-worker` / `--no-service-worker` | Service Worker XSS detection and cache-poisoning analysis (default: on). |
 | `--file-upload` | File upload form discovery. |
 | `--postmessage` | `postMessage` handler analysis (origin validation). |
 
@@ -649,28 +655,43 @@ xoxss example.com --god
 ```
 
 Pass one flag, pick your target (URL, bare domain, or `-l targets.txt`) and walk away.
-It enables and retries degraded setups automatically:
+It is the supreme preset: every scanner, analyser, browser verifier and out-of-band
+channel with every budget at its ceiling, and it retries degraded setups automatically:
 
-- **Recon**: passive subdomains, 50 brute-force candidates, `--allow-subdomains`,
+- **Recon**: passive subdomains, 100 brute-force candidates, `--allow-subdomains`,
   Wayback/Common Crawl/urlscan/OTX URL mining, OpenAPI discovery, parameter mining.
-- **Discovery**: crawl depth ≥ 6, ≥ 3000 URLs, 60 JS files, recursive path and
-  parameter fuzzing.
-- **Protected routes**: 401/403 bypass on, up to 48 request shapes per URL,
+- **Discovery**: crawl depth ≥ 8, ≥ 5000 URLs, 100 JS files, recursive path and
+  parameter fuzzing (1500-request fuzz budget, 300 words, 24 targets, 40 mined params).
+- **Protected routes**: 401/403 bypass on, up to 64 request shapes per URL,
   aggressive method probing.
-- **Injection**: ≥ 16 payloads per point, ≥ 1500 remote payloads + LazyXss, header
-  injection, stored-XSS hunting, reflection reporting.
-- **Analyzers**: polyglots, JSONP, prototype pollution, mXSS, CSP/CORS, Trusted Types,
-  DOM clobbering, `postMessage`, WebSocket, file-upload and GraphQL detection,
-  smart rate limiting.
-- **Verification**: fastest browser available (Playwright → Chrome/Edge/Firefox), two
-  headless workers, screenshots; HTTP-only without a browser.
+- **Injection**: ≥ 24 payloads per point, ≥ 2500 remote payloads + LazyXss, header
+  injection (25 params/URL, 1000 probes), dangling markup, stored-XSS hunting,
+  reflection reporting, per-character probes, 150 parameter-wordlist names.
+- **Analyzers**: polyglots, JSONP, prototype pollution, mXSS, CSP + CSP-bypass automation,
+  CORS, Trusted Types, DOM clobbering, DOM source probes, enhanced sinks, storage XSS,
+  service workers, framework bypasses, `postMessage`, active WebSocket frames,
+  file-upload and GraphQL/GraphQL-XSS detection, smart rate limiting.
+- **Verification**: fastest browser available (Playwright → Chrome/Edge/Firefox), three
+  headless workers, browser-driven route discovery, SPA route crawling, fragment XSS,
+  screenshots; hybrid CDP + AST/DFG pipeline and execution oracle when available;
+  HTTP-only without a browser.
 - **Blind XSS**: public interactsh (`oast.pro`) unless you supplied `--blind`,
-  `--interactsh`, `--oob-poll` or `--oob-file`.
+  `--interactsh`, `--oob-poll` or `--oob-file`; 60 s callback wait.
+- **AI fallback**: enabled only when an API key is actually configured, so no key means
+  no noise (`--god --no-ai` forces it off).
+- **Transport**: HTTP/2 via `curl_cffi` when installed, falling back to aiohttp.
 - **External tools**: dalfox/nuclei/subfinder/gau/katana/arjun/x8/kxss/wfuzz when installed.
 
-Networking is raised to 20 workers × 32 concurrent requests, 30 s timeout. Explicit
-flags always win (`--god --max-urls 500` keeps the URL budget). Not combinable with
-`--mass` or `--param-audit`. Authorized targets only — it is deliberately loud.
+Networking is raised to 32 workers × 48 concurrent requests, 45 s timeout, 3 retries.
+Explicit flags always win (`--god --max-urls 500` keeps the URL budget, `--god --no-dom`
+stays HTTP-analysis only, `--god --confirm http` skips browser-only stages). Every
+capability has a `--no-*` opt-out (`--no-external-tools`, `--no-subdomains`,
+`--no-passive-urls`, `--no-openapi`, `--no-mine-params`, `--no-dangling-markup`,
+`--no-header-injection`, `--no-service-worker`, `--no-ai`, …). Not
+combinable with `--mass` or `--param-audit`. Safety switches god mode will not flip:
+`--insecure` (TLS verification), `--allow-scheme-downgrade`, `--show-secrets` and
+`--fail-on-findings` remain exactly as you set them. Authorized targets only — it is
+deliberately loud.
 
 ### Authenticated scan
 

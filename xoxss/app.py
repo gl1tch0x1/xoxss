@@ -154,14 +154,17 @@ def _apply_god_mode(
         diamond = _ui.glyphs()["diamond"]
         console.raw(
             f"  {bcolors.FAIL}{bcolors.BOLD}{diamond} GOD MODE ENGAGED{bcolors.ENDC}"
-            f"{bcolors.DIM}  full-automatic maximum-aggression preset  "
+            f"{bcolors.DIM}  supreme preset: every scanner, analyser and budget  "
             f"{bcolors.FAIL}{diamond}{bcolors.ENDC}"
         )
     else:
-        console.info("GOD MODE engaged: full-automatic maximum-aggression preset applied", important=True)
+        console.info("GOD MODE engaged: supreme preset applied - every scanner and analyser at maximum budgets", important=True)
     console.info(
         f"god preset: crawl depth {args.crawl_depth}/{args.max_urls} URLs/{args.js_files} JS files, "
         f"{args.max_payloads} payloads per point, {args.threads} workers x {args.concurrency} requests, "
+        f"header-injection {args.header_injection_limit}/{args.header_injection_budget} probes, "
+        f"fuzz budget {getattr(args, 'fuzz_budget', 0)}, "
+        f"AI {'on (key found)' if getattr(args, 'ai', False) else 'off (no key)'}, "
         f"browser {'off (HTTP-only)' if args.no_browser else args.browser}, "
         f"OOB {'interactsh' if getattr(args, 'interactsh', None) else ('blind callback' if args.blind else 'off')}",
     )
@@ -194,6 +197,18 @@ def _check_required_dependencies(console: Console) -> Optional[int]:
         console.error("beautifulsoup4 is required: pip install -r requirements.txt")
         return 1
     return None
+
+
+def _clear_screen() -> None:
+    """Clear the interactive terminal before showing the scan banner."""
+    stream = sys.stdout
+    if (
+        not getattr(stream, "isatty", lambda: False)()
+        or os.environ.get("TERM", "") == "dumb"
+    ):
+        return
+    stream.write("\033[2J\033[H\033[3J")
+    stream.flush()
 
 
 def _normalize_limits(args: argparse.Namespace, console: Console) -> None:
@@ -367,6 +382,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if getattr(args, "doctor", False):
         return run_doctor(console, args)
     if not args.quiet:
+        _clear_screen()
         banner(console)
 
     rejected = _check_inputs(args, console)

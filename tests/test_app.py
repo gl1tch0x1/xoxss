@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 from typing import Any
 
 import pytest
@@ -29,6 +30,11 @@ class StubConsole:
 
     def raw(self, message: str, *_args: Any, **_kwargs: Any) -> None:
         self.raws.append(str(message))
+
+
+class InteractiveStream(io.StringIO):
+    def isatty(self) -> bool:
+        return True
 
 
 def make_args(**overrides: Any) -> argparse.Namespace:
@@ -281,3 +287,30 @@ def test_main_version_flag_exits_cleanly(capsys: pytest.CaptureFixture[str]) -> 
 def test_main_list_encoders_returns_zero(capsys: pytest.CaptureFixture[str]) -> None:
     assert app.main(["--list-encoders"]) == 0
     assert "urlencode" in capsys.readouterr().out
+
+
+def test_clear_screen_only_emits_control_codes_for_interactive_terminals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal = InteractiveStream()
+    monkeypatch.setattr(app.sys, "stdout", terminal)
+    monkeypatch.delenv("TERM", raising=False)
+
+    app._clear_screen()
+
+    assert terminal.getvalue() == "\033[2J\033[H\033[3J"
+
+
+def test_clear_screen_skips_non_interactive_and_dumb_terminals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = io.StringIO()
+    monkeypatch.setattr(app.sys, "stdout", output)
+    app._clear_screen()
+    assert output.getvalue() == ""
+
+    terminal = InteractiveStream()
+    monkeypatch.setattr(app.sys, "stdout", terminal)
+    monkeypatch.setenv("TERM", "dumb")
+    app._clear_screen()
+    assert terminal.getvalue() == ""

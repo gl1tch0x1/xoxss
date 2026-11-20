@@ -36,8 +36,36 @@ All notable changes to XOX$$ are documented here.  The format follows
   `messageEvent.data`, `caches`, `indexedDB` and `dataset` sources.
 - `tests/test_dangling.py`, `tests/test_header_injection.py`,
   `tests/test_dom_sinks.py`; CSP tests extended for the new semantics.
+- `tests/test_god_mode.py`: supremacy assertions for every capability flag,
+  budget ceilings, `--no-*` opt-outs, browser/AI degradation, and a drift test
+  that fails when a new capability flag is added without a god-mode decision.
 - Stats/summary/report rows: "Dangling markup", "Response splitting" and
   "Redirects blocked" counters (also serialized through `stats` in JSON).
+
+### Changed
+
+- `--god` / `--yolo` is now the supreme preset.  It enables every capability,
+  including CSP-bypass automation, enhanced sinks, storage XSS, service-worker
+  analysis, framework bypasses, active WebSocket frames, DOM source probes,
+  per-character probes, dangling markup, CRLF probing, HTTP/2 and the hybrid
+  CDP + AST/DFG pipeline, and raises budgets to depth 8 / 5000 URLs / 100 JS
+  files, 24 payloads per point, 64 bypass shapes, 1000 CRLF probes, a
+  1500-request fuzz budget, and 32 workers × 48 concurrent requests.
+  Explicit flags and `--no-*` opt-outs still win, and safety switches
+  (`--insecure`, `--allow-scheme-downgrade`, `--show-secrets`,
+  `--fail-on-findings`) are never flipped.  AI fallback activates only when a
+  key is actually configured; browser-only stages only with a usable browser.
+- `--service-worker` now gates service-worker analysis instead of being a
+  no-op flag: it is on by default (matching the previous unconditional
+  behaviour) and `--no-service-worker` turns it off.
+- `--ai` accepts `--no-ai` so the LLM fallback can be forced off, including
+  under `--god`.
+- `--subdomains`, `--passive-urls`, `--openapi`, `--mine-params` and
+  `--external-tools` accept `--no-*` opt-outs, so every automatic god-mode
+  stage can be pinned off without dropping the preset.
+- `ScanConfig` exposes analyser toggles that were CLI-only
+  (`csp_bypass`, `enhanced_sinks`, `storage_xss`, `service_worker`,
+  `framework_bypass`, `graphql_xss`, `browser_discovery`, `spa_crawl`).
 
 ## [2.0.1] - 2026-11-16
 

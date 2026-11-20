@@ -391,15 +391,13 @@ def banner(console: Optional[Console] = None) -> None:
 
     subtitle = (
         f"  {bcolors.BOLD}{bcolors.OKCYAN}{APP_NAME}{bcolors.ENDC}"
-        f"{bcolors.DIM}  -  Advanced Automated XSS Scanner  -  v{VERSION}{bcolors.ENDC}"
-        f"  {bcolors.WARNING}{bcolors.BOLD}{CODENAME}{bcolors.ENDC}"
+        f"{bcolors.DIM}  |  Advanced Automated XSS Scanner  |  v{VERSION}{bcolors.ENDC}"
     )
     meta = (
-        f"  {bcolors.DIM}stateful / context-aware / browser-verified / "
-        f"{CODENAME.lower()}{bcolors.ENDC}"
+        f"  {bcolors.DIM}Context-Aware  |  Browser-Verified  |  Smart Payloads  |  {CODENAME.capitalize()}{bcolors.ENDC}"
     )
     if _ui is not None and _ui.enabled():
-        underline = _ui.rule("", width=46)
+        underline = _ui.rule("", width=54)
         meta = f"{meta}\n  {underline}"
     text = f"{painted}\n{subtitle}\n{meta}"
     if console is not None:
