@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from xoxss.core.config import ScanConfig
+from xoxss.scan.injection import InjectionPoint
 from xoxss.scanner import XSSScanner
 from xoxss.utils.console import Console
 
@@ -203,3 +204,113 @@ def test_extended_analysis_can_be_disabled(
     findings = asyncio.run(scanner.run())
 
     assert not [f for f in findings if f.source == "extended"]
+
+
+# -- stored XSS verification -------------------------------------------------
+
+
+class _StubResponse:
+    def __init__(self, text: str, status: int = 200) -> None:
+        self.text = text
+        self.status = status
+        self.error = ""
+
+    def header(self, name: str, default: str = "") -> str:
+        return "text/html; charset=utf-8" if name.lower() == "content-type" else default
+
+
+class _StubHttp:
+    """Minimal async HTTP stub keyed by URL -> queued responses."""
+
+    def __init__(self, routes: dict) -> None:
+        self._routes = {url: list(texts) for url, texts in routes.items()}
+        self.calls: list = []
+
+    async def get(self, url: str, **_kwargs: object) -> _StubResponse:
+        self.calls.append(url)
+        queue = self._routes.get(url)
+        if not queue:
+            return _StubResponse("<html><body>none</body></html>")
+        text = queue.pop(0) if len(queue) > 1 else queue[0]
+        return _StubResponse(text)
+
+
+def _stored_scanner(tmp_path: Path, http: _StubHttp) -> XSSScanner:
+    config = _extended_config(
+        "http://127.0.0.1:9/submit", tmp_path, stored=True, stored_pages=5
+    )
+    scanner = XSSScanner(config.target, config, Console(quiet=True, log_file=None))
+    scanner.http = http  # type: ignore[assignment]
+    return scanner
+
+
+_STORED_TOKEN = "ST0REDTOK3N"
+_STORED_PAYLOAD = f"<script>alert('{_STORED_TOKEN}')</script>"
+_STORED_PAGE_HTML = f"<html><body><script>alert('{_STORED_TOKEN}')</script></body></html>"
+
+
+def test_check_stored_skips_urls_carrying_the_token(tmp_path: Path) -> None:
+    """A candidate URL containing the payload reflects it trivially — that is
+    request reflection, not persistence, and must not count as a stored hit."""
+    contaminated = f"http://127.0.0.1:9/comments?q={_STORED_TOKEN}"
+    http = _StubHttp({contaminated: [_STORED_PAGE_HTML]})
+    scanner = _stored_scanner(tmp_path, http)
+    point = InjectionPoint(
+        url="http://127.0.0.1:9/submit",
+        method="POST",
+        param="comment",
+        page_url=contaminated,
+    )
+
+    result = asyncio.run(
+        scanner.check_stored(point, _STORED_TOKEN, _STORED_PAYLOAD)
+    )
+
+    assert result is None
+    assert contaminated not in http.calls
+
+
+def test_check_stored_stable_reflection(tmp_path: Path) -> None:
+    """Executable reflection on two independent fetches = stable persistence."""
+    page = "http://127.0.0.1:9/comments"
+    http = _StubHttp({page: [_STORED_PAGE_HTML, _STORED_PAGE_HTML]})
+    scanner = _stored_scanner(tmp_path, http)
+    point = InjectionPoint(
+        url="http://127.0.0.1:9/submit",
+        method="POST",
+        param="comment",
+        page_url=page,
+    )
+
+    result = asyncio.run(
+        scanner.check_stored(point, _STORED_TOKEN, _STORED_PAYLOAD)
+    )
+
+    assert result == page
+    assert scanner._stored_hit_stable is True
+    assert scanner._stored_hit_info is not None
+    assert scanner._stored_hit_info.executable is True
+    # Two fetches: initial check + stability re-check.
+    assert http.calls.count(page) == 2
+
+
+def test_check_stored_unstable_reflection(tmp_path: Path) -> None:
+    """Reflection seen once but gone on re-fetch is flagged unstable."""
+    page = "http://127.0.0.1:9/comments"
+    clean = "<html><body>no marker here</body></html>"
+    http = _StubHttp({page: [_STORED_PAGE_HTML, clean]})
+    scanner = _stored_scanner(tmp_path, http)
+    point = InjectionPoint(
+        url="http://127.0.0.1:9/submit",
+        method="POST",
+        param="comment",
+        page_url=page,
+    )
+
+    result = asyncio.run(
+        scanner.check_stored(point, _STORED_TOKEN, _STORED_PAYLOAD)
+    )
+
+    # Hit is still reported (caller decides), but stability is recorded False.
+    assert result == page
+    assert scanner._stored_hit_stable is False

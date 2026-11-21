@@ -760,6 +760,7 @@ class XSSScanner(CrawlerMixin):
         self.screenshot_dir = Path(args.state_dir) / "screenshots"
         self._stored_checked: Set[str] = set()
         self._stored_hit_response: Optional[HttpResponse] = None
+        self._stored_hit_stable: bool = False
         self.mutation_findings: List[Dict[str, str]] = []
         self._mutation_probed: Set[str] = set()
         self._mutation_observations: Dict[str, List[MutationObservation]] = {}
@@ -5171,12 +5172,46 @@ class XSSScanner(CrawlerMixin):
                 'contexts': analysis.contexts,
             })
             self.console.warn(f"Mutation XSS possible: {url} - {analysis.sanitizer} {analysis.version}")
-            
+
             # Generate test payloads
             marker = unique_token()
             payloads = detector.generate_test_payloads(analysis, marker)
             for payload in payloads[:3]:
                 self.console.debug(f"mXSS test payload: {payload[:80]}...")
+
+            # Static detection only — record as a low-confidence lead.  mXSS
+            # confirmation requires a DOM-mutation browser probe, which needs
+            # an injection point this content-level check does not have.
+            cve_text = ", ".join(analysis.cve_ids) if analysis.cve_ids else "none"
+            digest = hashlib.sha1(f"mxss|{url}|{analysis.sanitizer}|{analysis.version}".encode()).hexdigest()[:10]
+            self.add_finding(
+                Finding(
+                    kind="Mutation XSS (static)",
+                    url=url,
+                    parameter="n/a",
+                    method="GET",
+                    payload=(payloads[0] if payloads else "")[:300],
+                    evidence=(
+                        f"{analysis.sanitizer or 'unknown'} {analysis.version or ''} "
+                        f"sanitizer with mutation-prone contexts: "
+                        f"{', '.join(analysis.contexts) or 'generic'}"
+                    )[:500],
+                    confidence="low",
+                    confidence_rationale=(
+                        "Static sanitizer/version and mutation-context match; "
+                        "DOM mutation was not verified in a browser."
+                    ),
+                    context="mxss",
+                    detail=(
+                        f"vulnerable_version={analysis.vulnerable}; "
+                        f"cves={cve_text}; contexts={', '.join(analysis.contexts)}"
+                    )[:500],
+                    subkey=f"mxss:{digest}",
+                    tags=["mxss", "dom", "static"],
+                    source="mxss",
+                    sink=str(analysis.sanitizer or "sanitizer"),
+                )
+            )
     
     async def _detect_proto_pollution(self, url: str, js_content: str) -> None:
         """Detect prototype pollution vulnerabilities."""
@@ -5197,6 +5232,41 @@ class XSSScanner(CrawlerMixin):
                     'has_gadget_chains': analysis.has_gadget_chains,
                 })
                 self.console.warn(f"Prototype pollution sources found: {url}")
+            # Static source-pattern match — low-confidence lead only; gadget
+            # reachability was not verified.
+            sources_text = ", ".join(
+                str(getattr(s, "value", s)) for s in analysis.pollution_sources
+            )
+            digest = hashlib.sha1(
+                f"proto|{url}|{sources_text}".encode("utf-8", "replace")
+            ).hexdigest()[:10]
+            self.add_finding(
+                Finding(
+                    kind="Prototype pollution (static)",
+                    url=url,
+                    parameter="n/a",
+                    method="GET",
+                    payload="",
+                    evidence=(
+                        f"pollution sources: {sources_text}; "
+                        f"frameworks: {', '.join(analysis.frameworks) or 'none'}"
+                    )[:500],
+                    confidence="low",
+                    confidence_rationale=(
+                        "Static pollution-source pattern match; gadget chain "
+                        "execution was not verified."
+                    ),
+                    context="prototype_pollution",
+                    detail=(
+                        f"gadget_chains={analysis.has_gadget_chains}; "
+                        f"sources={sources_text}"
+                    )[:500],
+                    subkey=f"proto:{digest}",
+                    tags=["prototype_pollution", "dom", "static"],
+                    source="proto_pollution",
+                    sink="prototype_pollution",
+                )
+            )
             self.console.debug(
                 "Proto hints: "
                 + ", ".join(source.value for source in analysis.pollution_sources)
@@ -5239,7 +5309,15 @@ class XSSScanner(CrawlerMixin):
         # high/confirmed without verifying execution in a browser.
         stored_executed = False
         stored_screenshot = ""
-        stored_evidence = f"payload persisted and re-rendered on {stored_page}"
+        stored_stable = bool(getattr(self, "_stored_hit_stable", False))
+        stability_note = (
+            "reflection stable across two independent fetches"
+            if stored_stable
+            else "reflection observed on a single fetch (stability unconfirmed)"
+        )
+        stored_evidence = (
+            f"payload persisted and re-rendered on {stored_page} ({stability_note})"
+        )
         stored_dialog_text = ""
 
         if self.pool is not None and self.pool.engines and self.args.confirm != "http":
@@ -5320,8 +5398,8 @@ class XSSScanner(CrawlerMixin):
                     ),
                     confidence="low",
                     confidence_rationale=(
-                        "Persistence verified over HTTP in executable HTML context, "
-                        "but browser execution was not observed."
+                        "Persistence verified over HTTP in executable HTML context "
+                        f"({stability_note}), but browser execution was not observed."
                     ),
                     context=stored_info.context if stored_info else payload_info.context,
                     detail="Persistence verified over HTTP; execution not confirmed in browser",
@@ -5344,6 +5422,9 @@ class XSSScanner(CrawlerMixin):
     async def check_stored(self, point: InjectionPoint, token: str, payload: str) -> Optional[str]:
         if not self.args.stored:
             return None
+        self._stored_hit_response = None
+        self._stored_hit_info = None
+        self._stored_hit_stable = False
         candidates: List[str] = []
         if point.page_url:
             candidates.append(point.page_url)
@@ -5355,6 +5436,11 @@ class XSSScanner(CrawlerMixin):
             if normalized in seen:
                 continue
             seen.add(normalized)
+            # A candidate URL that already carries the token/payload would
+            # reflect it trivially — that is request reflection, not
+            # server-side persistence.
+            if token in page or payload in page:
+                continue
             response = await self.http.get(page, cache=False)
             if response.error or not response.text:
                 continue
@@ -5370,8 +5456,31 @@ class XSSScanner(CrawlerMixin):
                 stored_info = analyze_reflection(response.text, token, payload, content_type)
                 if not stored_info.reflected or not stored_info.executable:
                     continue
+                # Stability re-check: fetch the page once more and require the
+                # same executable reflection.  A payload that only appears on
+                # one fetch is more likely a transient/cache artifact than
+                # durable server-side storage.
+                stable = False
+                try:
+                    confirm = await self.http.get(page, cache=False)
+                    if (
+                        not confirm.error
+                        and confirm.text
+                        and not (confirm.status and confirm.status >= 400)
+                        and (token in confirm.text or payload in confirm.text)
+                    ):
+                        confirm_info = analyze_reflection(
+                            confirm.text, token, payload,
+                            confirm.header("content-type", ""),
+                        )
+                        stable = bool(
+                            confirm_info.reflected and confirm_info.executable
+                        )
+                except Exception:
+                    stable = False
                 self._stored_hit_response = response
                 self._stored_hit_info = stored_info
+                self._stored_hit_stable = stable
                 return page
         return None
 
