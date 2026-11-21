@@ -131,8 +131,8 @@ dmypy.json
 *.state
 *.state.bak
 
-# Generated reports and evidence
-reports/
+# Generated reports and evidence (repo-root output dir only; xoxss/reports/ is source)
+/reports/
 *.jsonl
 screenshots/
 coverage.xml

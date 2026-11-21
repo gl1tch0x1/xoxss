@@ -754,7 +754,7 @@ def build_parser(
         metavar="PATH",
         help=argparse.SUPPRESS,
     )
-    output.add_argument("--report", default="all", help="json, md, html, sarif, all or none (default: all)")
+    output.add_argument("--report", default="all", help="json, md, html, sarif, compliance, collab, all or none (default: all)")
     output.add_argument(
         "--show-secrets",
         action="store_true",

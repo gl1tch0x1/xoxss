@@ -124,6 +124,11 @@ class Finding:
     finding_id: str = ""
     subkey: str = ""
     tags: List[str] = field(default_factory=list)
+    # Collaboration / triage metadata (populated by report consumers)
+    status: str = "open"  # open | triaged | confirmed | false_positive | fixed | accepted_risk
+    assigned_to: str = ""
+    triaged_at: str = ""
+    notes: str = ""
     timestamp: str = field(default_factory=now_iso)
 
     def __post_init__(self) -> None:

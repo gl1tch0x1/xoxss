@@ -10,6 +10,7 @@ from enum import Enum
 
 class DOMSink(Enum):
     """DOM XSS sink types."""
+    # --- Original ---
     INNER_HTML = "innerHTML"
     OUTER_HTML = "outerHTML"
     INSERT_ADJACENT_HTML = "insertAdjacentHTML"
@@ -48,9 +49,46 @@ class DOMSink(Enum):
     WORKER = "Worker"
     SET_ATTRIBUTE = "setAttribute"
 
+    # --- URL / navigation ---
+    LOCATION_ASSIGN = "location.assign"
+    LOCATION_REPLACE = "location.replace"
+
+    # --- Shadow DOM / iframe ---
+    SHADOW_ROOT_INNER_HTML = "shadowRoot.innerHTML"
+    ATTACH_SHADOW_INNER_HTML = "attachShadow().innerHTML"
+    CONTENT_DOCUMENT_WRITE = "contentDocument.write"
+    CONTENT_WINDOW_DOCUMENT_WRITE = "contentWindow.document.write"
+
+    # --- Attribute namespace ---
+    SET_ATTRIBUTE_NS = "setAttributeNS"
+
+    # --- CSS / stylesheet sinks ---
+    STYLE_PROPERTY = "style.setProperty"
+    STYLE_CSS_TEXT = "style.cssText"
+    STYLE_BACKGROUND_IMAGE = "style.backgroundImage"
+    CSS_STYLESHEET_REPLACE_SYNC = "CSSStyleSheet.replaceSync"
+    ADOPTED_STYLESHEETS = "adoptedStyleSheets"
+    INSERT_RULE = "insertRule"
+
+    # --- Framework-specific template/JSX sinks ---
+    REACT_DANGEROUSLY_SET_INNER_HTML = "dangerouslySetInnerHTML"
+    VUE_V_HTML = "v-html"
+    ANGULAR_INNER_HTML = "[innerHTML]"
+    ANGULAR_NG_BIND_HTML = "ng-bind-html"
+    ANGULAR_BYPASS_SECURITY_TRUST = "bypassSecurityTrust*"
+    ALPINE_X_HTML = "x-html"
+    HTMX_HX_ON = "hx-on"
+    HTMX_HX_VALS = "hx-vals"
+    HTMX_HX_HEADERS = "hx-headers"
+    LIT_UNSAFE_HTML = "unsafeHTML"
+    LIT_UNSAFE_SVG = "unsafeSVG"
+    LIT_UNSAFE_CSS = "unsafeCSS"
+    SVELTE_AT_HTML = "{@html}"
+
 
 class DOMSource(Enum):
     """DOM XSS source types."""
+    # --- Original ---
     LOCATION_HASH = "location.hash"
     LOCATION_SEARCH = "location.search"
     LOCATION_HREF = "location.href"
@@ -71,6 +109,56 @@ class DOMSource(Enum):
     CACHES = "caches"
     INDEXED_DB = "indexedDB"
     DATASET = "dataset"
+
+    # --- Location components ---
+    LOCATION_PATHNAME = "location.pathname"
+    LOCATION_ORIGIN = "location.origin"
+    LOCATION_HOSTNAME = "location.hostname"
+    LOCATION_PROTOCOL = "location.protocol"
+    LOCATION_PORT = "location.port"
+
+    # --- Document metadata ---
+    DOCUMENT_DOMAIN = "document.domain"
+    DOCUMENT_BASE_URI = "document.baseURI"
+    DOCUMENT_TITLE = "document.title"
+
+    # --- Navigator surface ---
+    NAVIGATOR_USER_AGENT = "navigator.userAgent"
+    NAVIGATOR_LANGUAGE = "navigator.language"
+    NAVIGATOR_CLIPBOARD_READ_TEXT = "navigator.clipboard.readText"
+    NAVIGATOR_CLIPBOARD_READ = "navigator.clipboard.read"
+
+    # --- Network response bodies ---
+    FETCH_RESPONSE = "fetch response body"
+    XHR_RESPONSE_TEXT = "xhr.responseText"
+    EVENT_SOURCE = "EventSource"
+
+    # --- Message channels ---
+    MESSAGE_PORT = "MessagePort"
+    BROADCAST_CHANNEL = "BroadcastChannel"
+    WORKER_MESSAGE = "Worker.onmessage"
+    SHARED_WORKER_MESSAGE = "SharedWorker.onmessage"
+    SERVICE_WORKER_MESSAGE = "ServiceWorker message"
+    MESSAGE_EVENT_ORIGIN = "messageEvent.origin"
+
+    # --- Form / input / clipboard values ---
+    INPUT_VALUE = "input.value"
+    TEXTAREA_VALUE = "textarea.value"
+    FILE_READER_RESULT = "FileReader.result"
+    CLIPBOARD_DATA = "clipboardData"
+    WINDOW_SELECTION = "window.getSelection"
+
+    # --- History mutation ---
+    HISTORY_PUSH_STATE = "history.pushState"
+    HISTORY_REPLACE_STATE = "history.replaceState"
+
+    # --- Cross-window ---
+    OPENER_LOCATION = "opener.location"
+    PARENT_LOCATION = "parent.location"
+    TOP_LOCATION = "top.location"
+
+    # --- WASM ---
+    WASM_MEMORY = "wasm.memory"
 
 
 @dataclass
@@ -109,9 +197,11 @@ class DOMAnalyzer:
     """
 
     # Sink patterns
+        # Sink patterns
     SINK_PATTERNS = {
-        DOMSink.INNER_HTML: r'\.innerHTML\s*=',
-        DOMSink.OUTER_HTML: r'\.outerHTML\s*=',
+        # --- Original ---
+        DOMSink.INNER_HTML: r'\.innerHTML\s*\+?=',
+        DOMSink.OUTER_HTML: r'\.outerHTML\s*\+?=',
         DOMSink.INSERT_ADJACENT_HTML: r'\.insertAdjacentHTML\s*\(',
         DOMSink.DOCUMENT_WRITE: r'document\.write\s*\(',
         DOMSink.DOCUMENT_WRITELN: r'document\.writeln\s*\(',
@@ -147,10 +237,47 @@ class DOMAnalyzer:
         DOMSink.IMPORT_SCRIPTS: r'importScripts\s*\(',
         DOMSink.WORKER: r'new\s+(?:Shared)?Worker\s*\(',
         DOMSink.SET_ATTRIBUTE: r"""\.setAttribute\s*\(\s*['"](?:href|src|srcdoc|action|formaction|style|on\w+)['"]""",
+
+        # --- URL / navigation ---
+        DOMSink.LOCATION_ASSIGN: r'location\.assign\s*\(',
+        DOMSink.LOCATION_REPLACE: r'location\.replace\s*\(',
+
+        # --- Shadow DOM / iframe ---
+        DOMSink.SHADOW_ROOT_INNER_HTML: r'\.shadowRoot\s*\.\s*innerHTML\s*\+?=',
+        DOMSink.ATTACH_SHADOW_INNER_HTML: r'attachShadow\s*\([^)]*\)\s*\.\s*innerHTML\s*\+?=',
+        DOMSink.CONTENT_DOCUMENT_WRITE: r'\.contentDocument\s*\.\s*write(?:ln)?\s*\(',
+        DOMSink.CONTENT_WINDOW_DOCUMENT_WRITE: r'\.contentWindow\s*\.\s*document\s*\.\s*write(?:ln)?\s*\(',
+
+        # --- Attribute namespace ---
+        DOMSink.SET_ATTRIBUTE_NS: r'\.setAttributeNS\s*\(',
+
+        # --- CSS / stylesheet sinks ---
+        DOMSink.STYLE_PROPERTY: r'\.style\s*\.\s*setProperty\s*\(',
+        DOMSink.STYLE_CSS_TEXT: r'\.style\s*\.\s*cssText\s*=',
+        DOMSink.STYLE_BACKGROUND_IMAGE: r'\.style\s*\.\s*backgroundImage\s*=',
+        DOMSink.CSS_STYLESHEET_REPLACE_SYNC: r'\.replaceSync\s*\(',
+        DOMSink.ADOPTED_STYLESHEETS: r'\.adoptedStyleSheets\s*=',
+        DOMSink.INSERT_RULE: r'\.insertRule\s*\(',
+
+        # --- Framework-specific template/JSX sinks ---
+        DOMSink.REACT_DANGEROUSLY_SET_INNER_HTML: r'dangerouslySetInnerHTML',
+        DOMSink.VUE_V_HTML: r'v-html\s*=',
+        DOMSink.ANGULAR_INNER_HTML: r'\[innerHTML\]\s*=',
+        DOMSink.ANGULAR_NG_BIND_HTML: r'ng-bind-html\s*=',
+        DOMSink.ANGULAR_BYPASS_SECURITY_TRUST: r'\.bypassSecurityTrust(?:Html|Script|Style|Url|ResourceUrl)\s*\(',
+        DOMSink.ALPINE_X_HTML: r'x-html\s*=',
+        DOMSink.HTMX_HX_ON: r'hx-on\s*[:=]',
+        DOMSink.HTMX_HX_VALS: r'hx-vals\s*=',
+        DOMSink.HTMX_HX_HEADERS: r'hx-headers\s*=',
+        DOMSink.LIT_UNSAFE_HTML: r'unsafeHTML\s*\(',
+        DOMSink.LIT_UNSAFE_SVG: r'unsafeSVG\s*\(',
+        DOMSink.LIT_UNSAFE_CSS: r'unsafeCSS\s*\(',
+        DOMSink.SVELTE_AT_HTML: r'\{@html',
     }
 
     # Source patterns
     SOURCE_PATTERNS = {
+        # --- Original ---
         DOMSource.LOCATION_HASH: r'location\.hash',
         DOMSource.LOCATION_SEARCH: r'location\.search',
         DOMSource.LOCATION_HREF: r'location\.href',
@@ -171,6 +298,56 @@ class DOMAnalyzer:
         DOMSource.CACHES: r'\bcaches\b',
         DOMSource.INDEXED_DB: r'\bindexedDB\b',
         DOMSource.DATASET: r'\.dataset\b',
+
+        # --- Location components ---
+        DOMSource.LOCATION_PATHNAME: r'location\.pathname',
+        DOMSource.LOCATION_ORIGIN: r'location\.origin',
+        DOMSource.LOCATION_HOSTNAME: r'location\.hostname',
+        DOMSource.LOCATION_PROTOCOL: r'location\.protocol',
+        DOMSource.LOCATION_PORT: r'location\.port\b',
+
+        # --- Document metadata ---
+        DOMSource.DOCUMENT_DOMAIN: r'document\.domain',
+        DOMSource.DOCUMENT_BASE_URI: r'document\.baseURI',
+        DOMSource.DOCUMENT_TITLE: r'document\.title',
+
+        # --- Navigator surface ---
+        DOMSource.NAVIGATOR_USER_AGENT: r'navigator\.userAgent',
+        DOMSource.NAVIGATOR_LANGUAGE: r'navigator\.language',
+        DOMSource.NAVIGATOR_CLIPBOARD_READ_TEXT: r'navigator\.clipboard\.readText',
+        DOMSource.NAVIGATOR_CLIPBOARD_READ: r'navigator\.clipboard\.read\b',
+
+        # --- Network response bodies ---
+        DOMSource.FETCH_RESPONSE: r'fetch\s*\([^)]*\)\s*\.then\s*\([^)]*\.(?:text|json|blob|arrayBuffer)\s*\(',
+        DOMSource.XHR_RESPONSE_TEXT: r'\.responseText\b',
+        DOMSource.EVENT_SOURCE: r'new\s+EventSource\s*\(',
+
+        # --- Message channels ---
+        DOMSource.MESSAGE_PORT: r'\.port[12]\b',
+        DOMSource.BROADCAST_CHANNEL: r'new\s+BroadcastChannel\s*\(',
+        DOMSource.WORKER_MESSAGE: r'worker\s*\.\s*onmessage\b',
+        DOMSource.SHARED_WORKER_MESSAGE: r'new\s+SharedWorker\s*\(',
+        DOMSource.SERVICE_WORKER_MESSAGE: r'navigator\.serviceWorker',
+        DOMSource.MESSAGE_EVENT_ORIGIN: r'(?:message|event)\.origin',
+
+        # --- Form / input / clipboard values ---
+        DOMSource.INPUT_VALUE: r'input\.value\b',
+        DOMSource.TEXTAREA_VALUE: r'textarea\.value\b',
+        DOMSource.FILE_READER_RESULT: r'reader\.result\b',
+        DOMSource.CLIPBOARD_DATA: r'clipboardData',
+        DOMSource.WINDOW_SELECTION: r'window\.getSelection\s*\(',
+
+        # --- History mutation ---
+        DOMSource.HISTORY_PUSH_STATE: r'history\.pushState',
+        DOMSource.HISTORY_REPLACE_STATE: r'history\.replaceState',
+
+        # --- Cross-window ---
+        DOMSource.OPENER_LOCATION: r'opener\.location',
+        DOMSource.PARENT_LOCATION: r'parent\.location',
+        DOMSource.TOP_LOCATION: r'top\.location',
+
+        # --- WASM ---
+        DOMSource.WASM_MEMORY: r'(?:\.memory\.buffer|new\s+WebAssembly\.Memory)',
     }
 
     # Sanitizer patterns
@@ -181,6 +358,30 @@ class DOMAnalyzer:
         r'escape',
         r'encodeURI',
         r'encodeURIComponent',
+        r'he\.encode',
+        r'he\.escape',
+        r'_\s*\.\s*escape',
+        r'lodash\s*\.\s*escape',
+        r'validator\s*\.\s*escape',
+        r'xss-filters',
+        r'js-xss',
+        r'xss\s*\(',
+        r'bleach\s*\.\s*clean',
+        r'markupsafe\s*\.\s*escape',
+        r'html\s*\.\s*escape',
+        r'htmlspecialchars',
+        r'htmlentities',
+        r'strip_tags',
+        r'esc_html',
+        r'esc_attr',
+        r'esc_url',
+        r'Sanitizer\s*\.\s*sanitize',
+        r'DomSanitizer',
+        r'TrustedHTML',
+        r'TrustedTypes',
+        r'createTextNode',
+        r'textContent\s*=',
+        r'innerText\s*=',
     ]
 
     def __init__(self):
@@ -297,6 +498,7 @@ class DOMAnalyzer:
     def generate_dom_payload(self, flow: DOMTaintFlow, marker: str) -> str:
         """Generate a DOM XSS payload for a specific taint flow."""
         html_sinks = {
+            # --- Original ---
             DOMSink.INNER_HTML,
             DOMSink.OUTER_HTML,
             DOMSink.INSERT_ADJACENT_HTML,
@@ -318,8 +520,48 @@ class DOMAnalyzer:
             DOMSink.PARSE_FROM_STRING,
             DOMSink.EXEC_COMMAND,
             DOMSink.SET_ATTRIBUTE,
+
+            # --- Shadow DOM / iframe write variants ---
+            DOMSink.SHADOW_ROOT_INNER_HTML,
+            DOMSink.ATTACH_SHADOW_INNER_HTML,
+            DOMSink.CONTENT_DOCUMENT_WRITE,
+            DOMSink.CONTENT_WINDOW_DOCUMENT_WRITE,
+
+            # --- Attribute namespace ---
+            DOMSink.SET_ATTRIBUTE_NS,
+
+            # --- CSS injection (styled like HTML: markup that renders in the DOM) ---
+            DOMSink.STYLE_PROPERTY,
+            DOMSink.STYLE_CSS_TEXT,
+            DOMSink.STYLE_BACKGROUND_IMAGE,
+            DOMSink.CSS_STYLESHEET_REPLACE_SYNC,
+            DOMSink.ADOPTED_STYLESHEETS,
+            DOMSink.INSERT_RULE,
+            DOMSink.LIT_UNSAFE_CSS,
+
+            # --- Framework template/JSX sinks (attribute-shaped, HTML-context) ---
+            DOMSink.REACT_DANGEROUSLY_SET_INNER_HTML,
+            DOMSink.VUE_V_HTML,
+            DOMSink.ANGULAR_INNER_HTML,
+            DOMSink.ANGULAR_NG_BIND_HTML,
+            DOMSink.ANGULAR_BYPASS_SECURITY_TRUST,
+            DOMSink.ALPINE_X_HTML,
+            DOMSink.HTMX_HX_ON,
+            DOMSink.HTMX_HX_VALS,
+            DOMSink.HTMX_HX_HEADERS,
+            DOMSink.LIT_UNSAFE_HTML,
+            DOMSink.LIT_UNSAFE_SVG,
+            DOMSink.SVELTE_AT_HTML,
+
+            # NOTE: FRAME_SRC and SCRIPT_SRC deliberately omitted — both are
+            # matched by the same r'\.src\s*=' pattern, so including them here
+            # (or in code_sinks) would double-report every `.src = ` assignment.
+            # LOCATION_HASH / LOCATION_SEARCH / DOCUMENT_REFERRER / WINDOW_NAME
+            # remain pure sources, not sinks.
         }
+
         code_sinks = {
+            # --- Original ---
             DOMSink.EVAL,
             DOMSink.FUNCTION,
             DOMSink.SET_TIMEOUT,
@@ -329,7 +571,12 @@ class DOMAnalyzer:
             DOMSink.WINDOW_OPEN,
             DOMSink.IMPORT_SCRIPTS,
             DOMSink.WORKER,
+
+            # --- Navigation variants (javascript: URL landing sites) ---
+            DOMSink.LOCATION_ASSIGN,
+            DOMSink.LOCATION_REPLACE,
         }
+
         if flow.sink.sink_type in html_sinks:
             return f"<img src=x onerror=window.__xoxss_dom_hits.push('{marker}')>"
         if flow.sink.sink_type in code_sinks:

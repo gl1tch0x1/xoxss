@@ -13,6 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from xoxss.core.compliance import (
+    compliance_for_kind,
+    cwe_for_kind,
+    cvss_for_finding,
+    finding_dedupe_fingerprint,
+    secondary_cwes,
+)
 from xoxss.reports.common import VERSION
 
 # SARIF severity mapping.  "note" still surfaces in GitHub code scanning.
@@ -78,6 +85,10 @@ def build_sarif_document(
         level = SARIF_LEVELS.get(confidence, "warning")
 
         if rule_id not in rules:
+            cwe = cwe_for_kind(kind)
+            cwe_slug = cwe.lower().replace("-", "")
+            comp = compliance_for_kind(kind)
+            owasp = comp["owasp"]
             rules[rule_id] = {
                 "id": rule_id,
                 "name": kind.split(" (")[0],
@@ -91,8 +102,19 @@ def build_sarif_document(
                 "helpUri": "https://owasp.org/www-community/attacks/xss/",
                 "defaultConfiguration": {"level": level},
                 "properties": {
-                    "tags": ["security", "xss", "owasp-a03"],
+                    "tags": [
+                        "security",
+                        "xss",
+                        f"external/cwe/{cwe_slug}",
+                        f"external/owasp/{owasp['id'].lower().replace(':', '-')}",
+                    ],
                     "precision": "high" if confidence in ("confirmed", "high") else "medium",
+                    "cwe": cwe,
+                    "secondaryCwes": secondary_cwes(kind),
+                    "owasp": owasp,
+                    "security-severity": cvss_for_finding(
+                        {"kind": kind, "confidence": confidence}
+                    )["baseScore"],
                 },
             }
             rule_order.append(rule_id)
@@ -143,6 +165,11 @@ def build_sarif_document(
                 ],
                 "properties": {
                     "findingId": getattr(finding, "finding_id", ""),
+                    "dedupeFingerprint": finding_dedupe_fingerprint(finding),
+                    "cwe": cwe_for_kind(kind),
+                    "secondaryCwes": secondary_cwes(kind),
+                    "cvss": cvss_for_finding(finding),
+                    "compliance": compliance_for_kind(kind),
                     "source": getattr(finding, "source", ""),
                     "parameter": parameter,
                     "method": method,
