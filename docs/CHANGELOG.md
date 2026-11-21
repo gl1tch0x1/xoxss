@@ -6,6 +6,8 @@ All notable changes to XOX$$ are documented here.  The format follows
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-21
+
 ### Added
 
 - **Dangling markup injection detection** (`xoxss/analysis/dangling.py`). A
@@ -41,6 +43,38 @@ All notable changes to XOX$$ are documented here.  The format follows
   that fails when a new capability flag is added without a god-mode decision.
 - Stats/summary/report rows: "Dangling markup", "Response splitting" and
   "Redirects blocked" counters (also serialized through `stats` in JSON).
+- **Extended surface analyzers wired into the scan pipeline**
+  (`--extended-analysis`, on by default; `--no-extended-analysis` disables).
+  Template injection, HTTP parameter pollution, cookie-based XSS, WASM,
+  web-component and clipboard detectors now run against the already-fetched
+  landing page — no extra requests — and emit deduplicated low-confidence
+  leads with explicit "not runtime verified" rationales. HPP "injection"
+  results are suppressed unless duplicate parameters are actually present
+  in the scanned URL.
+- **CST taint analysis** alongside the AST pass when tree-sitter is
+  installed, sharing the taint-flow dedupe/cap path (`source="cst"`).
+- **Stored-XSS hardening**: candidate URLs carrying the token/payload are
+  rejected (request reflection is not persistence), and hits are re-fetched
+  once to record whether the executable reflection is stable. New
+  `--stored-alt-session COOKIE_HEADER` re-checks hits under a second
+  identity for cross-session stored XSS evidence.
+- **mXSS and prototype-pollution detections now produce findings**
+  (low-confidence static leads) instead of console-only lists, and mXSS
+  payloads are delivered through HTML-body reflection points on flagged
+  pages with per-attempt tokens so browser confirmation still applies.
+- **DOM-clobbering payload delivery**: clobberable window properties are
+  collected per page and clobbering payloads are injected through
+  html-context reflections; clobbering matches emit low-confidence findings.
+- **`--min-confidence LEVEL`** filters findings at the report boundary
+  (JSON/Markdown/HTML/SARIF/compliance/collaboration) without affecting
+  collection, stats or `--fail-on` exit codes.
+- **Recon/fuzzing expansion**: ~800 directory words, ~180 fuzz extensions,
+  ~850 parameter names; JS intelligence now extracts EventSource,
+  sendBeacon, dynamic import, Worker, service-worker and JSONP endpoints
+  plus manifest/prefetch/form-action/meta-refresh/base-href resources, and
+  ~87 curated credential patterns (values masked in reports by default).
+  `expand_paths` ordering fixed so extension coverage is not starved by
+  wordlist size.
 
 ### Changed
 
