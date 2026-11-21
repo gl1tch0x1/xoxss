@@ -30,7 +30,7 @@ def collaboration_bundle(scanner: "XSSScanner") -> Dict[str, Any]:
         get = field_getter(finding)
         kind = str(get("kind"))
         dedupe_method = getattr(finding, "dedupe_key", None)
-        dedupe_key = (
+        dedupe_key = str(
             dedupe_method()
             if callable(dedupe_method)
             else finding_dedupe_fingerprint(finding)
