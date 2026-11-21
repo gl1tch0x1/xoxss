@@ -112,6 +112,27 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
   constraint-driven payload variants without being reported as XSS by themselves.
 - Mutation XSS (mXSS) hints from sanitizer and version detection.
 - Vulnerable-JavaScript-library detection from URLs and bundle contents.
+- **Extended attack-surface analyzer modules** (`xoxss/analysis/`, also usable
+  programmatically — see [Using as a library](#using-as-a-library)):
+  - **Template injection** (`template_injection.py`) — framework detection and
+    payload generation for 18 engines: Angular, Vue, Svelte, SolidJS, Lit,
+    Alpine.js, HTMX, React, Ember, Backbone, Astro, Mavo, Handlebars, Mustache,
+    EJS, Pug, Nunjucks and Twig.
+  - **HTTP parameter pollution** (`hpp.py`) — duplicate parameters, case
+    collisions, array/dot notation, encoding variants and ordering tricks for
+    WAF bypass and parser-differential testing.
+  - **Cookie-based XSS** (`cookie_xss.py`) — `document.cookie`, header and
+    storage sinks with attribute-bypass analysis (SameSite, Secure, HttpOnly,
+    Path, Domain).
+  - **Web Components** (`web_components.py`) — custom-element hijacking,
+    Shadow DOM injection, template reuse and lifecycle-hook sinks.
+  - **WebAssembly** (`wasm_xss.py`) — module/instance/memory/table/function
+    sinks feeding JavaScript, plus `.wasm` asset detection.
+  - **Clipboard** (`clipboard_xss.py`) — Clipboard API, paste/copy/cut
+    handlers and `execCommand` clipboard sinks.
+  - **Blind/OOB transports** (`xoxss/oob/dns_blind.py`, `smtp_blind.py`,
+    `websocket_oob.py`) — DNS exfiltration/rebinding, SMTP header and subject
+    injection, and WebSocket message/frame/callback sink analysis.
 
 **Discovery**
 
@@ -176,6 +197,11 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 - Native interactsh client with RSA-OAEP/AES-CTR encryption and correlation IDs.
 - Generic JSON/NDJSON poller (XSS Hunter, Burp bridges, custom collectors) and a local
   file tailer for `interactsh-client` output.
+- Blind/OOB analysis modules for transports interactsh does not cover: DNS
+  payload generation with five exfiltration methods and rebinding checks
+  (`oob/dns_blind.py`), SMTP email-form and header-injection payloads
+  (`oob/smtp_blind.py`), and WebSocket message/frame/callback/event sink
+  analysis with OOB payload generation (`oob/websocket_oob.py`).
 - Background polling raises a `Blind XSS (callback confirmed)` finding only when the
   out-of-band callback is observed with the marker — a probe that was merely sent is
   never a finding — plus a post-scan grace period for late callbacks.
@@ -187,7 +213,10 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 - WAF fingerprinting (header/cookie/body signatures) and an active blocking probe.
 - Retries with exponential backoff, `Retry-After` support, token-bucket rate limiting,
   optional adaptive (`--smart-rate`) limiting, proxy support and request concurrency.
-- Console, JSON, Markdown, self-contained HTML and SARIF v2.1.0 reports.
+- Console, JSON, Markdown, self-contained HTML, SARIF v2.1.0, compliance
+  (OWASP/PCI DSS/HIPAA) and team-collaboration reports.
+- Scan summary reports the real payload budget — payloads tested versus the
+  total available pool — so coverage is never ambiguous.
 - Optional browser screenshots for confirmed findings; preflight diagnostics with
   `--doctor`.
 
@@ -574,7 +603,7 @@ bypasses from the checkpoint.
 | `--mutation-probes` / `--mutation-probe-limit N` | Opt in to bounded Unicode, decoding, byte-mask and multibyte transformation probes. |
 | `--adaptive-payloads` | Add bounded syntax variants using observed delimiter constraints. |
 | `--log-file PATH` | Write the full human-readable text log to a file. `-o, --output` remains a deprecated alias. |
-| `--report LIST` | `json`, `md`, `html`, `sarif`, combinations, `all`, or `none` (default `all`). |
+| `--report LIST` | `json`, `md`, `html`, `sarif`, `compliance`, `collab`, combinations, `all`, or `none` (default `all`; `all` emits all six formats). |
 | `--report-dir DIR` / `--state-dir DIR` | Report root / checkpoint root (default `.xoxss`). |
 | `--env PATH` / `--config PATH` | Custom `.env` file path (auto-discovers `.env`). |
 | `--events-jsonl PATH` | Append versioned JSONL target, discovery, finding, and completion events for automation. |
@@ -824,6 +853,12 @@ see `xoxss/data/LAZYXSS_NOTICE.md` for provenance.
     sarif_file: artifacts
 ```
 
+SARIF results carry CWE identifiers, CVSS v3.1 scores and OWASP tags, so
+code-scanning dashboards can filter and prioritize by severity out of the box.
+`--report compliance` produces an audit mapping to OWASP Top 10 2021, PCI DSS
+4.0 and HIPAA controls; `--report collab` produces a deduplicated triage bundle
+with stable finding IDs for team issue trackers.
+
 Only `confirmed` and `high` findings return `2`. There are no open-ended blind
 findings waiting to be confirmed — a blind point either has a callback (confirmed)
 or nothing at all. For air-gapped environments use
@@ -840,10 +875,12 @@ Each requested format is written as:
 
 | Format | Ext | Contents |
 |---|---|---|
-| JSON | `.json` | Full payload: stats, recon, OOB, analyzer results, findings. Each finding includes `finding_id`, the redacted `request`, `response_status`/`response_excerpt`, `sink`/`dom_path`, `oob` callback detail, `poc_url` and a copy-paste `poc_curl`. |
+| JSON | `.json` | Full payload: stats, recon, OOB, analyzer results, findings. Each finding includes `finding_id`, triage fields (`status`, `assigned_to`, `triaged_at`, `notes`), the redacted `request`, `response_status`/`response_excerpt`, `sink`/`dom_path`, `oob` callback detail, `poc_url` and a copy-paste `poc_curl`. |
 | Markdown | `.md` | Human-readable summary, tables with finding IDs, per-finding request/response evidence, sink, OOB callbacks and a `curl` PoC block. |
 | HTML | `.html` | Self-contained dark-theme report with cards, tables, a PoC column, full request/response evidence and click-to-expand screenshot evidence. |
-| SARIF | `.sarif` | SARIF v2.1.0 for code-scanning platforms. Rules derive from findings (`xoxss/reflected-xss`, …); `confirmed`/`high` → `error`, `medium` → `warning`, `low` → `note`. Each result embeds `findingId`, `request`, `sink`, `pocUrl`, `pocCurl` and `oob` properties. |
+| SARIF | `.sarif` | SARIF v2.1.0 for code-scanning platforms. Rules derive from findings (`xoxss/reflected-xss`, …); `confirmed`/`high` → `error`, `medium` → `warning`, `low` → `note`. Rules and results carry CWE ids (`external/cwe/cwe-79` tags), secondary CWEs, a CVSS v3.1 vector/base score/severity, OWASP mapping and a stable dedupe fingerprint alongside `findingId`, `request`, `sink`, `pocUrl`, `pocCurl` and `oob` properties. |
+| Compliance | `.compliance.json` | Audit-evidence mapping of every finding to OWASP Top 10 2021, PCI DSS 4.0 and HIPAA Security Rule controls, with per-control counts and CWE/CVSS per finding. |
+| Collaboration | `.collab.json` | Deduplicated triage bundle: findings grouped by dedupe key with stable IDs, occurrence counts, best-confidence rollup, evidence excerpts and `status`/`assignedTo`/`notes` fields for team workflows. |
 
 Screenshots go to `<state-dir>/screenshots/` (`<token>.png`, `dom-<token>.png`) and are
 linked from findings. The HTML report renders each one as a thumbnail that opens in a
@@ -887,6 +924,10 @@ intelligence, OpenAPI operations, OOB registrations and every analyzer list):
       "confidence_rationale": "The payload's delimiters survived verbatim in an executable context; browser verification was disabled.",
       "context": "html",
       "source": "query",
+      "status": "open",
+      "assigned_to": "",
+      "triaged_at": "",
+      "notes": "",
       "request": {
         "method": "GET",
         "url": "https://target.tld/search?q=...",
@@ -1022,7 +1063,7 @@ flowchart LR
     SCAN --> CRAWLER["engine/crawler.py<br/>BFS spider and sitemaps"]
     SCAN --> RECON["recon/ modules<br/>passive, JS, OpenAPI, access bypass"]
     SCAN --> OOB["oob/ modules<br/>interactsh and pollers"]
-    SCAN --> REPORTS["reports/ modules<br/>JSON, HTML, Markdown, SARIF"]
+    SCAN --> REPORTS["reports/ modules<br/>JSON, HTML, Markdown, SARIF, compliance, collaboration"]
     SCAN --> EVENTS["console events and JSONL"]
 ```
 
@@ -1054,6 +1095,7 @@ xoxss/
   core/
     config.py             typed ScanConfig schema supporting all 102 options and presets
     finding.py            Finding, Evidence, Confidence, and finding collection models
+    compliance.py         CWE/CVSS v3.1 scoring and OWASP/PCI DSS/HIPAA mappings
     scope.py              ScopeManager, URL normalization, out-of-scope/dead-zone filters
     cdp_hooks.py          CDP runtime taint tracking and prototype sink hooking
     execution_oracle.py   headless browser verification harness and PoC verification
@@ -1087,6 +1129,7 @@ xoxss/
     graphql.py            GraphQL introspection, endpoint discovery, and injection analysis
     csp.py                Content Security Policy evaluation and bypass analysis
     jsonp.py cors.py mxss.py dom_clobbering.py trusted_types.py websocket.py file_upload.py postmessage.py
+    template_injection.py hpp.py cookie_xss.py web_components.py wasm_xss.py clipboard_xss.py
   engine/
     crawler.py            BFS spider, sitemap walker and endpoint recorder
   crawler/
@@ -1101,6 +1144,9 @@ xoxss/
     base.py               OOB manager, marker correlation, generic parsing
     interactsh.py         native RSA/AES interactsh client
     poller.py             HTTP and file pollers
+    dns_blind.py          DNS exfiltration/rebinding blind-XSS analysis
+    smtp_blind.py         SMTP/email header-injection blind-XSS analysis
+    websocket_oob.py      WebSocket sink analysis and OOB payload generation
   tools/
     external.py           optional recon, parameter discovery and XSS tool adapters
   reports/
@@ -1108,7 +1154,9 @@ xoxss/
     html.py               standalone HTML report
     json.py               JSON report payload and writer
     markdown.py           Markdown report
-    sarif.py              SARIF v2.1.0 export
+    sarif.py              SARIF v2.1.0 export with CWE/CVSS/OWASP metadata
+    compliance.py         OWASP Top 10 / PCI DSS / HIPAA control mapping
+    collaboration.py      deduplicated triage bundle for team workflows
   data/
     lazyxss.txt           bundled LazyXss payload pack
     LAZYXSS_NOTICE.md     payload provenance and licensing notice
@@ -1187,6 +1235,25 @@ findings = asyncio.run(scanner.run())
 `scanner.run()` starts and closes the HTTP engine and browser pool, writes reports
 unless `--report none` is set, and returns `Finding` objects. The internal API is not a
 versioned library contract; pin the version you embed.
+
+The extended analyzer modules are importable directly for custom pipelines —
+each returns structured vulnerability objects with risk assessments:
+
+```python
+from xoxss.analysis.template_injection import TemplateInjectionDetector
+from xoxss.analysis.hpp import HPPDetector
+from xoxss.analysis.cookie_xss import CookieXSSDetector
+from xoxss.oob.dns_blind import DNSBlindXSSDetector
+from xoxss.core.compliance import cvss_for_finding, compliance_for_kind
+
+detector = TemplateInjectionDetector()
+frameworks = detector.detect_frameworks(html_content, js_content)
+vulns = detector.scan_for_template_injection(html_content, url="https://t.example/")
+
+# CWE/CVSS + framework controls for any finding-like object
+print(cvss_for_finding({"kind": "Reflected XSS", "confidence": "high"}))
+print(compliance_for_kind("Reflected XSS")["owasp"]["id"])  # A03:2021
+```
 
 ## Performance
 
@@ -1329,6 +1396,11 @@ stealth-only features, no destructive defaults, no unconfirmed finding promoted 
 - **Advanced analyzers are heuristics** (mXSS, CSP, CORS, clobbering, Trusted Types,
   JSONP, GraphQL, WebSocket, upload, `postMessage`) — supporting signals, not
   exhaustive protocol implementations.
+- **Extended analyzers** (template injection, HPP, cookie XSS, Web Components,
+  WASM, clipboard, DNS/SMTP/WebSocket OOB) ship as importable modules under
+  `xoxss/analysis/` and `xoxss/oob/`; their results are structured
+  vulnerability objects rather than `Finding`s, so they are not yet merged
+  into the default scan pipeline.
 - **Mass mode is triage, not confirmation**, and **no WAF evasion is guaranteed**.
 - **No distributed scanning** (concurrency is per-process) and **no interception
   proxy**; use separate state/report dirs for scale, and `--proxy` with an external
