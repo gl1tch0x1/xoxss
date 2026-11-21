@@ -40,6 +40,75 @@ _SECRET_PATTERNS: List[Tuple[str, str, str]] = [
     ("basic_auth_url", r"\bhttps?://[^/\s:'\"]+:[^/\s'\"]+@[^\s'\"]+", "high"),
     ("bearer_token", r"(?i)bearer\s+([A-Za-z0-9._~+/=-]{18,})", "high"),
     ("generic_secret", r"(?i)(?:api[_-]?key|secret|passwd|password|auth[_-]?token|access[_-]?token)['\"]?\s*[:=]\s*['\"]([^'\"]{12,})['\"]", "medium"),
+    # --- cloud / SaaS credentials -------------------------------------------
+    ("gcp_api_key", r"\bAIza[0-9A-Za-z_-]{35}\b", "high"),
+    ("gcp_oauth", r"\b[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com\b", "medium"),
+    ("azure_storage", r"\bDefaultEndpointsProtocol=https?://[a-z0-9]+\.blob\.core\.windows\.net", "high"),
+    ("azure_sas", r"(?i)(?:sig|se|sp|sv|sr)=[A-Za-z0-9%_-]{8,}", "medium"),
+    ("digitalocean_token", r"\bdop_v1_[a-f0-9]{64}\b", "critical"),
+    ("digitalocean_pat", r"\bdop_v1_[a-f0-9]{64}\b", "critical"),
+    ("heroku_api", r"(?i)heroku[_-]?(?:api[_-]?)?key['\"\s:=]{1,12}([0-9a-f-]{36})", "high"),
+    ("npm_token", r"\bnpm_[A-Za-z0-9]{36}\b", "critical"),
+    ("pypi_token", r"\bpypi-[A-Za-z0-9_-]{16,}\b", "critical"),
+    ("rubygems_token", r"\brg_[A-Za-z0-9]{16,}\b", "high"),
+    ("discord_token", r"\b[MN][A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27}\b", "critical"),
+    ("discord_webhook", r"https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+", "high"),
+    ("telegram_bot", r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b", "critical"),
+    ("slack_app_token", r"\bxapp-[0-9A-Za-z-]{10,}\b", "critical"),
+    ("slack_config_token", r"\bxoxe\.[0-9A-Za-z-]{10,}\b", "critical"),
+    ("openai_key", r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}\b", "critical"),
+    ("anthropic_key", r"\bsk-ant-[A-Za-z0-9_-]{20,}\b", "critical"),
+    ("huggingface_token", r"\bhf_[A-Za-z0-9]{30,}\b", "high"),
+    ("replicate_token", r"\br8_[A-Za-z0-9]{20,}\b", "high"),
+    ("groq_key", r"\bgsk_[A-Za-z0-9]{20,}\b", "high"),
+    ("cohere_key", r"\b[A-Za-z0-9]{40}\b(?=[^\n]{0,40}cohere)", "medium"),
+    ("shopify_token", r"\bshpat_[a-f0-9]{32}\b", "critical"),
+    ("shopify_access", r"\bshpca_[a-f0-9]{32}\b", "critical"),
+    ("shopify_shared", r"\bshpss_[a-f0-9]{32}\b", "critical"),
+    ("square_token", r"\bsq0atp-[A-Za-z0-9_-]{22}\b|\bsq0csp-[A-Za-z0-9_-]{43}\b", "critical"),
+    ("paypal_token", r"\bA21AA[A-Za-z0-9_-]{60,}\b", "high"),
+    ("razorpay_key", r"\brzp_(?:live|test)_[A-Za-z0-9]{14}\b", "high"),
+    ("braintree_key", r"(?i)braintree[_-]?(?:public|private)[_-]?key['\"\s:=]{1,12}([A-Za-z0-9]{16})", "medium"),
+    ("paypal_secret", r"(?i)paypal[_-]?(?:secret|client[_-]?secret)['\"\s:=]{1,12}([A-Za-z0-9_-]{20,})", "critical"),
+    ("twilio_sid", r"\bAC[a-f0-9]{32}\b", "high"),
+    ("mailchimp_key", r"\b[a-f0-9]{32}-us\d+\b", "high"),
+    ("postmark_key", r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b", "medium"),
+    ("mandrill_key", r"\b[A-Za-z0-9]{26}-[A-Za-z0-9_-]{24}\b", "high"),
+    ("sendinblue_key", r"\bxkeysib-[A-Za-z0-9_-]{40,}\b", "high"),
+    ("mailjet_key", r"(?i)mailjet[_-]?(?:api[_-]?)?key['\"\s:=]{1,12}([a-f0-9]{32})", "high"),
+    ("aws_session", r"\bASIA[0-9A-Z]{16}\b", "high"),
+    ("aws_mws", r"\bamzn\.mws\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", "critical"),
+    ("gcp_service_account", r'"type"\s*:\s*"service_account"', "critical"),
+    ("gcp_private_key", r'"private_key"\s*:\s*"-----BEGIN', "critical"),
+    ("supabase_url", r"https://[a-z0-9]+\.supabase\.co", "medium"),
+    ("supabase_key", r"\beyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b", "critical"),
+    ("vercel_token", r"\b[A-Za-z0-9]{24}\.[A-Za-z0-9]{24}\b", "medium"),
+    ("netlify_token", r"\bnfp_[A-Za-z0-9]{20,}\b", "critical"),
+    ("cloudflare_api", r"(?i)cloudflare[_-]?(?:api[_-]?)?token['\"\s:=]{1,12}([A-Za-z0-9_-]{37})", "critical"),
+    ("github_pat", r"\bgithub_pat_[A-Za-z0-9_]{22,}\b", "critical"),
+    ("github_oauth", r"\bgho_[A-Za-z0-9]{36}\b", "critical"),
+    ("github_app", r"\b(?:ghu|ghs)_[A-Za-z0-9]{36}\b", "critical"),
+    ("github_refresh", r"\bghr_[A-Za-z0-9]{36}\b", "critical"),
+    ("gitlab_pat", r"\bglpat-[A-Za-z0-9_-]{20,}\b", "critical"),
+    ("bitbucket_token", r"\bATBB[A-Za-z0-9]{20,}\b", "critical"),
+    ("bitbucket_app", r"(?i)bitbucket[_-]?(?:app[_-]?)?password['\"\s:=]{1,12}([A-Za-z0-9]{16,})", "high"),
+    ("dockerhub_token", r"\bdckr_pat_[A-Za-z0-9_-]{27}\b", "critical"),
+    ("jfrog_token", r"(?i)jfrog[_-]?(?:access[_-]?)?token['\"\s:=]{1,12}([A-Za-z0-9]{20,})", "high"),
+    ("sonarqube_token", r"\bsqu_[A-Za-z0-9_-]{40}\b", "critical"),
+    ("sentry_token", r"\bsntrys_[A-Za-z0-9_-]{20,}\b|\b[a-f0-9]{32}\b", "medium"),
+    ("newrelic_key", r"\bNRAK-[A-Z0-9]{27}\b|\bNRBR-[A-Z0-9]{19}\b|\bNRAL-[A-Z0-9]{32}\b", "high"),
+    ("pagerduty_token", r"\bu\+[^\s]{20,}\b", "high"),
+    ("opsgenie_key", r"\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b", "medium"),
+    ("splunk_token", r"(?i)splunk[_-]?(?:hec[_-]?)?token['\"\s:=]{1,12}([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})", "high"),
+    ("vault_token", r"\bhvs\.[A-Za-z0-9_-]{20,}\b|\bs\.[A-Za-z0-9]{20,}\b", "critical"),
+    ("consul_token", r"(?i)consul[_-]?(?:acl[_-]?)?token['\"\s:=]{1,12}([a-f0-9]{36})", "high"),
+    ("terraform_token", r"(?i)terraform[_-]?(?:cloud[_-]?)?token['\"\s:=]{1,12}([A-Za-z0-9]{20,})", "high"),
+    ("kubernetes_token", r"\beyJhbGciOiJSUzI1NiIsImtpZCI6", "critical"),
+    ("docker_config", r'"auths"\s*:\s*\{[^}]*"auth"', "critical"),
+    ("ssh_private_key", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY(?: BLOCK)?-----", "critical"),
+    ("pgp_private_key", r"-----BEGIN PGP PRIVATE KEY BLOCK-----", "critical"),
+    ("age_private_key", r"AGE-SECRET-KEY-1[0-9A-Z]{58}", "critical"),
+    ("wireguard_key", r"\[Interface\][^\[]*PrivateKey", "high"),
 ]
 
 _ENDPOINT_RE = re.compile(
@@ -121,6 +190,62 @@ _ATTR_URL_RE = re.compile(
 _JSON_ENDPOINT_RE = re.compile(
     r"""(?:"|')((?:/|https?://)[^"'<>]{2,200}/(?:api|v\d+|graphql|rest|rpc)[^"'<>]*)["']""",
     re.I,
+)
+# Additional client-side request surfaces not covered by _ENDPOINT_RE.
+_EVENTSOURCE_RE = re.compile(
+    r"""\bnew\s+EventSource\s*\(\s*["'`]([^"'`]{2,300})["'`]""", re.I
+)
+_SEND_BEACON_RE = re.compile(
+    r"""\b(?:navigator\.)?sendBeacon\s*\(\s*["'`]([^"'`]{2,300})["'`]""", re.I
+)
+_DYNAMIC_IMPORT_RE = re.compile(
+    r"""\bimport\s*\(\s*["'`]([^"'`]{2,300})["'`]\s*\)"""
+)
+_LOCATION_METHOD_RE = re.compile(
+    r"""\b(?:window\.)?location\.(?:assign|replace)\s*\(\s*["'`]([^"'`]{2,300})["'`]""",
+    re.I,
+)
+_SCRIPT_CREATE_RE = re.compile(
+    r"""\.(?:src|href)\s*=\s*["'`]([^"'`]{2,300})["'`][^;]{0,120}(?:appendChild|insertBefore)""",
+    re.I | re.S,
+)
+_WORKER_RE = re.compile(
+    r"""\bnew\s+(?:Worker|SharedWorker)\s*\(\s*["'`]([^"'`]{2,300})["'`]""", re.I
+)
+_SERVICE_WORKER_RE = re.compile(
+    r"""\.register\s*\(\s*["'`]([^"'`]{2,300})["'`]"""
+)
+_MANIFEST_RE = re.compile(
+    r"""<link[^>]+rel=["']manifest["'][^>]+href=["']([^"']+)["']""", re.I
+)
+_PREFETCH_RE = re.compile(
+    r"""<link[^>]+rel=["'](?:prefetch|preload|modulepreload|dns-prefetch|preconnect)["'][^>]+href=["']([^"']+)["']""",
+    re.I,
+)
+_JSONP_SCRIPT_RE = re.compile(
+    r"""<script[^>]+src=["']([^"']*(?:callback|jsonp|cb|_cb)[^"']*)["']""", re.I
+)
+_IFRAME_SRC_RE = re.compile(
+    r"""<iframe[^>]+src=["']([^"']{2,300})["']""", re.I
+)
+_OBJECT_DATA_RE = re.compile(
+    r"""<object[^>]+data=["']([^"']{2,300})["']""", re.I
+)
+_EMBED_SRC_RE = re.compile(
+    r"""<embed[^>]+src=["']([^"']{2,300})["']""", re.I
+)
+_FORM_ACTION_RE = re.compile(
+    r"""<form[^>]+action=["']([^"']{2,300})["']""", re.I
+)
+_BUTTON_FORM_ACTION_RE = re.compile(
+    r"""<(?:button|input)[^>]+formaction=["']([^"']{2,300})["']""", re.I
+)
+_META_REFRESH_RE = re.compile(
+    r"""<meta[^>]+http-equiv=["']refresh["'][^>]+content=["'][^"']*url=([^"']+)["']""",
+    re.I,
+)
+_BASE_HREF_RE = re.compile(
+    r"""<base[^>]+href=["']([^"']{2,300})["']""", re.I
 )
 
 _STATIC_EXTENSIONS = {
@@ -304,28 +429,41 @@ def _absolute(value: str, base: str) -> str:
         return value
 
 
+# Single-capture-group patterns that each yield one URL/path candidate.
+_SINGLE_GROUP_ENDPOINT_RES = (
+    _EVENTSOURCE_RE,
+    _SEND_BEACON_RE,
+    _DYNAMIC_IMPORT_RE,
+    _LOCATION_METHOD_RE,
+    _SCRIPT_CREATE_RE,
+    _WORKER_RE,
+    _SERVICE_WORKER_RE,
+    _JSONP_SCRIPT_RE,
+)
+
+
 def extract_endpoints(js: str, base_url: str = "") -> List[str]:
     found: List[str] = []
     seen: Set[str] = set()
-    for match in _ENDPOINT_RE.finditer(js or ""):
-        value = match.group("quoted") or match.group("css") or match.group("fetch") or ""
-        if not _looks_like_endpoint(value):
-            continue
+
+    def _add(value: str) -> None:
+        value = (value or "").strip().strip("'\"`")
+        if not value or not _looks_like_endpoint(value):
+            return
         url = _absolute(value, base_url)
         key = url.split("#", 1)[0]
         if key in seen:
-            continue
+            return
         seen.add(key)
         found.append(url)
+
+    for match in _ENDPOINT_RE.finditer(js or ""):
+        _add(match.group("quoted") or match.group("css") or match.group("fetch") or "")
     for match in _JSON_ENDPOINT_RE.finditer(js or ""):
-        value = match.group(1)
-        if not _looks_like_endpoint(value):
-            continue
-        url = _absolute(value, base_url)
-        key = url.split("#", 1)[0]
-        if key not in seen:
-            seen.add(key)
-            found.append(url)
+        _add(match.group(1))
+    for pattern in _SINGLE_GROUP_ENDPOINT_RES:
+        for match in pattern.finditer(js or ""):
+            _add(match.group(1))
     return found
 
 
@@ -455,15 +593,31 @@ def extract_html_parameters(html: str) -> List[str]:
     return names
 
 
+# HTML attribute-surface patterns feeding extract_attr_urls.
+_HTML_URL_RES = (
+    _MANIFEST_RE,
+    _PREFETCH_RE,
+    _JSONP_SCRIPT_RE,
+    _IFRAME_SRC_RE,
+    _OBJECT_DATA_RE,
+    _EMBED_SRC_RE,
+    _FORM_ACTION_RE,
+    _BUTTON_FORM_ACTION_RE,
+    _META_REFRESH_RE,
+    _BASE_HREF_RE,
+)
+
+
 def extract_attr_urls(html: str, base_url: str = "") -> List[str]:
     urls: List[str] = []
-    for match in _ATTR_URL_RE.finditer(html or ""):
-        value = match.group(1).strip()
-        if value.startswith(("data:", "mailto:", "tel:", "javascript:", "#")):
-            continue
-        url = _absolute(value, base_url)
-        if url and url not in urls:
-            urls.append(url)
+    for pattern in (_ATTR_URL_RE, *_HTML_URL_RES):
+        for match in pattern.finditer(html or ""):
+            value = match.group(1).strip()
+            if not value or value.startswith(("data:", "mailto:", "tel:", "javascript:", "#")):
+                continue
+            url = _absolute(value, base_url)
+            if url and url not in urls:
+                urls.append(url)
     return urls
 
 

@@ -35,6 +35,67 @@ class EnhancedSink(Enum):
     NAME = "window_name"
     WEBSQL_EXECUTE = "websql_execute"
     INDEXEDDB_EXECUTE = "indexeddb_execute"
+    BROADCAST_CHANNEL = "broadcast_channel"
+    SHARED_WORKER = "shared_worker"
+    NAVIGATION_API = "navigation_api"
+    DOM_PARSER = "dom_parser"
+    RANGE_FRAGMENT = "range_fragment"
+    INSERT_ADJACENT = "insert_adjacent"
+    OUTER_HTML = "outer_html"
+    SCRIPT_TEXT = "script_text"
+    ATTACH_SHADOW = "attach_shadow"
+    CONTENT_DOCUMENT_WRITE = "content_document_write"
+    SET_TIMEOUT_STRING = "set_timeout_string"
+    NEW_FUNCTION = "new_function"
+    LOCATION_ASSIGN = "location_assign"
+    WINDOW_OPEN = "window_open"
+    DOCUMENT_DOMAIN = "document_domain"
+    HISTORY_API = "history_api"
+    SEND_BEACON = "send_beacon"
+    EVENTSOURCE = "eventsource"
+    DYNAMIC_IMPORT = "dynamic_import"
+    WEBSOCKET_SEND = "websocket_send"
+    PROTOCOL_HANDLER = "protocol_handler"
+    NAV_CREDENTIALS = "nav_credentials"
+    WEB_SHARE = "web_share"
+    TEMPLATE_CONTENT = "template_content"
+    SLOT_ASSIGN = "slot_assign"
+    CUSTOM_ELEMENT = "custom_element"
+    SHADOW_ROOT_HTML = "shadow_root_html"
+    IFRAME_SRCDOC = "iframe_srcdoc"
+    OBJECT_DATA = "object_data"
+    EMBED_SRC = "embed_src"
+    SCRIPT_SRC = "script_src"
+    LINK_HREF = "link_href"
+    META_REFRESH = "meta_refresh"
+    BASE_HREF = "base_href"
+    FORM_ACTION = "form_action"
+    BUTTON_FORM_ACTION = "button_formaction"
+    INPUT_FORM_ACTION = "input_formaction"
+    AREA_HREF = "area_href"
+    SVG_USE_HREF = "svg_use_href"
+    MATHML_HREF = "mathml_href"
+    IFRAME_LONGDESC = "iframe_longdesc"
+    FRAME_LONGDESC = "frame_longdesc"
+    ISINDEX_ACTION = "isindex_action"
+    BGSOUND_SRC = "bgsound_src"
+    LAYER_SRC = "layer_src"
+    XML_DATA_ISLAND = "xml_data_island"
+    CSS_IMPORT = "css_import"
+    CSS_URL = "css_url"
+    CSS_IMAGESET = "css_imageset"
+    CSS_CURSOR = "css_cursor"
+    CSS_LIST_STYLE = "css_list_style"
+    CSS_CONTENT_URL = "css_content_url"
+    CSS_BEHAVIOR = "css_behavior"
+    CSS_MOZ_BINDING = "css_moz_binding"
+    CSS_FILTER_PROGID = "css_filter_progid"
+    CSS_EXPRESSION_FUNC = "css_expression_func"
+    CSS_JAVASCRIPT_URL = "css_javascript_url"
+    CSS_VBSCRIPT_URL = "css_vbscript_url"
+    CSS_DATA_URL = "css_data_url"
+    CSS_BLOB_URL = "css_blob_url"
+    CSS_FILESYSTEM_URL = "css_filesystem_url"
 
 
 @dataclass
@@ -122,6 +183,256 @@ class EnhancedSinkTracker:
         EnhancedSink.INDEXEDDB_EXECUTE: [
             r"\.objectStore\s*\([^)]*\)\s*\.\s*(?:add|put)\s*\(",
             r"\bIDBObjectStore\.prototype\.(?:add|put)\b",
+        ],
+        # --- modern DOM / network sinks --------------------------------------
+        EnhancedSink.BROADCAST_CHANNEL: [
+            r"\bnew\s+BroadcastChannel\s*\(",
+            r"\.postMessage\s*\([^)]*\.(?:name|data|payload)",
+        ],
+        EnhancedSink.SHARED_WORKER: [
+            r"\bnew\s+SharedWorker\s*\(",
+        ],
+        EnhancedSink.NAVIGATION_API: [
+            r"\bnavigation\.(?:navigate|reload|traverseTo|back|forward)\s*\(",
+            r"\bonnavigate\s*=",
+            r"\bNavigateEvent\b",
+        ],
+        EnhancedSink.DOM_PARSER: [
+            r"\bnew\s+DOMParser\s*\(\s*\)\s*\.\s*parseFromString\s*\(",
+            r"\.parseFromString\s*\([^)]*text/html",
+        ],
+        EnhancedSink.RANGE_FRAGMENT: [
+            r"\.createContextualFragment\s*\(",
+            r"\bRange\.prototype\.createContextualFragment\b",
+        ],
+        EnhancedSink.INSERT_ADJACENT: [
+            r"\.insertAdjacentHTML\s*\(",
+            r"\.insertAdjacentElement\s*\(",
+            r"\.insertAdjacentText\s*\(",
+        ],
+        EnhancedSink.OUTER_HTML: [
+            r"\.outerHTML\s*=",
+            r"\.outerHTML\s*\+=",
+        ],
+        EnhancedSink.SCRIPT_TEXT: [
+            r"\.createElement\s*\(\s*['\"]script['\"]\s*\)[\s\S]{0,200}\.text\s*=",
+            r"\.createElement\s*\(\s*['\"]script['\"]\s*\)[\s\S]{0,200}\.textContent\s*=",
+            r"\.createElement\s*\(\s*['\"]script['\"]\s*\)[\s\S]{0,200}\.innerHTML\s*=",
+        ],
+        EnhancedSink.ATTACH_SHADOW: [
+            r"\.attachShadow\s*\([^)]*\)\s*\.\s*innerHTML\s*=",
+            r"\.attachShadow\s*\([^)]*\)[\s\S]{0,300}\.innerHTML\s*=",
+        ],
+        EnhancedSink.CONTENT_DOCUMENT_WRITE: [
+            r"\.contentDocument\.write\s*\(",
+            r"\.contentWindow\.document\.write\s*\(",
+            r"\.contentWindow\.eval\s*\(",
+            r"\.contentDocument\.open\s*\(",
+        ],
+        EnhancedSink.SET_TIMEOUT_STRING: [
+            r"\bsetTimeout\s*\(\s*['\"`]",
+            r"\bsetInterval\s*\(\s*['\"`]",
+            r"\bsetImmediate\s*\(\s*['\"`]",
+            r"\brequestIdleCallback\s*\(\s*['\"`]",
+        ],
+        EnhancedSink.NEW_FUNCTION: [
+            r"\bnew\s+Function\s*\(",
+            r"\bFunction\s*\(\s*['\"`]",
+        ],
+        EnhancedSink.LOCATION_ASSIGN: [
+            r"\.location\s*=\s*[^;]{0,80}",
+            r"\.location\.href\s*=\s*[^;]{0,80}",
+            r"\.location\.assign\s*\(",
+            r"\.location\.replace\s*\(",
+            r"\.location\.reload\s*\(",
+        ],
+        EnhancedSink.WINDOW_OPEN: [
+            r"\bwindow\.open\s*\(",
+            r"\bopen\s*\(\s*[^)]*['\"`]https?://",
+            r"\bopen\s*\(\s*[^)]*['\"`]javascript:",
+        ],
+        EnhancedSink.DOCUMENT_DOMAIN: [
+            r"\bdocument\.domain\s*=",
+        ],
+        EnhancedSink.HISTORY_API: [
+            r"\bhistory\.(?:pushState|replaceState)\s*\(",
+            r"\bhistory\.go\s*\(",
+            r"\bhistory\.back\s*\(",
+            r"\bhistory\.forward\s*\(",
+        ],
+        EnhancedSink.SEND_BEACON: [
+            r"\bnavigator\.sendBeacon\s*\(",
+            r"\bsendBeacon\s*\(\s*[^)]*['\"`]https?://",
+        ],
+        EnhancedSink.EVENTSOURCE: [
+            r"\bnew\s+EventSource\s*\(",
+        ],
+        EnhancedSink.DYNAMIC_IMPORT: [
+            r"\bimport\s*\(\s*[^)]*['\"`]https?://",
+            r"\bimport\s*\(\s*[^)]*['\"`]/",
+            r"\bimport\s*\(\s*[^)]*['\"`][^'\"`]*\.(?:js|mjs)",
+        ],
+        EnhancedSink.WEBSOCKET_SEND: [
+            r"\.send\s*\(\s*[^)]*\.(?:name|data|payload|message|value)",
+            r"new\s+WebSocket\s*\([^)]*\.(?:name|data|payload|url|host)",
+        ],
+        EnhancedSink.PROTOCOL_HANDLER: [
+            r"\bnavigator\.registerProtocolHandler\s*\(",
+            r"\bregisterProtocolHandler\s*\(",
+        ],
+        EnhancedSink.NAV_CREDENTIALS: [
+            r"\bnavigator\.credentials\.(?:get|create|store)\s*\(",
+            r"\bPublicKeyCredential\b",
+            r"\bOTPCredential\b",
+            r"\bIdentityCredential\b",
+            r"\bPasswordCredential\b",
+            r"\bFederatedCredential\b",
+        ],
+        EnhancedSink.WEB_SHARE: [
+            r"\bnavigator\.share\s*\(",
+            r"\bnavigator\.canShare\s*\(",
+        ],
+        EnhancedSink.TEMPLATE_CONTENT: [
+            r"\.content\.cloneNode\s*\(",
+            r"\.content\.appendChild\s*\(",
+            r"\.content\.innerHTML\s*=",
+        ],
+        EnhancedSink.SLOT_ASSIGN: [
+            r"\.slot\s*=",
+            r"\.assignedSlot\b",
+            r"\bHTMLSlotElement\b",
+        ],
+        EnhancedSink.CUSTOM_ELEMENT: [
+            r"\bcustomElements\.define\s*\(",
+            r"\bconnectedCallback\s*\(",
+            r"\bdisconnectedCallback\s*\(",
+            r"\battributeChangedCallback\s*\(",
+            r"\badoptedCallback\s*\(",
+        ],
+        EnhancedSink.SHADOW_ROOT_HTML: [
+            r"\.shadowRoot\.innerHTML\s*=",
+            r"\.shadowRoot\.outerHTML\s*=",
+            r"\.shadowRoot\.appendChild\s*\(",
+            r"\.shadowRoot\.insertBefore\s*\(",
+        ],
+        EnhancedSink.IFRAME_SRCDOC: [
+            r"\.srcdoc\s*=",
+            r"\.srcdoc\s*\+=",
+        ],
+        EnhancedSink.OBJECT_DATA: [
+            r"\.data\s*=\s*[^;]{0,80}",
+            r"\.setAttribute\s*\(\s*['\"]data['\"]",
+        ],
+        EnhancedSink.EMBED_SRC: [
+            r"\.src\s*=\s*[^;]{0,80}",
+            r"\.setAttribute\s*\(\s*['\"]src['\"]",
+        ],
+        EnhancedSink.SCRIPT_SRC: [
+            r"\.createElement\s*\(\s*['\"]script['\"]\s*\)[\s\S]{0,200}\.src\s*=",
+            r"\.setAttribute\s*\(\s*['\"]src['\"]\s*,",
+        ],
+        EnhancedSink.LINK_HREF: [
+            r"\.createElement\s*\(\s*['\"]link['\"]\s*\)[\s\S]{0,200}\.href\s*=",
+            r"\.rel\s*=\s*['\"]import['\"]",
+            r"<link[^>]*rel=[\"']import[\"']",
+        ],
+        EnhancedSink.META_REFRESH: [
+            r"<meta[^>]*http-equiv=[\"']refresh[\"']",
+            r"\.setAttribute\s*\(\s*['\"]http-equiv['\"]\s*,\s*['\"]refresh['\"]",
+        ],
+        EnhancedSink.BASE_HREF: [
+            r"<base[^>]*href=",
+            r"\.createElement\s*\(\s*['\"]base['\"]\s*\)[\s\S]{0,200}\.href\s*=",
+            r"\.setAttribute\s*\(\s*['\"]href['\"]\s*,",
+        ],
+        EnhancedSink.FORM_ACTION: [
+            r"\.action\s*=\s*[^;]{0,80}",
+            r"\.setAttribute\s*\(\s*['\"]action['\"]",
+        ],
+        EnhancedSink.BUTTON_FORM_ACTION: [
+            r"\.formAction\s*=",
+            r"\.setAttribute\s*\(\s*['\"]formaction['\"]",
+        ],
+        EnhancedSink.INPUT_FORM_ACTION: [
+            r"\.formAction\s*=",
+            r"\.setAttribute\s*\(\s*['\"]formaction['\"]",
+        ],
+        EnhancedSink.AREA_HREF: [
+            r"\.href\s*=\s*[^;]{0,80}",
+            r"\.setAttribute\s*\(\s*['\"]href['\"]",
+        ],
+        EnhancedSink.SVG_USE_HREF: [
+            r"<use[^>]*(?:href|xlink:href)=",
+            r"\.setAttribute\s*\(\s*['\"](?:href|xlink:href)['\"]",
+        ],
+        EnhancedSink.MATHML_HREF: [
+            r"<math[^>]*href=",
+            r"\.setAttribute\s*\(\s*['\"]href['\"]",
+        ],
+        EnhancedSink.IFRAME_LONGDESC: [
+            r"<iframe[^>]*longdesc=",
+        ],
+        EnhancedSink.FRAME_LONGDESC: [
+            r"<frame[^>]*longdesc=",
+        ],
+        EnhancedSink.ISINDEX_ACTION: [
+            r"<isindex[^>]*action=",
+        ],
+        EnhancedSink.BGSOUND_SRC: [
+            r"<bgsound[^>]*src=",
+        ],
+        EnhancedSink.LAYER_SRC: [
+            r"<layer[^>]*src=",
+            r"<ilayer[^>]*src=",
+        ],
+        EnhancedSink.XML_DATA_ISLAND: [
+            r"<xml[^>]*src=",
+            r"<xml[^>]*data=",
+        ],
+        EnhancedSink.CSS_IMPORT: [
+            r"@import\s+(?:url\s*\(\s*)?[\"']?([^\"'\s)]+)[\"']?\s*\)?",
+        ],
+        EnhancedSink.CSS_URL: [
+            r"url\s*\(\s*[\"']?([^\"'\s)]+)[\"']?\s*\)",
+        ],
+        EnhancedSink.CSS_IMAGESET: [
+            r"image-set\s*\(\s*([^)]{2,300})\)",
+        ],
+        EnhancedSink.CSS_CURSOR: [
+            r"cursor\s*:\s*url\s*\(\s*[\"']?([^\"'\s)]+)[\"']?\s*\)",
+        ],
+        EnhancedSink.CSS_LIST_STYLE: [
+            r"list-style(?:-image)?\s*:\s*url\s*\(\s*[\"']?([^\"'\s)]+)[\"']?\s*\)",
+        ],
+        EnhancedSink.CSS_CONTENT_URL: [
+            r"content\s*:\s*url\s*\(\s*[\"']?([^\"'\s)]+)[\"']?\s*\)",
+        ],
+        EnhancedSink.CSS_BEHAVIOR: [
+            r"behavior\s*:\s*url\s*\(\s*[\"']?([^\"'\s)]+)[\"']?\s*\)",
+        ],
+        EnhancedSink.CSS_MOZ_BINDING: [
+            r"-moz-binding\s*:\s*url\s*\(\s*[\"']?([^\"'\s)]+)[\"']?\s*\)",
+        ],
+        EnhancedSink.CSS_FILTER_PROGID: [
+            r"filter\s*:\s*progid:DXImageTransform\.Microsoft\.([^)]{2,300})\)",
+        ],
+        EnhancedSink.CSS_EXPRESSION_FUNC: [
+            r"expression\s*\(\s*([^)]{2,300})\)",
+        ],
+        EnhancedSink.CSS_JAVASCRIPT_URL: [
+            r"javascript\s*:\s*([^\"'\s;)]+)",
+        ],
+        EnhancedSink.CSS_VBSCRIPT_URL: [
+            r"vbscript\s*:\s*([^\"'\s;)]+)",
+        ],
+        EnhancedSink.CSS_DATA_URL: [
+            r"data\s*:\s*([^\"'\s;)]+)",
+        ],
+        EnhancedSink.CSS_BLOB_URL: [
+            r"blob\s*:\s*([^\"'\s;)]+)",
+        ],
+        EnhancedSink.CSS_FILESYSTEM_URL: [
+            r"filesystem\s*:\s*([^\"'\s;)]+)",
         ],
     }
 

@@ -65,7 +65,9 @@ def test_soft_404_signature_keeps_real_content_distinct() -> None:
 
 def test_expand_paths_applies_extensions_and_deduplicates() -> None:
     paths = expand_paths(["admin", "/admin", "index.php"], extensions=(".php", ".bak"))
-    assert paths == ["admin", "admin.php", "admin.bak", "index.php", "index.php.bak"]
+    # Extension-major ordering: bare paths first so a truncated budget still
+    # covers every word, then one pass per extension.
+    assert paths == ["admin", "index.php", "admin.php", "admin.bak", "index.php.bak"]
 
 
 def test_catch_all_pages_are_suppressed_regardless_of_status() -> None:
