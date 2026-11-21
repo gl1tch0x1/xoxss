@@ -16,13 +16,22 @@ from xoxss.analysis.graphql import GraphQLAnalyzer
 from xoxss.analysis.websocket import WebSocketAnalyzer
 from xoxss.analysis.file_upload import FileUploadAnalyzer
 from xoxss.analysis.postmessage import PostMessageAnalyzer
+from xoxss.analysis.template_injection import TemplateInjectionDetector
+from xoxss.analysis.hpp import HPPDetector
+from xoxss.analysis.cookie_xss import CookieXSSDetector
+from xoxss.analysis.web_components import WebComponentDetector
+from xoxss.analysis.wasm_xss import WASMXSSDetector
+from xoxss.analysis.clipboard_xss import ClipboardXSSDetector
 
 __all__ = [
     "CORSAnalyzer",
     "CSPAnalyzer",
+    "ClipboardXSSDetector",
+    "CookieXSSDetector",
     "DOMClobberingDetector",
     "FileUploadAnalyzer",
     "GraphQLAnalyzer",
+    "HPPDetector",
     "JSONPAnalyzer",
     "MXSSDetector",
     "PerCharProbe",
@@ -30,6 +39,9 @@ __all__ = [
     "PostMessageAnalyzer",
     "PrototypePollutionDetector",
     "SmartRateLimiter",
+    "TemplateInjectionDetector",
     "TrustedTypesAnalyzer",
+    "WASMXSSDetector",
+    "WebComponentDetector",
     "WebSocketAnalyzer",
 ]
