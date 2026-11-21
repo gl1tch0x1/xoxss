@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List
 
 from xoxss.core.compliance import (
     HIPAA,
@@ -19,7 +19,7 @@ from xoxss.core.compliance import (
     finding_dedupe_fingerprint,
     secondary_cwes,
 )
-from xoxss.reports.common import now_iso
+from xoxss.reports.common import field_getter, now_iso
 
 if TYPE_CHECKING:
     from xoxss.scanner import XSSScanner
@@ -33,11 +33,7 @@ def compliance_records(scanner: "XSSScanner") -> List[Dict[str, Any]]:
     """One compliance record per finding with CWE/CVSS/framework mappings."""
     records: List[Dict[str, Any]] = []
     for finding in _iter_findings(scanner):
-        get = (
-            (lambda name, default="": getattr(finding, name, default))
-            if not isinstance(finding, dict)
-            else (lambda name, default="": finding.get(name, default))
-        )
+        get = field_getter(finding)
         kind = str(get("kind"))
         records.append(
             {

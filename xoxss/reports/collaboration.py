@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict
 
 from xoxss.core.compliance import finding_dedupe_fingerprint
-from xoxss.reports.common import APP_NAME, VERSION, now_iso
+from xoxss.reports.common import APP_NAME, VERSION, field_getter, now_iso
 
 if TYPE_CHECKING:
     from xoxss.scanner import XSSScanner
@@ -27,15 +27,12 @@ def collaboration_bundle(scanner: "XSSScanner") -> Dict[str, Any]:
 
     groups: Dict[str, Dict[str, Any]] = {}
     for finding in findings:
-        get = (
-            (lambda name, default="": getattr(finding, name, default))
-            if not isinstance(finding, dict)
-            else (lambda name, default="": finding.get(name, default))
-        )
+        get = field_getter(finding)
         kind = str(get("kind"))
+        dedupe_method = getattr(finding, "dedupe_key", None)
         dedupe_key = (
-            finding.dedupe_key()
-            if hasattr(finding, "dedupe_key") and callable(getattr(finding, "dedupe_key"))
+            dedupe_method()
+            if callable(dedupe_method)
             else finding_dedupe_fingerprint(finding)
         )
         group = groups.setdefault(
