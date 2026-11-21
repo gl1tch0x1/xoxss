@@ -702,13 +702,18 @@ class XSSScanner(CrawlerMixin):
         self.extended_detectors: Dict[str, Any] = {}
         if HAS_EXTENDED:
             try:
+                detector_classes = {
+                    "template_injection": TemplateInjectionDetector,
+                    "hpp": HPPDetector,
+                    "cookie_xss": CookieXSSDetector,
+                    "wasm_xss": WASMXSSDetector,
+                    "web_components": WebComponentDetector,
+                    "clipboard_xss": ClipboardXSSDetector,
+                }
                 self.extended_detectors = {
-                    "template_injection": TemplateInjectionDetector(),
-                    "hpp": HPPDetector(),
-                    "cookie_xss": CookieXSSDetector(),
-                    "wasm_xss": WASMXSSDetector(),
-                    "web_components": WebComponentDetector(),
-                    "clipboard_xss": ClipboardXSSDetector(),
+                    name: cls()
+                    for name, cls in detector_classes.items()
+                    if cls is not None
                 }
             except Exception as exc:
                 self.console.debug(f"Extended detectors init failed: {exc}")
