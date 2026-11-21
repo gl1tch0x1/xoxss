@@ -174,6 +174,7 @@ class ScanConfig:
     header_injection_budget: int = 150
     stored: bool = False
     stored_pages: int = 10
+    stored_alt_session: Optional[str] = None
     report_reflections: bool = False
     check_libs: bool = True
     mutation_probes: bool = False
@@ -293,6 +294,7 @@ class ScanConfig:
     output: Optional[str] = None
     report: str = "all"
     report_dir: str = ".xoxss/reports"
+    min_confidence: Optional[str] = None
     show_secrets: bool = False
     verbose: bool = False
     quiet: bool = False

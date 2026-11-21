@@ -815,6 +815,11 @@ class XSSScanner(CrawlerMixin):
         self.jsonp_findings: List[Dict] = []
         self.csp_issues: List[Dict] = []
         self.mxss_findings: List[Dict] = []
+        # MXSSAnalysis objects keyed by page (scheme://host/path) for payload
+        # delivery through reflection points on mXSS-flagged pages.
+        self._mxss_analysis: Dict[str, Any] = {}
+        # Clobberable window properties per page, for payload delivery.
+        self._clobber_props: Dict[str, set] = {}
         self.proto_pollution_findings: List[Dict] = []
         self.cors_issues: List[Dict] = []
         self.policy_issues: List[Dict] = []
@@ -3429,6 +3434,31 @@ class XSSScanner(CrawlerMixin):
                 limit=max(1, self.args.max_payloads * 2),
             )
             templates = list(dict.fromkeys([*templates, *variants]))
+
+        # mXSS delivery: pages flagged by --mxss analysis get their mutation
+        # payloads appended, but only for HTML-body reflections — the payloads
+        # are full elements that must survive parsing to mutate.  ``{t}`` is
+        # the marker placeholder render() substitutes per attempt.
+        if HAS_ADVANCED and self._mxss_analysis and info.context == "html":
+            mxss_analysis = self._mxss_for_point(point)
+            if mxss_analysis is not None:
+                try:
+                    from xoxss.analysis.mxss import MXSSDetector
+
+                    mxss_templates = MXSSDetector().generate_test_payloads(
+                        mxss_analysis, "{t}"
+                    )
+                    templates = list(dict.fromkeys([*templates, *mxss_templates]))
+                except Exception as exc:
+                    self.console.debug(f"mXSS payload generation failed: {exc}")
+
+        # DOM-clobbering chain: when the page already exposes clobberable
+        # window properties, reflected HTML can inject an element that
+        # overrides them — deliver one payload per property (capped).
+        if info.context == "html":
+            clobber_templates = self._clobber_templates_for_point(point)
+            if clobber_templates:
+                templates = list(dict.fromkeys([*templates, *clobber_templates]))
         for template in templates:
             if self._stop.is_set():
                 return
@@ -4664,7 +4694,9 @@ class XSSScanner(CrawlerMixin):
             from xoxss.analysis.dom_clobbering import DOMClobberingDetector
 
             try:
+                page_props = self._clobber_props.setdefault(self._page_key(url), set())
                 for vuln in DOMClobberingDetector().detect_dom_clobbering(response.text, url):
+                    page_props.add(str(vuln.target_property))
                     self.dom_clobber_findings.append({
                         'url': url,
                         'type': vuln.clobbering_type.value,
@@ -4672,6 +4704,33 @@ class XSSScanner(CrawlerMixin):
                         'element': vuln.element[:120],
                         'severity': vuln.severity,
                     })
+                    digest = hashlib.sha1(
+                        f"clobber|{url}|{vuln.clobbering_type.value}|{vuln.target_property}".encode()
+                    ).hexdigest()[:10]
+                    self.add_finding(
+                        Finding(
+                            kind="DOM clobbering (static)",
+                            url=url,
+                            parameter=str(vuln.target_property),
+                            method="GET",
+                            payload="",
+                            evidence=(
+                                f"{vuln.clobbering_type.value}: element can clobber "
+                                f"window.{vuln.target_property} ({vuln.context})"
+                            )[:500],
+                            confidence="low",
+                            confidence_rationale=(
+                                "Static markup match for a clobberable property; "
+                                "script-side impact was not verified."
+                            ),
+                            context="dom_clobbering",
+                            detail=f"severity={vuln.severity}; element={vuln.element[:120]}",
+                            subkey=f"clobber:{digest}",
+                            tags=["dom_clobbering", "dom", "static"],
+                            source="dom_clobbering",
+                            sink=str(vuln.target_property),
+                        )
+                    )
                     self.console.warn(
                         f"DOM clobbering ({vuln.clobbering_type.value}): "
                         f"{vuln.target_property} @ {truncate(url, 90)}"
@@ -5158,6 +5217,51 @@ class XSSScanner(CrawlerMixin):
             if analyzer.check_xss_data_exfiltration_risk(analysis):
                 self.console.warn("  XSS data exfiltration possible via CORS")
     
+    @staticmethod
+    def _page_key(url: str) -> str:
+        """Scheme://host/path identity for page-level analyses (query ignored)."""
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            return url
+        return urlunsplit(
+            (parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", "", "")
+        )
+
+    def _mxss_for_point(self, point: InjectionPoint) -> Any:
+        """Return the stored MXSSAnalysis for the page this point lands on."""
+        if not self._mxss_analysis:
+            return None
+        for candidate in (point.page_url, point.url):
+            if not candidate:
+                continue
+            analysis = self._mxss_analysis.get(self._page_key(candidate))
+            if analysis is not None:
+                return analysis
+        return None
+
+    def _clobber_templates_for_point(self, point: InjectionPoint) -> List[str]:
+        """Clobbering payload templates for properties exposed by this page."""
+        if not self._clobber_props:
+            return []
+        props: set = set()
+        for candidate in (point.page_url, point.url):
+            if candidate:
+                props |= self._clobber_props.get(self._page_key(candidate), set())
+        if not props:
+            return []
+        try:
+            from xoxss.analysis.dom_clobbering import DOMClobberingDetector
+
+            detector = DOMClobberingDetector()
+            return [
+                detector.generate_clobbering_payload(prop, "{t}")
+                for prop in sorted(props)[:5]
+            ]
+        except Exception as exc:
+            self.console.debug(f"DOM clobbering payload generation failed: {exc}")
+            return []
+
     async def _detect_mxss(self, url: str, js_content: str) -> None:
         """Detect mutation XSS vulnerabilities."""
         if not HAS_ADVANCED:
@@ -5169,6 +5273,7 @@ class XSSScanner(CrawlerMixin):
         analysis = detector.detect_mutation_xss(js_content, url)
         
         if analysis.has_mutation_xss:
+            self._mxss_analysis[self._page_key(url)] = analysis
             self.mxss_findings.append({
                 'url': url,
                 'sanitizer': analysis.sanitizer or 'unknown',
@@ -5310,6 +5415,40 @@ class XSSScanner(CrawlerMixin):
                 stored_response.text, payload_token
             )
 
+        # Optional cross-session check: re-fetch the stored page with a second
+        # identity's Cookie header.  A payload that still renders executable
+        # under a different session is a stronger stored-XSS claim; a miss is
+        # inconclusive (the page may simply require authentication).
+        stored_cross_session: Optional[bool] = None
+        alt_cookies = str(getattr(self.args, "stored_alt_session", "") or "").strip()
+        if alt_cookies and stored_page:
+            try:
+                alt = await self.http.get(
+                    stored_page,
+                    headers={"Cookie": alt_cookies},
+                    cache=False,
+                )
+                if (
+                    not alt.error
+                    and alt.text
+                    and not (alt.status and alt.status >= 400)
+                    and (payload_token in alt.text or payload in alt.text)
+                ):
+                    alt_info = analyze_reflection(
+                        alt.text,
+                        payload_token,
+                        payload,
+                        alt.header("content-type", ""),
+                    )
+                    stored_cross_session = bool(
+                        alt_info.reflected and alt_info.executable
+                    )
+                else:
+                    stored_cross_session = False
+            except Exception as exc:
+                self.console.debug(f"Stored alt-session check failed: {exc}")
+                stored_cross_session = None
+
         # Execution verification in browser for stored XSS: never report as
         # high/confirmed without verifying execution in a browser.
         stored_executed = False
@@ -5320,8 +5459,15 @@ class XSSScanner(CrawlerMixin):
             if stored_stable
             else "reflection observed on a single fetch (stability unconfirmed)"
         )
+        if stored_cross_session is True:
+            session_note = "renders under a second session (cross-session stored XSS)"
+        elif stored_cross_session is False:
+            session_note = "did not render under the alternate session (inconclusive)"
+        else:
+            session_note = "alternate-session check not performed"
         stored_evidence = (
-            f"payload persisted and re-rendered on {stored_page} ({stability_note})"
+            f"payload persisted and re-rendered on {stored_page} "
+            f"({stability_note}; {session_note})"
         )
         stored_dialog_text = ""
 
@@ -5375,6 +5521,11 @@ class XSSScanner(CrawlerMixin):
                     confidence_rationale=(
                         "Persistence verified and JavaScript execution confirmed in browser: "
                         "marker dialog/sink observed."
+                        + (
+                            " Payload also rendered executable under a second session."
+                            if stored_cross_session is True
+                            else ""
+                        )
                     ),
                     context=stored_info.context if stored_info else payload_info.context,
                     detail="Persistence and execution confirmed in headless browser",
@@ -5812,6 +5963,23 @@ class XSSScanner(CrawlerMixin):
                 console.raw(f"  {flag} - {truncate(item['url'], 120)}")
 
     # -- reports ----------------------------------------------------------------------
+    @property
+    def report_findings(self) -> List[Finding]:
+        """Findings visible in reports after the optional confidence floor.
+
+        ``--min-confidence`` filters report output only — collection, dedupe,
+        stats and ``--fail-on`` exit behavior still see every finding.
+        """
+        floor_name = str(getattr(self.args, "min_confidence", "") or "").strip().lower()
+        if floor_name in ("", "any", "low"):
+            return self.findings
+        floor = CONFIDENCE_RANK.get(floor_name, 0)
+        return [
+            finding
+            for finding in self.findings
+            if CONFIDENCE_RANK.get(str(finding.confidence or "low").lower(), 0) >= floor
+        ]
+
     def write_reports(self) -> None:
         formats = [item.strip().lower() for item in str(self.args.report).split(",") if item.strip()]
         if "none" in formats or not formats:
@@ -5873,7 +6041,7 @@ def payload_for_kind(kind: str) -> str:
 def build_sarif(scanner: XSSScanner) -> Dict[str, Any]:
     """Thin adapter over :func:`xoxss.reports.sarif.build_sarif_document`."""
     return build_sarif_document(
-        scanner.findings,
+        scanner.report_findings,
         target=scanner.target,
         waf_names=scanner.waf.names,
         duration_seconds=scanner.stats.elapsed,

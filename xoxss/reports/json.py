@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
 
-from xoxss.reports.common import APP_NAME, VERSION, now_iso
+from xoxss.reports.common import APP_NAME, VERSION, iter_report_findings, now_iso
 
 if TYPE_CHECKING:
     from xoxss.scanner import XSSScanner
@@ -149,7 +149,9 @@ def report_payload(scanner: XSSScanner) -> Dict[str, Any]:
         "file_upload": scanner.file_upload_findings,
         "graphql": scanner.graphql_endpoints,
         "blind_markers": scanner.blind_markers,
-        "findings": [finding.to_dict() for finding in scanner.findings],
+        "findings": [finding.to_dict() for finding in iter_report_findings(scanner)],
+        "findings_total": len(getattr(scanner, "findings", []) or []),
+        "min_confidence": getattr(getattr(scanner, "args", None), "min_confidence", None),
         "transformation_observations": scanner.mutation_findings[:1000],
     }
 

@@ -394,6 +394,15 @@ def build_parser(
     injection.add_argument("--stored", action="store_true", help="look for persisted (stored) payloads")
     injection.add_argument("--stored-pages", type=int, default=10, help="pages checked for stored XSS (default: 10)")
     injection.add_argument(
+        "--stored-alt-session",
+        metavar="COOKIE_HEADER",
+        default=None,
+        help=(
+            "Cookie header for a second identity; stored hits are re-fetched "
+            "with it to check whether the payload renders cross-session"
+        ),
+    )
+    injection.add_argument(
         "--report-reflections",
         action="store_true",
         help="also report reflections / static candidates that could not be executed",
@@ -779,6 +788,17 @@ def build_parser(
     output.add_argument("--quiet", action="store_true", help="only print findings and errors")
     output.add_argument("--no-color", action="store_true", help="disable ANSI colours")
     output.add_argument("--fail-on-findings", action="store_true", help="exit with status 2 when findings exist")
+    output.add_argument(
+        "--min-confidence",
+        choices=("low", "medium", "high", "confirmed"),
+        default=None,
+        metavar="LEVEL",
+        help=(
+            "only include findings at or above this confidence level in "
+            "reports (low, medium, high, confirmed); collection and exit-code "
+            "behavior are unaffected"
+        ),
+    )
     output.add_argument(
         "--fail-on",
         choices=("any", "low", "medium", "high", "confirmed"),

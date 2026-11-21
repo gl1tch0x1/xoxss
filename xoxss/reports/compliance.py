@@ -19,14 +19,14 @@ from xoxss.core.compliance import (
     finding_dedupe_fingerprint,
     secondary_cwes,
 )
-from xoxss.reports.common import field_getter, now_iso
+from xoxss.reports.common import field_getter, iter_report_findings, now_iso
 
 if TYPE_CHECKING:
     from xoxss.scanner import XSSScanner
 
 
 def _iter_findings(scanner: "XSSScanner") -> List[Any]:
-    return list(getattr(scanner, "findings", []) or [])
+    return iter_report_findings(scanner)
 
 
 def compliance_records(scanner: "XSSScanner") -> List[Dict[str, Any]]:

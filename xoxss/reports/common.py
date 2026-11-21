@@ -16,11 +16,24 @@ def field_getter(finding: Any) -> Callable[..., Any]:
     return lambda name, default="": getattr(finding, name, default)
 
 
+def iter_report_findings(scanner: Any) -> list:
+    """Findings after the optional ``--min-confidence`` report floor.
+
+    Falls back to ``scanner.findings`` for scanner-like objects that do not
+    expose the filtered view.
+    """
+    filtered = getattr(scanner, "report_findings", None)
+    if filtered is not None:
+        return list(filtered)
+    return list(getattr(scanner, "findings", []) or [])
+
+
 __all__ = [
     "APP_NAME",
     "VERSION",
     "field_getter",
     "fmt_duration",
+    "iter_report_findings",
     "now_iso",
     "truncate",
 ]

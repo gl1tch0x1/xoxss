@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List
 from urllib.parse import quote
 
-from xoxss.reports.common import APP_NAME, VERSION, fmt_duration, now_iso, truncate
+from xoxss.reports.common import (
+    APP_NAME,
+    VERSION,
+    fmt_duration,
+    iter_report_findings,
+    now_iso,
+    truncate,
+)
 from xoxss.reports.json import report_payload
 
 if TYPE_CHECKING:
@@ -124,7 +131,7 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:  # noqa: C901
             _card("WebSocket", len(scanner.websocket_findings)),
             _card("Upload forms", len(scanner.file_upload_findings)),
             _card("GraphQL", len(scanner.graphql_endpoints)),
-            _card("XSS Findings", len(scanner.findings)),
+            _card("XSS Findings", len(iter_report_findings(scanner))),
         ]
     )
 
@@ -318,9 +325,9 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:  # noqa: C901
             "<tbody>" + "".join(gql_rows) + "</tbody></table>"
         )
 
-    if scanner.findings:
+    if iter_report_findings(scanner):
         rows = []
-        for finding in scanner.findings:
+        for finding in iter_report_findings(scanner):
             poc_cell = (
                 html_lib.escape(truncate(finding.poc_url, 300))
                 if finding.poc_url
@@ -355,7 +362,7 @@ def write_html_report(path: Path, scanner: XSSScanner) -> None:  # noqa: C901
             "when replaying a finding with <code>--replay</code>.</p>",
             "",
         ]
-        for index, finding in enumerate(scanner.findings, 1):
+        for index, finding in enumerate(iter_report_findings(scanner), 1):
             detail_rows = [
                 f"<tr><th>Finding ID</th><td><code>{html_lib.escape(finding.finding_id)}</code></td></tr>",
                 f"<tr><th>Type</th><td>{html_lib.escape(finding.kind)} "

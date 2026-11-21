@@ -314,3 +314,118 @@ def test_check_stored_unstable_reflection(tmp_path: Path) -> None:
     # Hit is still reported (caller decides), but stability is recorded False.
     assert result == page
     assert scanner._stored_hit_stable is False
+
+
+# -- --min-confidence report filter -------------------------------------------
+
+
+def test_min_confidence_filters_report_findings(tmp_path: Path) -> None:
+    """The report floor hides low leads but never drops them from collection."""
+    from xoxss.core.finding import Finding
+
+    config = _extended_config("http://127.0.0.1:9/", tmp_path, min_confidence="high")
+    scanner = XSSScanner(config.target, config, Console(quiet=True, log_file=None))
+    for confidence in ("low", "medium", "high", "confirmed"):
+        scanner.add_finding(
+            Finding(
+                kind=f"Test {confidence}",
+                url="http://127.0.0.1:9/x",
+                parameter="q",
+                method="GET",
+                payload="p",
+                evidence="e",
+                confidence=confidence,
+                subkey=f"t-{confidence}",
+                source="test",
+            )
+        )
+
+    assert len(scanner.findings) == 4
+    reported = scanner.report_findings
+    assert {f.confidence for f in reported} == {"high", "confirmed"}
+
+    # Report writers see the same filtered view.
+    from xoxss.reports.common import iter_report_findings
+
+    assert len(iter_report_findings(scanner)) == 2
+
+
+def test_min_confidence_unset_returns_everything(tmp_path: Path) -> None:
+    from xoxss.core.finding import Finding
+
+    config = _extended_config("http://127.0.0.1:9/", tmp_path)
+    scanner = XSSScanner(config.target, config, Console(quiet=True, log_file=None))
+    scanner.add_finding(
+        Finding(
+            kind="Low lead",
+            url="http://127.0.0.1:9/x",
+            parameter="q",
+            method="GET",
+            payload="p",
+            evidence="e",
+            confidence="low",
+            subkey="t-low",
+            source="test",
+        )
+    )
+    assert scanner.report_findings == scanner.findings
+
+
+# -- mXSS / DOM-clobbering payload delivery ------------------------------------
+
+
+def test_page_key_strips_query_and_fragment(tmp_path: Path) -> None:
+    config = _extended_config("http://127.0.0.1:9/", tmp_path)
+    scanner = XSSScanner(config.target, config, Console(quiet=True, log_file=None))
+    assert (
+        scanner._page_key("HTTP://Example.com:80/a/b?x=1#frag")
+        == "http://example.com:80/a/b"
+    )
+
+
+def test_clobber_templates_match_point_page(tmp_path: Path) -> None:
+    config = _extended_config("http://127.0.0.1:9/", tmp_path)
+    scanner = XSSScanner(config.target, config, Console(quiet=True, log_file=None))
+    scanner._clobber_props["http://127.0.0.1:9/page"] = {"location", "config"}
+    point = InjectionPoint(
+        url="http://127.0.0.1:9/page?q=1",
+        method="GET",
+        param="q",
+        page_url="http://127.0.0.1:9/page",
+    )
+
+    templates = scanner._clobber_templates_for_point(point)
+
+    assert len(templates) == 2
+    assert all("{t}" in template for template in templates)
+    assert any('id="location"' in template for template in templates)
+
+
+def test_clobber_templates_empty_without_page_match(tmp_path: Path) -> None:
+    config = _extended_config("http://127.0.0.1:9/", tmp_path)
+    scanner = XSSScanner(config.target, config, Console(quiet=True, log_file=None))
+    scanner._clobber_props["http://127.0.0.1:9/other"] = {"location"}
+    point = InjectionPoint(
+        url="http://127.0.0.1:9/page?q=1",
+        method="GET",
+        param="q",
+        page_url="http://127.0.0.1:9/page",
+    )
+    assert scanner._clobber_templates_for_point(point) == []
+
+
+def test_mxss_for_point_matches_page_url(tmp_path: Path) -> None:
+    config = _extended_config("http://127.0.0.1:9/", tmp_path)
+    scanner = XSSScanner(config.target, config, Console(quiet=True, log_file=None))
+    sentinel = object()
+    scanner._mxss_analysis["http://127.0.0.1:9/app"] = sentinel
+    point = InjectionPoint(
+        url="http://127.0.0.1:9/api/submit",
+        method="POST",
+        param="comment",
+        page_url="http://127.0.0.1:9/app#main",
+    )
+    assert scanner._mxss_for_point(point) is sentinel
+    assert scanner._mxss_for_point(
+        InjectionPoint(url="http://127.0.0.1:9/none", method="GET", param="x")
+    ) is None

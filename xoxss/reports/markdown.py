@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from xoxss.reports.common import APP_NAME, fmt_duration
+from xoxss.reports.common import APP_NAME, fmt_duration, iter_report_findings
 from xoxss.reports.json import report_payload
 
 if TYPE_CHECKING:
@@ -37,7 +37,7 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:  # noqa: C90
         f"- **Redirects blocked:** {scanner.stats.redirects_blocked}",
         f"- **Dangling markup:** {scanner.stats.dangling_hits}",
         f"- **Response splitting:** {scanner.stats.response_splitting_hits}",
-        f"- **XSS Findings:** {len(scanner.findings)}",
+        f"- **XSS Findings:** {len(iter_report_findings(scanner))}",
         "",
     ]
     if data.get("coverage_notes"):
@@ -163,21 +163,21 @@ def write_markdown_report(path: Path, scanner: XSSScanner) -> None:  # noqa: C90
             lines.append(f"| {index} | {url} | {issues_str} |")
         lines += [""]
 
-    if scanner.findings:
+    if iter_report_findings(scanner):
         lines += [
             "## XSS Findings",
             "",
             "| # | ID | Severity | Type | Method | Parameter | URL |",
             "|---|----|----------|------|--------|-----------|-----|",
         ]
-        for index, finding in enumerate(scanner.findings, 1):
+        for index, finding in enumerate(iter_report_findings(scanner), 1):
             url = finding.url.replace("|", "%7C")
             lines.append(
                 f"| {index} | `{finding.finding_id}` | {finding.confidence} | {finding.kind} | "
                 f"{finding.method} | `{finding.parameter}` | {url} |"
             )
         lines += ["", "## Details", ""]
-        for index, finding in enumerate(scanner.findings, 1):
+        for index, finding in enumerate(iter_report_findings(scanner), 1):
             lines += [
                 f"### {index}. {finding.kind} ({finding.confidence})",
                 "",

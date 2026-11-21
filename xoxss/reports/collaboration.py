@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict
 
 from xoxss.core.compliance import finding_dedupe_fingerprint
-from xoxss.reports.common import APP_NAME, VERSION, field_getter, now_iso
+from xoxss.reports.common import APP_NAME, VERSION, field_getter, iter_report_findings, now_iso
 
 if TYPE_CHECKING:
     from xoxss.scanner import XSSScanner
@@ -23,7 +23,7 @@ VALID_STATUSES = ("open", "triaged", "confirmed", "false_positive", "fixed", "ac
 
 def collaboration_bundle(scanner: "XSSScanner") -> Dict[str, Any]:
     """Build the deduplicated triage bundle for the current findings."""
-    findings = list(getattr(scanner, "findings", []) or [])
+    findings = iter_report_findings(scanner)
 
     groups: Dict[str, Dict[str, Any]] = {}
     for finding in findings:
