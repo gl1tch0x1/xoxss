@@ -225,7 +225,7 @@ class BrowserEngine:
 
     def _start_sync(self) -> bool:
         try:
-            from selenium import webdriver  # noqa: F401
+            from selenium import webdriver  # noqa: F401  # type: ignore[reportMissingImports]
         except Exception:
             self.console.warn("Selenium is not installed - browser verification disabled (pip install selenium)")
             return False
@@ -305,9 +305,9 @@ class BrowserEngine:
             )
 
     def _create_driver(self) -> Any:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options as ChromeOptions
-        from selenium.webdriver.firefox.options import Options as FirefoxOptions
+        from selenium import webdriver  # type: ignore[reportMissingImports]
+        from selenium.webdriver.chrome.options import Options as ChromeOptions  # type: ignore[reportMissingImports]
+        from selenium.webdriver.firefox.options import Options as FirefoxOptions  # type: ignore[reportMissingImports]
 
         if self.kind in ("chrome", "chromium"):
             options = ChromeOptions()
@@ -337,13 +337,13 @@ class BrowserEngine:
                 return webdriver.Chrome(options=options)
             except Exception as first:
                 self.console.debug(f"Selenium Manager failed ({first}); falling back to webdriver-manager")
-                from selenium.webdriver.chrome.service import Service
-                from webdriver_manager.chrome import ChromeDriverManager
+                from selenium.webdriver.chrome.service import Service  # type: ignore[reportMissingImports]
+                from webdriver_manager.chrome import ChromeDriverManager  # type: ignore[reportMissingImports]
 
                 return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
 
         if self.kind == "edge":
-            from selenium.webdriver.edge.options import Options as EdgeOptions
+            from selenium.webdriver.edge.options import Options as EdgeOptions  # type: ignore[reportMissingImports]
 
             options = EdgeOptions()
             options.enable_bidi = False
@@ -381,8 +381,8 @@ class BrowserEngine:
             return webdriver.Firefox(options=options)
         except Exception as first:
             self.console.debug(f"Selenium Manager failed ({first}); falling back to webdriver-manager")
-            from selenium.webdriver.firefox.service import Service
-            from webdriver_manager.firefox import GeckoDriverManager
+            from selenium.webdriver.firefox.service import Service  # type: ignore[reportMissingImports]
+            from webdriver_manager.firefox import GeckoDriverManager  # type: ignore[reportMissingImports]
 
             return webdriver.Firefox(service=Service(GeckoDriverManager().install()), options=options)
 

@@ -149,7 +149,7 @@ class TestSarifDeep:
 class TestComplianceReport:
     def test_records_have_frameworks(self):
         scanner = _FakeScanner([_finding(), _finding(kind="CRLF Injection", parameter="x")])
-        records = compliance_records(scanner)
+        records = compliance_records(scanner)  # type: ignore[arg-type]
         assert len(records) == 2
         xss = records[0]
         assert xss["cwe"] == "CWE-79"
@@ -158,7 +158,7 @@ class TestComplianceReport:
 
     def test_summary_buckets_controls(self):
         scanner = _FakeScanner([_finding(), _finding(kind="CRLF Injection")])
-        summary = compliance_summary(scanner)
+        summary = compliance_summary(scanner)  # type: ignore[arg-type]
         assert summary["totals"]["findings"] == 2
         assert summary["frameworks"]["owasp_top10_2021"]
         assert summary["frameworks"]["pci_dss_4_0"]
@@ -169,7 +169,7 @@ class TestComplianceReport:
 
         scanner = _FakeScanner([_finding()])
         path = tmp_path / "comp.json"
-        write_compliance_report(path, scanner)
+        write_compliance_report(path, scanner)  # type: ignore[arg-type]
         data = json.loads(path.read_text())
         assert data["totals"]["findings"] == 1
 
@@ -177,7 +177,7 @@ class TestComplianceReport:
 class TestCollaboration:
     def test_bundle_dedupes(self):
         scanner = _FakeScanner([_finding(), _finding(payload="<svg onload=1>")])
-        bundle = collaboration_bundle(scanner)
+        bundle = collaboration_bundle(scanner)  # type: ignore[arg-type]
         assert bundle["counts"]["rawFindings"] == 2
         assert bundle["counts"]["uniqueIssues"] == 1
         assert bundle["issues"][0]["occurrences"] == 2
@@ -186,7 +186,7 @@ class TestCollaboration:
         scanner = _FakeScanner(
             [_finding(status="triaged", assigned_to="alice", notes="checking")]
         )
-        bundle = collaboration_bundle(scanner)
+        bundle = collaboration_bundle(scanner)  # type: ignore[arg-type]
         issue = bundle["issues"][0]
         assert issue["status"] == "triaged"
         assert issue["assignedTo"] == "alice"
@@ -201,7 +201,7 @@ class TestCollaboration:
 
         scanner = _FakeScanner([_finding()])
         path = tmp_path / "collab.json"
-        write_collaboration_report(path, scanner)
+        write_collaboration_report(path, scanner)  # type: ignore[arg-type]
         data = json.loads(path.read_text())
         assert data["schemaVersion"] == 1
         assert data["issues"]

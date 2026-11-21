@@ -6453,7 +6453,7 @@ def run_doctor(console: Console, args: argparse.Namespace) -> int:
                 report("ok", "browser", "playwright (run: playwright install chromium)")
         else:
             try:
-                import selenium  # noqa: F401
+                import selenium  # noqa: F401  # type: ignore[reportMissingImports]
             except Exception:
                 report(
                     "warn",

@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Tuple
 # Primary CWE per finding family.  ``kind`` strings may carry a suffix like
 # ``"DOM XSS (taint flow)"`` - matching is done on the family prefix.
 
-_CWE_RULES: Tuple[Tuple[str, Tuple[str, ...], str], ...] = [
+_CWE_RULES: Tuple[Tuple[str, Tuple[str, ...], str], ...] = [  # type: ignore[reportAssignmentType]
     # (family prefix, match substrings, CWE id)
     ("Reflected XSS", (), "CWE-79"),
     ("DOM XSS", (), "CWE-79"),

@@ -130,7 +130,7 @@ class _FakeDetector:
 
 
 def _extended_config(target: str, tmp_path: Path, **overrides: object) -> ScanConfig:
-    base = dict(
+    base: dict = dict(
         no_browser=True,
         no_state=True,
         no_resume=True,
