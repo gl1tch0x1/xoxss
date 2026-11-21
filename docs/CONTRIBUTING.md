@@ -212,6 +212,6 @@ python benchmarks/run_benchmark.py --only dom-location-hash
 4. **Open a Pull Request:**
    - Push your branch to GitHub.
    - Open a PR against the `main` branch.
-   - Complete the checklist provided in the [Pull Request Template](.github/PULL_REQUEST_TEMPLATE.md).
+   - Complete the checklist provided in the [Pull Request Template](../.github/PULL_REQUEST_TEMPLATE.md).
 
 Thank you for helping make XOXSS faster, more accurate, and more reliable!

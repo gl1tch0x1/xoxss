@@ -11,8 +11,8 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](#requirements)
 ![Version](https://img.shields.io/badge/version-2.0.1-informational.svg)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#license)
-[![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](SECURITY.md)
-[![Contributing](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
+[![Contributing](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](docs/CONTRIBUTING.md)
 [![SARIF](https://img.shields.io/badge/report-SARIF%20v2.1.0-purple.svg)](#reports-and-exit-codes)
 [![Authorized testing only](https://img.shields.io/badge/use-authorized%20testing%20only-red.svg)](#security-and-legal)
 
@@ -1295,7 +1295,7 @@ See [`benchmarks/README.md`](benchmarks/README.md) for details on benchmark case
 ## Contributing
 
 We welcome community contributions, bug reports, false positive submissions, and feature proposals!
-Please review our [`CONTRIBUTING.md`](CONTRIBUTING.md) guide for details on development setup,
+Please review our [`CONTRIBUTING.md`](docs/CONTRIBUTING.md) guide for details on development setup,
 coding standards, and our pull request process.
 
 - **Found a bug?** Open a [Bug Report](https://github.com/gl1tch0x1/xoxss/issues/new?template=bug_report.yml).
@@ -1338,7 +1338,7 @@ stealth-only features, no destructive defaults, no unconfirmed finding promoted 
 
 ## Security and legal
 
-- **Vulnerability Disclosure:** If you discover a security vulnerability in XOXSS itself, please report it privately according to our [Security Policy (SECURITY.md)](SECURITY.md). Do not report security vulnerabilities in public issues.
+- **Vulnerability Disclosure:** If you discover a security vulnerability in XOXSS itself, please report it privately according to our [Security Policy (SECURITY.md)](docs/SECURITY.md). Do not report security vulnerabilities in public issues.
 - Use XOXSS only against systems you own or have explicit written permission to test.
 - Respect scope files, rate limits and program rules. A scanner that ignores scope is a
   liability, not a tool.

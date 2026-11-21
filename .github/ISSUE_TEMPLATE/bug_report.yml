@@ -8,7 +8,7 @@ body:
       value: |
         Thank you for reporting an issue!
         Before submitting, please make sure you are using the latest version of XOXSS (`git pull` or `pip install --upgrade xoxss`).
-        If you are reporting a security vulnerability in XOXSS itself, please see [SECURITY.md](https://github.com/gl1tch0x1/xoxss/blob/main/SECURITY.md) instead of creating a public issue.
+        If you are reporting a security vulnerability in XOXSS itself, please see [SECURITY.md](https://github.com/gl1tch0x1/xoxss/blob/main/docs/SECURITY.md) instead of creating a public issue.
 
   - type: textarea
     id: description

@@ -76,7 +76,7 @@ All notable changes to XOX$$ are documented here.  The format follows
   CLI parsing, report writers, payload catalog, version contract, `HttpEngine`
   transport behaviour (retry, redirect scoping, truncation, cache) and the CLI
   application layer.
-- `CHANGELOG.md` and `xoxss/py.typed` (PEP 561 inline types).
+- `docs/CHANGELOG.md` and `xoxss/py.typed` (PEP 561 inline types).
 - `.github/workflows/security.yml` (CodeQL + `pip-audit`) and
   `.github/dependabot.yml`.
 - `xoxss/app.py`: CLI application layer (argument handling, profiles, mode
