@@ -348,6 +348,17 @@ diagnostic, listing, and piped-output commands retain their existing output.
 
 ### 2. Manual Installation
 
+**Standalone binaries (no Python required)** — each GitHub release attaches
+single-file executables for Windows, Linux and macOS:
+
+```bash
+# download the asset for your platform from the latest release, then:
+xoxss-x86_64-pc-windows-msvc.exe https://target.tld
+./xoxss-x86_64-unknown-linux-gnu https://target.tld
+```
+
+**From source / PyPI:**
+
 ```bash
 # create and activate an isolated virtual environment
 python -m venv .venv

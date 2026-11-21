@@ -4,7 +4,7 @@ XOXSS - Advanced XSS Scanner Package
 A professional, aggressive XSS security scanner for authorized testing.
 """
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __author__ = "Security Research"
 __license__ = "MIT"
 

@@ -6,6 +6,16 @@ All notable changes to XOX$$ are documented here.  The format follows
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-11-21
+
+### Added
+
+- **Standalone binaries in releases**: the Release workflow now builds
+  single-file PyInstaller executables for Windows x86_64, Linux x86_64 and
+  macOS (arm64 + x86_64) via `packaging/xoxss.spec` and attaches them to the
+  GitHub Release alongside the sdist/wheel. Binaries bundle core
+  dependencies only; optional extras degrade gracefully.
+
 ## [2.1.0] - 2026-11-21
 
 ### Added

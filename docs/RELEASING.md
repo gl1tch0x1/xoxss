@@ -48,9 +48,32 @@ python -m twine check dist/*
 3. The `Release` GitHub Actions workflow (`.github/workflows/release.yml`) will:
    - build source and wheel distributions,
    - validate package metadata with `twine check`,
+   - build standalone binaries for Windows (x86_64), Linux (x86_64) and
+     macOS (arm64 + x86_64) via PyInstaller (`packaging/xoxss.spec`),
    - upload build artifacts to the workflow run,
-   - create a GitHub Release for the tag and attach the distributions,
+   - create a GitHub Release for the tag and attach the distributions and
+     binaries,
    - publish to PyPI when trusted publishing is configured.
+
+### Standalone binaries
+
+Each release attaches single-file executables built with PyInstaller:
+
+| Asset | Platform |
+| --- | --- |
+| `xoxss-x86_64-pc-windows-msvc.exe` | Windows x86_64 |
+| `xoxss-x86_64-unknown-linux-gnu` | Linux x86_64 |
+| `xoxss-aarch64-apple-darwin` | macOS Apple Silicon |
+| `xoxss-x86_64-apple-darwin` | macOS Intel |
+
+Binaries bundle the core dependencies only; optional extras (browser
+drivers, Interactsh crypto, HTTP/2) degrade gracefully, matching the
+pip-installed behaviour. To rebuild locally:
+
+```bash
+pip install -e . pyinstaller
+python -m PyInstaller packaging/xoxss.spec --noconfirm --distpath dist-bin --workpath build
+```
 
 ## PyPI publishing prerequisites
 
