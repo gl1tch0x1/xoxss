@@ -317,6 +317,8 @@ browser is available.
 
 ## Installation
 
+Release packages (source distributions and wheels) are built from version tags. See [CHANGELOG.md](CHANGELOG.md) for release notes and [docs/RELEASING.md](docs/RELEASING.md) for the release workflow.
+
 ### 1. Automated Setup (Recommended)
 
 The repository includes an automated installer (`installer.py`) that **automatically creates an isolated Python virtual environment (`.venv`)** and configures root launchers so you don't need to manually create or activate environments:

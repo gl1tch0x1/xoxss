@@ -51,7 +51,12 @@ dev = [
 xoxss = "xoxss.scanner:main"
 
 [project.urls]
-Source = "https://github.com/gl1tch0x1/xoxss"
+Homepage = "https://github.com/gl1tch0x1/xoxss"
+Repository = "https://github.com/gl1tch0x1/xoxss"
+Issues = "https://github.com/gl1tch0x1/xoxss/issues"
+Changelog = "https://github.com/gl1tch0x1/xoxss/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/gl1tch0x1/xoxss#readme"
+Security = "https://github.com/gl1tch0x1/xoxss/blob/main/docs/SECURITY.md"
 
 [tool.setuptools]
 include-package-data = true
