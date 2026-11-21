@@ -189,6 +189,29 @@ except Exception as _hybrid_exc:  # pragma: no cover
     ExecutionOracle = None  # type: ignore
     OracleVerdict = None  # type: ignore
 
+# Extended static surface analyzers (template injection, HPP, cookie XSS,
+# WASM, web components, clipboard).  All are pure content analysis — no
+# network — so they run against the already-fetched page for free.
+try:
+    from xoxss.analysis.template_injection import TemplateInjectionDetector
+    from xoxss.analysis.hpp import HPPDetector
+    from xoxss.analysis.cookie_xss import CookieXSSDetector
+    from xoxss.analysis.wasm_xss import WASMXSSDetector
+    from xoxss.analysis.web_components import WebComponentDetector
+    from xoxss.analysis.clipboard_xss import ClipboardXSSDetector
+    from xoxss.analysis.cst_taint import analyze_javascript_cst
+    HAS_EXTENDED = True
+except Exception as _extended_exc:  # pragma: no cover
+    HAS_EXTENDED = False
+    _EXTENDED_IMPORT_ERROR = str(_extended_exc)
+    TemplateInjectionDetector = None  # type: ignore
+    HPPDetector = None  # type: ignore
+    CookieXSSDetector = None  # type: ignore
+    WASMXSSDetector = None  # type: ignore
+    WebComponentDetector = None  # type: ignore
+    ClipboardXSSDetector = None  # type: ignore
+    analyze_javascript_cst = None  # type: ignore
+
 
 from xoxss.reports.sarif import (
     build_sarif_document,
@@ -674,6 +697,22 @@ class XSSScanner(CrawlerMixin):
             self.enhanced_sinks = EnhancedSinkTracker()
         if StorageXSSAnalyzer is not None:
             self.storage_xss = StorageXSSAnalyzer()
+        # Extended static surface detectors (Phase 1-4 modules).  Constructed
+        # once; each scan_for_* call resets its own result list.
+        self.extended_detectors: Dict[str, Any] = {}
+        if HAS_EXTENDED:
+            try:
+                self.extended_detectors = {
+                    "template_injection": TemplateInjectionDetector(),
+                    "hpp": HPPDetector(),
+                    "cookie_xss": CookieXSSDetector(),
+                    "wasm_xss": WASMXSSDetector(),
+                    "web_components": WebComponentDetector(),
+                    "clipboard_xss": ClipboardXSSDetector(),
+                }
+            except Exception as exc:
+                self.console.debug(f"Extended detectors init failed: {exc}")
+                self.extended_detectors = {}
         if InteractshClient is not None and getattr(args, 'interactsh', False):
             # ``--interactsh`` carries the server name (``nargs="?"``); the
             # constructor also needs the console, so calling it bare raised
@@ -2161,7 +2200,7 @@ class XSSScanner(CrawlerMixin):
             )
         )
 
-    def _record_taint_flow(self, url: str, flow: Any) -> None:
+    def _record_taint_flow(self, url: str, flow: Any, *, source: str = "ast") -> None:
         key = (
             f"{getattr(flow, 'source', '')}|{getattr(flow, 'sink', '')}|"
             f"{getattr(flow, 'line', 0)}|{getattr(flow, 'snippet', '')[:120]}"
@@ -2181,7 +2220,11 @@ class XSSScanner(CrawlerMixin):
         if is_framework_internal_sink("", snippet) or is_static_or_feature_detection(snippet):
             return
 
-        if sum(1 for finding in self.findings if "ast" in finding.tags) >= 50:
+        if sum(
+            1
+            for finding in self.findings
+            if "ast" in finding.tags or "cst" in finding.tags
+        ) >= 50:
             return
         score = float(getattr(flow, "confidence", 0.7) or 0.0)
         # Static AST taint flows are informational leads and must not be elevated
@@ -2211,8 +2254,8 @@ class XSSScanner(CrawlerMixin):
                     )
                 ),
                 subkey=f"ast:{getattr(flow, 'line', 0)}:{getattr(flow, 'sink', '')}:{digest}",
-                tags=["dom", "ast"],
-                source="ast",
+                tags=["dom", source],
+                source=source,
                 sink=str(getattr(flow, "sink", "") or ""),
                 dom_path=str(getattr(flow, "context", "") or ""),
                 confidence_rationale=(
@@ -2293,6 +2336,187 @@ class XSSScanner(CrawlerMixin):
 
         if getattr(self.args, "spa_crawl", False):
             await self._crawl_spa_routes(url)
+
+    async def _run_extended_surface_analysis(self, url: str) -> None:
+        """Run the extended static surface detectors on the landing page.
+
+        These analyzers inspect already-fetched HTML/JS for attack surfaces
+        that parameter reflection never reaches: template engines, HTTP
+        parameter pollution, cookie/storage sinks, WASM, web components and
+        clipboard APIs.  Every match is recorded as a low-confidence lead —
+        a static pattern hit is not execution proof.
+        """
+        detectors = getattr(self, "extended_detectors", None)
+        if not detectors or self._stop.is_set():
+            return
+        if not getattr(self.args, "extended_analysis", True):
+            return
+        try:
+            page = await self.fetch_page(url, cache=True)
+        except Exception:
+            return
+        if page.error or not page.text:
+            return
+        content_type = str(page.header("content-type", "") or "")
+        if content_type and "html" not in content_type.lower():
+            return
+        html = page.text
+        js_parts: List[str] = []
+        try:
+            if extract_inline_scripts is not None:
+                js_parts.extend(extract_inline_scripts(html) or [])
+        except Exception:
+            pass
+        if not js_parts:
+            try:
+                for script in extract_scripts(url, html):
+                    if script.inline and script.content:
+                        js_parts.append(script.content)
+            except Exception:
+                pass
+        js = "\n".join(js_parts)
+        marker = unique_token("ext", 8)
+        emitted = 0
+        cap = 25
+
+        def _emit(
+            kind: str,
+            parameter: str,
+            evidence: str,
+            detail: str,
+            *,
+            sink: str = "",
+            payload: str = "",
+            vuln_url: str = "",
+        ) -> bool:
+            nonlocal emitted
+            if emitted >= cap:
+                return False
+            key_src = f"{url}|{kind}|{parameter}|{evidence}"
+            digest = hashlib.sha1(key_src.encode("utf-8", "replace")).hexdigest()[:10]
+            added = self.add_finding(
+                Finding(
+                    kind=kind,
+                    url=vuln_url or url,
+                    parameter=parameter or "n/a",
+                    method="GET",
+                    payload=(payload or "")[:300],
+                    evidence=(evidence or "")[:500],
+                    confidence="low",
+                    confidence_rationale=(
+                        "Static pattern match from extended surface analysis; "
+                        "runtime execution was not verified."
+                    ),
+                    context="extended",
+                    detail=(detail or "")[:500],
+                    subkey=f"ext:{kind}:{digest}",
+                    tags=["extended", kind.lower().replace(" ", "_")],
+                    source="extended",
+                    sink=sink,
+                )
+            )
+            # Only unique findings consume the per-URL budget — payload-variant
+            # duplicates rejected by add_finding must not starve other surfaces.
+            if added:
+                emitted += 1
+            return added
+
+        def _sev(vuln: Any) -> str:
+            return str(getattr(vuln, "severity", "") or "")
+
+        def _ctx(vuln: Any) -> str:
+            return str(getattr(vuln, "context", "") or getattr(vuln, "injection_point", "") or "")
+
+        runners = (
+            ("template_injection", "Template injection", lambda: detectors["template_injection"].scan_for_template_injection(html, js, marker=marker)),
+            ("cookie_xss", "Cookie-based XSS", lambda: detectors["cookie_xss"].scan_for_cookie_xss(js, html, marker=marker)),
+            ("wasm_xss", "WASM XSS", lambda: detectors["wasm_xss"].scan_for_wasm_xss(html, js, marker=marker)),
+            ("web_components", "Web component XSS", lambda: detectors["web_components"].scan_for_web_component_xss(html, js, marker=marker)),
+            ("clipboard_xss", "Clipboard XSS", lambda: detectors["clipboard_xss"].scan_for_clipboard_xss(html, js, marker=marker)),
+        )
+        for name, label, runner in runners:
+            detector = detectors.get(name)
+            if detector is None:
+                continue
+            try:
+                vulns = runner() or []
+            except Exception as exc:
+                self.console.debug(f"{label} analysis failed: {exc}")
+                continue
+            for vuln in vulns:
+                if emitted >= cap:
+                    break
+                sink = str(getattr(getattr(vuln, "sink", ""), "value", getattr(vuln, "sink", "")) or "")
+                if not sink:
+                    sink = str(getattr(getattr(vuln, "component_type", ""), "value", getattr(vuln, "component_type", "")) or "")
+                parameter = str(
+                    getattr(vuln, "parameter", "")
+                    or getattr(vuln, "injection_point", "")
+                    or getattr(vuln, "element_name", "")
+                    or "n/a"
+                )
+                payload = str(getattr(vuln, "payload", "") or "")
+                extra = getattr(vuln, "category", "") or getattr(vuln, "pattern", "") or ""
+                reflected = bool(getattr(vuln, "reflected", False))
+                detail = (
+                    f"severity={_sev(vuln)}; context={_ctx(vuln)}"
+                    + (f"; category={extra}" if extra else "")
+                    + ("; reflection confirmed in response" if reflected else "")
+                )
+                _emit(
+                    label,
+                    parameter,
+                    f"{label} surface detected ({sink or 'pattern'})",
+                    detail,
+                    sink=sink,
+                    payload=payload,
+                )
+            if emitted >= cap:
+                break
+
+        # HPP is URL-shape analysis — it does not need page content.
+        hpp = detectors.get("hpp")
+        if hpp is not None and emitted < cap:
+            try:
+                hpp_vulns = hpp.scan_for_hpp_vulnerabilities(url, marker=marker) or []
+            except Exception as exc:
+                self.console.debug(f"HPP analysis failed: {exc}")
+                hpp_vulns = []
+            seen_hpp: set = set()
+            for vuln in hpp_vulns:
+                if emitted >= cap:
+                    break
+                # Only report HPP when duplicate parameters were actually
+                # observed in the URL.  "injection"-type vulns are generated
+                # for any well-known parameter name without server evidence —
+                # pure speculation, so they stay out of findings.
+                if str(getattr(vuln, "pollution_type", "") or "") != "duplicate":
+                    continue
+                # HPP emits one vuln per payload/variant pair; collapse to a single
+                # lead per (parameter, pollution type) — the variants are
+                # replay material, not separate findings.
+                hpp_key = (
+                    str(getattr(vuln, "parameter", "") or ""),
+                    str(getattr(vuln, "pollution_type", "") or ""),
+                )
+                if hpp_key in seen_hpp:
+                    continue
+                seen_hpp.add(hpp_key)
+                variant = str(getattr(vuln, "url", "") or "")
+                _emit(
+                    "HTTP parameter pollution",
+                    str(getattr(vuln, "parameter", "") or "n/a"),
+                    f"Duplicate/polluted parameter '{getattr(vuln, 'parameter', '')}' "
+                    f"({getattr(vuln, 'pollution_type', 'duplicate')})",
+                    f"severity={_sev(vuln)}; waf_bypass={bool(getattr(vuln, 'waf_bypass', False))}; "
+                    f"variant={variant[:200]}",
+                    payload=str(getattr(vuln, "payload", "") or ""),
+                )
+        if emitted:
+            self.console.info(
+                f"Extended surface analysis: {emitted} lead(s) on {url}",
+                important=False,
+            )
 
     async def _report_csp_bypasses(self, url: str) -> None:
         bypass = self.csp_bypass
@@ -2423,6 +2647,11 @@ class XSSScanner(CrawlerMixin):
                         self.console.info(f"Storage XSS: {len(storage_vectors)} vector(s) detected for {url}")
                 except Exception as exc:
                     self.console.debug(f"Storage XSS analysis failed: {exc}")
+
+            # Extended static surface analysis: template injection, HPP,
+            # cookie/storage sinks, WASM, web components, clipboard APIs.
+            # Runs on the cached page — no extra requests.
+            await self._run_extended_surface_analysis(url)
             completed = True
         except asyncio.CancelledError:
             interrupted = True
@@ -4344,6 +4573,26 @@ class XSSScanner(CrawlerMixin):
                 self.stats.ast_flows += len(flows)
                 for flow in flows:
                     self._record_taint_flow(script.url or url, flow)
+
+        # CST (concrete syntax tree) taint is a second, structurally different
+        # pass over the same scripts.  It shares the AST dedupe key space so
+        # identical flows collapse; divergent parses surface as separate
+        # low-confidence leads.
+        if (
+            getattr(self.args, "ast_analysis", True)
+            and HAS_EXTENDED
+            and analyze_javascript_cst is not None
+        ):
+            for script in scripts:
+                if not script.content:
+                    continue
+                try:
+                    cst_flows = analyze_javascript_cst(script.content, script.url or url)
+                except Exception as exc:
+                    self.console.debug(f"CST taint analysis failed: {exc}")
+                    continue
+                for flow in cst_flows:
+                    self._record_taint_flow(script.url or url, flow, source="cst")
 
         if self.dfg_slicer is not None and self.hybrid_enabled:
             for script in scripts:

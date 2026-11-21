@@ -218,6 +218,7 @@ class ScanConfig:
     service_worker: bool = True
     framework_bypass: bool = False
     ast_analysis: bool = True
+    extended_analysis: bool = True
     dom_source_probes: bool = False
 
     # AI fallback

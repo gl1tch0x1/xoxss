@@ -548,6 +548,16 @@ def build_parser(
         help="enable AST-based JavaScript taint analysis for DOM XSS (default: on; --no-ast-analysis disables)",
     )
     advanced.add_argument("--framework-bypass", action="store_true", help="enable framework-specific XSS bypass testing (React, Vue, Angular)")
+    advanced.add_argument(
+        "--extended-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "enable extended static surface analysis on the landing page "
+            "(template injection, HPP, cookie XSS, WASM, web components, "
+            "clipboard APIs; default: on; --no-extended-analysis disables)"
+        ),
+    )
     advanced.add_argument("--spa-crawl", action="store_true", help="enable SPA-aware hash route navigation and dynamic content discovery")
     advanced.add_argument("--csp-bypass", action="store_true", help="enable automated CSP bypass testing and payload generation")
     advanced.add_argument(
