@@ -162,6 +162,16 @@ class Finding:
             return hashlib.sha1(
                 f"{family}|{page}".encode("utf-8", "replace")
             ).hexdigest()
+        if family in ("Stored XSS", "Template injection"):
+            # The sink is the page/form, not the query string that happened to
+            # reach it.  Without this, auto-mode parameter mining reports the
+            # same stored sink once per discovered query parameter.
+            parts = urlsplit(self.url)
+            page = urlunsplit(
+                (parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", "", "")
+            )
+            raw = "|".join([family, page, self.parameter, self.method.upper()])
+            return hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()
         return self.key()
 
     def to_dict(self) -> Dict[str, Any]:

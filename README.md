@@ -72,18 +72,25 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 
 **Detection**
 
-- **Hybrid Evidence-Based Verification Pipeline (`--hybrid`, `--oracle-verify`):**
-  - **CDP Runtime Taint & Hooking (`core/cdp_hooks.py`):** Injects deep prototype hooks into Chromium DevTools Protocol (`Page.addScriptToEvaluateOnNewDocument`) across Playwright and Selenium before page scripts execute. Taints sources with trackable canary tokens (`xoxss_canary_<id>`) and hooks sinks (`Element.prototype.innerHTML`, `outerHTML`, `insertAdjacentHTML`, `Document.prototype.write`, `eval`, `Function`, `location.href`, `setAttribute`). Tracks async storage provenance (`IDBObjectStore.prototype.put/get`, `Storage.prototype.setItem/getItem`) to prevent cross-script storage contamination.
-  - **AST / CFG / DFG Program Slicing (`analysis/dfg_slicer.py`):** Tree-sitter CST and AST backward data-flow slicer that computes def-use chains, traces variable propagation across closures and minified scopes, and eliminates false positives caused by minified variable name collisions (`id`, `db`, `url`, `hash`, `loc`).
-  - **Framework Runtime Internal Sink Suppression (`analysis/framework_sinks.py`):** Eliminates vendor framework internal runtime false positives (Vue 3 `Af.innerHTML = Ef(...)`, Alpine.js `D('html', ...)`, React `dangerouslySetInnerHTML`, Angular and jQuery internal sinks) by classifying vendor internals as safe wrappers unless reachable by untrusted user data.
-  - **Context-Aware DOM Breakout Mutation (`analysis/context_mutator.py`):** Generates optimal breakout payloads tailored to the exact enclosing syntax tree context (HTML body, quoted attribute, script block, template string, or event handler).
-  - **Multi-Provider LLM Semantic Triage (`analysis/llm_triage.py`):** Optional AI triage layer supporting OpenAI, Google Gemini, Anthropic Claude, and local Ollama models with strict JSON schema validation to filter out harmless DOM flows before browser execution.
-  - **Headless Execution Oracle (`core/execution_oracle.py`):** Browser verification harness for Playwright and Selenium sessions that injects candidates into an isolated test page, monitors `window.__xoxss_verify`, and records browser-observed execution evidence.
+- **Layered evidence pipeline (`--hybrid`):**
+  - **CDP sink instrumentation (`core/cdp_hooks.py`):** Injects prototype hooks into
+    Playwright and Selenium pages before page scripts run and records sink activity for
+    `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `eval`, `Function`,
+    `location.href` and `setAttribute`. A sink observation is promoted to execution
+    evidence only when the instrumented sink receives executable markup and the unique
+    marker is observed; static sink taint remains a lead.
+  - **Data-flow slicing (`analysis/dfg_slicer.py`):** Backward source-to-sink slicing
+    across function boundaries, async callbacks and minified scopes. A tree-sitter CST
+    backend resolves shadowed variables when `tree-sitter` and `tree-sitter-javascript`
+    are installed; otherwise the regex analyzer is used.
+  - **Framework internal-sink suppression (`analysis/framework_sinks.py`):** Classifies
+    vendor framework runtime sinks (Vue, Alpine, React, Angular, jQuery) as wrappers
+    unless untrusted data actually reaches them.
 - Context-aware payloads for HTML, attributes (double/single/unquoted), `<script>`,
   `<style>`, comments, JSON, `javascript:` URLs and generic fallbacks.
-- HTTP-first probing with browser confirmation: Selenium Firefox or Playwright drives
-  only candidates that survive the probe stage. Scoped Selenium Chrome/Edge verification
-  fails closed until reliable BiDi request continuation is available.
+- HTTP-first probing with browser confirmation: Playwright or Selenium Firefox drives
+  only candidates that survive the probe stage. Scoped Chrome/Chromium/Edge runs are
+  routed through Playwright, which intercepts every request, instead of failing closed.
 - Execution markers instead of blocking dialogs. Payloads write a random token to
   `window.__xoxss_hits`; `alert`, `confirm` and `prompt` are intercepted and recorded.
 - Runtime DOM instrumentation for `innerHTML`, `outerHTML`, `document.write`,
@@ -165,15 +172,19 @@ The CLI is the stable interface. `python xoxss.py`, `python -m xoxss` and the in
 
 - Ten context-specific built-in payload families, the bundled 440-vector
   [brokep/XSS-Payloads](https://github.com/brokep/XSS-Payloads) catalog (24 attack
-  families plus the README examples, scheduled by reflection context), a rotating
-  remote corpus and the bundled 6,900+ entry LazyXss payload pack.
+  families plus the README examples, scheduled by reflection context), and the bundled
+  6,900+ entry LazyXss payload pack. Remote corpora are opt-in via `--remote-payloads`.
 - Eight tamper transforms (`doubleencode`, `hexencode`, `htmlentities`, `jscomment`,
   `jsonfuzz`, `spacetab`, `uppercase`, `urlencode`) and the `all` chain.
 - Twenty composable encoders, including entity variants, JS escapes, `fromCharCode`,
   base64/eval, comment breaks, `%uXXXX`, UTF-16LE, full-width characters and null bytes.
-- Remote payload lists download to temporary storage and are cleaned up automatically,
-  with graceful fallback when offline. Local corpora load from files, JSON arrays or
-  whole directories.
+- When `--remote-payloads` is supplied, remote lists download to temporary storage and
+  are cleaned up automatically, with graceful fallback when offline. Local corpora load
+  from files, JSON arrays or whole directories.
+- **Payload safety:** bundled and downloaded payloads are sanitized before use.
+  Exfiltration sinks are rewritten to the reserved `xoxss.invalid` host, and cookie reads
+  are neutered only when a network sink is present. Nothing is sent to third-party
+  collection domains by default.
 
 **Access-control bypass (401/403)**
 
@@ -436,22 +447,46 @@ executable.
 ## Quick start
 
 ```bash
-# 0. God mode: everything below, fully automatic, no extra flags
+# 0. One domain, autonomous pipeline: normalize, recon, crawl, map, probe,
+#    exploit, verify, chain and report
+xoxss example.com --auto
+
+# 1. God mode: every capability, every budget at the ceiling
 xoxss example.com --god          # alias: --yolo
 
-# 1. Fast HTTP-only triage of a single URL
+# 2. Fast HTTP-only triage of a single URL
 xoxss "https://target.tld/?q=1" --no-browser --report json,sarif
 
-# 2. Harvest a domain and find reflecting parameters (collector + Gxss)
+# 3. Harvest a domain and find reflecting parameters (collector + Gxss)
 xoxss example.com --param-audit --param-output params.json
 
-# 3. Crawl, confirm in a headless browser, save evidence
+# 4. Crawl, confirm in a headless browser, save evidence
 xoxss https://target.tld --crawl --deep \
   --browser playwright --headless --screenshot --report all
 
-# 4. Triage a large URL list without a browser
+# 5. Triage a large URL list without a browser
 xoxss -l urls.txt --mass --jsonl findings.jsonl --concurrency 32
 ```
+
+### Auto mode (`--auto`)
+
+`--auto` is the single-input mode: give it a bare domain (or a URL) and it runs the full
+phased pipeline without further flags.
+
+```bash
+xoxss example.com --auto
+```
+
+It normalizes the target, applies an autonomous preset once, then runs: recon → crawl →
+surface mapping → creative probes (open redirect, host-header, cache poisoning, CRLF,
+CORS, JSONP, GraphQL introspection, static DOM/postMessage, source maps, secrets) →
+XSS exploit/verify → primitive chaining → coverage matrix and reports. Explicit flags and
+`--no-*` opt-outs always win, so `--auto --no-browser` stays HTTP-only and
+`--auto --max-urls 100` keeps the tighter budget.
+
+Auto mode deliberately keeps scope narrow by default: subdomain enumeration,
+`--allow-subdomains` and external tools stay opt-in. `--auto` cannot be combined with
+`--mass` or `--param-audit`.
 
 A confirmed finding is printed with its URL, parameter, method, payload, context and
 evidence. JSON, Markdown, HTML and SARIF files are written to `.xoxss/reports/` by
@@ -493,7 +528,7 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--fuzz-targets N` / `--fuzz-words N` | Directories fuzzed per crawl (default `8`) and wordlist entries tried per directory (default `100`). |
 | `--fuzz-budget N` / `--fuzz-param-targets N` | Hard request cap for the phase (default `400`) and endpoints mined for hidden parameters (default `25`). |
 | `--external-tools` / `--no-external-tools` | Use installed external recon/verification binaries. |
-| `--allow-subdomains` / `--include REGEX` / `--exclude REGEX` | Scope control; subdomains are auto-enabled for recon. |
+| `--allow-subdomains` / `--include REGEX` / `--exclude REGEX` | Scope control; subdomains stay out of scope unless explicitly allowed. |
 
 ### Injection and payloads
 
@@ -502,7 +537,7 @@ standard input. For example: `httpx -silent -l hosts.txt | python -m xoxss --mas
 | `--max-payloads N` | Payloads per injection point (default `6`). |
 | `--payload-catalog` / `--no-payload-catalog` | Bundled 440-vector repo catalog, context-scheduled (on by default). |
 | `--payload-file PATH` / `--payload-dir DIR` | Custom corpus: single file, `os.pathsep`-separated list, JSON array / recursive directory. |
-| `--lazy-payloads` / `--remote-payloads` | Bundled LazyXss pack (on) / temporary GitHub corpus download (on). Disable with the `--no-*` form. |
+| `--lazy-payloads` / `--remote-payloads` | Bundled LazyXss pack (on) / temporary GitHub corpus download (off; opt in explicitly). Disable with the `--no-*` form. |
 | `--payload-source URL` / `--payload-limit N` | Extra raw payload URL / maximum remote payloads kept (default `600`, hard cap `5000`). |
 | `--payload-tmp-dir DIR` / `--keep-payloads` | Payload cache root / retain the temp directory after the scan. |
 | `--tamper NAME` | `doubleencode`, `hexencode`, `htmlentities`, `jscomment`, `jsonfuzz`, `spacetab`, `uppercase`, `urlencode`, `all`. |
@@ -566,12 +601,12 @@ bypasses from the checkpoint.
 
 | Option | Description |
 |---|---|
-| `--hybrid` | Enable the 5-layer Hybrid Detection Pipeline (CDP runtime instrumentation, AST/CFG/DFG static slicing, DOM context breakout mutation, and headless execution oracle). |
-| `--oracle-verify` | Strictly verify all candidate findings via headless execution oracle (`window.__xoxss_verify`) before reporting. |
-| `--llm-provider PROVIDER` | LLM triage provider: `openai`, `gemini`, `anthropic`, `ollama` (default: `none`). |
-| `--llm-api-key KEY` | API key for LLM semantic triage (or env vars `OPENAI_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`). |
-| `--llm-model MODEL` | Model identifier for LLM triage (e.g. `gpt-4o`, `gemini-2.5-flash`, `claude-3-5-sonnet-latest`, `llama3.2`). |
-| `--llm-endpoint URL` | Custom endpoint base URL (e.g. `http://localhost:11434` for Ollama). |
+| `--hybrid` | Enable layered verification: CDP sink instrumentation, data-flow slicing, framework sink suppression and browser execution evidence. |
+| `--oracle-verify` | Accepted for compatibility. Findings still require the standard deterministic/browser evidence path; no separate oracle verdict is applied. |
+| `--llm-provider PROVIDER` | Experimental LLM triage hook (`openai`, `gemini`, `anthropic`, `ollama`). Not part of the default reporting policy. |
+| `--llm-api-key KEY` | API key for the experimental LLM triage hook (or env vars `OPENAI_API_KEY`, `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`). |
+| `--llm-model MODEL` | Model identifier for the experimental LLM triage hook. |
+| `--llm-endpoint URL` | Custom endpoint base URL for the experimental LLM triage hook (e.g. `http://localhost:11434` for Ollama). |
 
 > The `--ai*` options send a bounded reflection snippet, the parameter name and the
 > character matrix to the configured chat endpoint. Use them only when that data may
@@ -706,16 +741,17 @@ channel with every budget at its ceiling, and it retries degraded setups automat
   parameter fuzzing (1500-request fuzz budget, 300 words, 24 targets, 40 mined params).
 - **Protected routes**: 401/403 bypass on, up to 64 request shapes per URL,
   aggressive method probing.
-- **Injection**: ≥ 24 payloads per point, ≥ 2500 remote payloads + LazyXss, header
-  injection (25 params/URL, 1000 probes), dangling markup, stored-XSS hunting,
-  reflection reporting, per-character probes, 150 parameter-wordlist names.
+- **Injection**: ≥ 24 payloads per point, LazyXss corpus, header injection (25 params/URL,
+  1000 probes), dangling markup, stored-XSS hunting, reflection reporting, per-character
+  probes, 150 parameter-wordlist names. Remote corpora stay opt-in; add
+  `--remote-payloads` to include them.
 - **Analyzers**: polyglots, JSONP, prototype pollution, mXSS, CSP + CSP-bypass automation,
   CORS, Trusted Types, DOM clobbering, DOM source probes, enhanced sinks, storage XSS,
   service workers, framework bypasses, `postMessage`, active WebSocket frames,
   file-upload and GraphQL/GraphQL-XSS detection, smart rate limiting.
 - **Verification**: fastest browser available (Playwright → Chrome/Edge/Firefox), three
   headless workers, browser-driven route discovery, SPA route crawling, fragment XSS,
-  screenshots; hybrid CDP + AST/DFG pipeline and execution oracle when available;
+  screenshots; hybrid CDP sink instrumentation and data-flow slicing when available;
   HTTP-only without a browser.
 - **Blind XSS**: public interactsh (`oast.pro`) unless you supplied `--blind`,
   `--interactsh`, `--oob-poll` or `--oob-file`; 60 s callback wait.
@@ -1398,12 +1434,12 @@ stealth-only features, no destructive defaults, no unconfirmed finding promoted 
 - **Browser verification does not inherit arbitrary CLI headers**. `--auth-state`
   loads Playwright storage-state cookies into HTTP and browser sessions.
 - **Browser scope enforcement depends on interception support**. Playwright routes
-  requests through its context; Selenium Firefox uses WebDriver BiDi network interception.
-  Scoped Selenium Chrome/Edge verification is currently disabled because Chromium BiDi
-  request continuation proved unreliable in integration testing. Unsupported Selenium
-  backends fail closed rather than continuing without the configured scope boundary.
-  Out-of-scope resources are blocked, which can change pages that depend on third-party
-  assets.
+  requests through its context; Selenium Firefox uses WebDriver BiDi network
+  interception. Scoped Chrome/Chromium/Edge runs are routed through Playwright instead of
+  Selenium because Chromium BiDi request continuation is unreliable. If Playwright is not
+  installed, scoped Chrome/Chromium/Edge verification fails closed rather than continuing
+  without the configured scope boundary. Out-of-scope resources are blocked, which can
+  change pages that depend on third-party assets.
 - **Prototype-pollution gadgets are finite**; known gadgets are fingerprinted, but
   arbitrary chains are not synthesized.
 - **Advanced analyzers are heuristics** (mXSS, CSP, CORS, clobbering, Trusted Types,
@@ -1432,8 +1468,10 @@ stealth-only features, no destructive defaults, no unconfirmed finding promoted 
 - Reports can contain credentials discovered in JavaScript; restrict access to
   `.xoxss/` and exported report directories.
 - `--insecure` disables TLS verification — never on untrusted networks.
-- Remote payload downloads contact GitHub at startup; use `--no-remote-payloads` in
-  restricted or air-gapped environments.
+- Remote payload downloads are opt-in (`--remote-payloads`) and contact GitHub only when
+  enabled; leave them off in restricted or air-gapped environments. Downloaded payloads
+  are sanitized to the reserved `xoxss.invalid` host and cookie reads are neutered when a
+  network sink is present.
 - The authors are not responsible for misuse or damage caused by this software.
 
 ## Acknowledgements

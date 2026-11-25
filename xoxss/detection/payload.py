@@ -9,6 +9,8 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
+from xoxss.scan.safety import sanitize_payload
+
 
 class PayloadContext(Enum):
     """Payload execution contexts."""
@@ -1878,10 +1880,11 @@ def catalog_by_context(
     seen: Set[str] = set()
     templates: List[str] = []
     for entry in exact:
-        if entry.payload in seen:
+        payload = sanitize_payload(entry.payload)
+        if payload in seen:
             continue
-        seen.add(entry.payload)
-        templates.append(entry.payload)
+        seen.add(payload)
+        templates.append(payload)
     _CONTEXT_TEMPLATE_CACHE[key] = tuple(templates)
     return list(templates)
 

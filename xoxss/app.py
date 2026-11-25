@@ -71,6 +71,7 @@ def _parse_args(
     if not getattr(args, "fail_on", None):
         args.fail_on = "any" if getattr(args, "fail_on_findings", False) else None
     explicit_flags = {token.split("=", 1)[0] for token in raw_args if token.startswith("--")}
+    args._explicit_flags = set(explicit_flags)
     god_mode_requested = "--god" in explicit_flags or "--yolo" in explicit_flags
     if args.ai_only:
         args.ai = True
@@ -328,6 +329,45 @@ def _run_mass_mode(args: argparse.Namespace, console: Console) -> int:
     return code
 
 
+def _run_auto_mode(args: argparse.Namespace, console: Console) -> int:
+    """Run the autonomous domain-first pipeline (``--auto``)."""
+    from xoxss.auto.engine import run_auto
+
+    install_uvloop()
+    payload_files: List[Path] = []
+    payload_dir: Optional[Path] = None
+    code = 0
+    try:
+        if args.remote_payloads:
+            sources: List[str] = list(PAYLOAD_SOURCES)
+            for extra in args.payload_source or []:
+                if extra and extra not in sources:
+                    sources.append(str(extra))
+            payload_dir = payload_workdir(args.payload_tmp_dir)
+            payload_files, payload_dir = download_payload_lists(
+                console,
+                sources,
+                args.payload_limit,
+                work_dir=payload_dir,
+            )
+        args.payload_files = [str(path) for path in payload_files]
+
+        console.start_status()
+        code, _actionable = asyncio.run(run_auto(args, console))
+    except KeyboardInterrupt:
+        console.warn("Interrupted - checkpoints were saved")
+        code = 130
+    except Exception as exc:
+        console.error(f"Fatal error: {exc}")
+        if args.verbose:
+            console.raw(traceback.format_exc())
+        code = 1
+    finally:
+        console.stop_status()
+        cleanup_payload_lists(payload_dir, keep=args.keep_payloads, console=console)
+    return code
+
+
 def _run_full_scan(args: argparse.Namespace, console: Console) -> int:
     """Download optional payload lists, scan every target and clean up."""
     install_uvloop()
@@ -392,6 +432,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if getattr(args, "god", False):
         _apply_god_mode(args, argv, console)
 
+    if getattr(args, "auto", False):
+        from xoxss.auto.plan import apply_auto_preset
+
+        apply_auto_preset(args, console, explicit_flags)
+
     rejected = _check_recon_support(args, console)
     if rejected is not None:
         return rejected
@@ -413,9 +458,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         console.error("--mass and --param-audit are separate modes; choose one")
         return 1
 
+    if getattr(args, "auto", False) and (args.mass or getattr(args, "param_audit", False)):
+        console.error("--auto is a full-scan preset; it cannot be combined with --mass or --param-audit")
+        return 1
+
     if getattr(args, "god", False) and (args.mass or getattr(args, "param_audit", False)):
         console.error("--god is a full-scan preset; it cannot be combined with --mass or --param-audit")
         return 1
+
+    if getattr(args, "auto", False):
+        return _run_auto_mode(args, console)
 
     if getattr(args, "param_audit", False):
         return _run_param_audit_mode(args, console)

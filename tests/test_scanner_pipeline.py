@@ -14,6 +14,7 @@ import pytest
 
 from xoxss.core.config import ScanConfig
 from xoxss.scan.injection import InjectionPoint
+from xoxss.scan.reflection import analyze_reflection
 from xoxss.scanner import XSSScanner
 from xoxss.utils.console import Console
 
@@ -314,6 +315,82 @@ def test_check_stored_unstable_reflection(tmp_path: Path) -> None:
     # Hit is still reported (caller decides), but stability is recorded False.
     assert result == page
     assert scanner._stored_hit_stable is False
+
+
+def test_failed_stored_check_does_not_poison_later_payloads(tmp_path: Path) -> None:
+    """A payload that is not stored must not stop later payloads from being
+    checked; otherwise a persisted later payload is mislabelled as reflected."""
+    page = "http://127.0.0.1:9/comments"
+    http = _StubHttp({page: ["<html><body>no marker</body></html>"]})
+    scanner = _stored_scanner(tmp_path, http)
+    point = InjectionPoint(
+        url="http://127.0.0.1:9/submit",
+        method="POST",
+        param="comment",
+        page_url=page,
+    )
+    info = analyze_reflection(
+        "<html><body>no marker</body></html>",
+        _STORED_TOKEN,
+        _STORED_PAYLOAD,
+        "text/html",
+    )
+
+    result = asyncio.run(
+        scanner._test_stored_candidate(
+            point,
+            _STORED_PAYLOAD,
+            _STORED_TOKEN,
+            _StubResponse("<html><body>no marker</body></html>"),
+            info,
+        )
+    )
+
+    assert result is False
+    assert point.key() not in scanner._stored_checked
+    assert scanner._stored_attempts[point.key()] == 1
+
+
+def test_confirm_in_browser_relabels_persisted_post_as_stored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Confirmed POST execution whose payload survives a fresh GET is stored
+    XSS, never reflected XSS."""
+    from types import SimpleNamespace
+
+    from xoxss.core.finding import CONFIRMED_EXECUTION
+    from xoxss.scan.reflection import analyze_reflection
+
+    page = "http://127.0.0.1:9/comments"
+    http = _StubHttp({page: [_STORED_PAGE_HTML]})
+    scanner = _stored_scanner(tmp_path, http)
+    point = InjectionPoint(
+        url=page, method="POST", param="comment", page_url=page
+    )
+    info = analyze_reflection(
+        _STORED_PAGE_HTML, _STORED_TOKEN, _STORED_PAYLOAD, "text/html"
+    )
+
+    async def fake_validate(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(
+            status=CONFIRMED_EXECUTION,
+            evidence=f"js-executed: {_STORED_TOKEN}",
+            dialog_text="",
+            screenshot="",
+        )
+
+    monkeypatch.setattr(scanner, "validate_execution", fake_validate)
+
+    finding = asyncio.run(
+        scanner.confirm_in_browser(
+            point, _STORED_PAYLOAD, _STORED_TOKEN, info, "text/html"
+        )
+    )
+
+    assert finding is not None
+    assert finding.kind == "Stored XSS (confirmed)"
+    assert finding.url == page
+    assert point.key() in scanner._stored_checked
 
 
 # -- --min-confidence report filter -------------------------------------------

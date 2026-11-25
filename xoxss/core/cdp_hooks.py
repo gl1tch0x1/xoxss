@@ -141,6 +141,46 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
       }}
     }};
 
+    // Helper: does the marker survive in an executable construct *after* the
+    // browser has parsed the value?  The old implementation marked a sink as a
+    // hit when the raw pre-sanitisation string contained the canary, so a
+    // sanitizer that stripped the payload still counted as execution.  This
+    // helper inspects the post-parse DOM instead.
+    var TOKEN_RE = /z[a-z0-9]{{6,}}/gi;
+    var isExecutableMarkup = function (root, raw) {{
+      try {{
+        if (!root) {{ root = document.documentElement; }}
+        if (!root) {{ return false; }}
+        var html = '';
+        if (root.nodeType === 9) {{
+          html = root.documentElement ? root.documentElement.innerHTML : '';
+        }} else if (root.nodeType === 11) {{
+          var tmp = document.createElement('div');
+          tmp.appendChild(root.cloneNode(true));
+          html = tmp.innerHTML;
+        }} else {{
+          html = root.innerHTML || '';
+        }}
+        var tokens = String(raw || '').match(TOKEN_RE) || [];
+        if (!tokens.length) {{ return false; }}
+        var lower = html.toLowerCase();
+        for (var i = 0; i < tokens.length; i++) {{
+          var t = tokens[i].toLowerCase();
+          var idx = lower.indexOf(t);
+          if (idx === -1) {{ continue; }}
+          var start = Math.max(0, idx - 200);
+          var end = Math.min(html.length, idx + t.length + 60);
+          var around = lower.slice(start, end);
+          if (/on[a-z]+\\s*=/.test(around)) {{ return true; }}
+          if (around.indexOf('javascript:') !== -1) {{ return true; }}
+          if (around.indexOf('<script') !== -1) {{ return true; }}
+          if (around.indexOf('srcdoc') !== -1) {{ return true; }}
+          if (/<(iframe|object|embed)[^>]+(src|data)\\s*=/.test(around)) {{ return true; }}
+        }}
+        return false;
+      }} catch (e) {{ return false; }}
+    }};
+
     // Helper: Record sink execution
     var recordSink = function (sinkName, value, targetNode) {{
       try {{
@@ -153,6 +193,15 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
           return;
         }}
 
+        var tokenPresent = (String(strVal).match(TOKEN_RE) || []).length > 0;
+        var executed = isExecutableMarkup(targetNode, strVal);
+        // eval/Function/setTimeout(string) execute the value itself, so the
+        // token's presence is proof that code ran.
+        if (!executed && (sinkName === 'eval' || sinkName === 'Function'
+            || sinkName === 'setTimeout' || sinkName === 'setInterval')) {{
+          executed = tokenPresent;
+        }}
+
         var caller = parseCaller();
         var entry = {{
           sink: sinkName,
@@ -161,14 +210,15 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
           script_url: caller.url,
           caller_line: caller.line,
           caller_stack: caller.raw,
-          has_canary: strVal.includes(CANARY_PREFIX),
+          has_canary: tokenPresent,
+          executed: executed,
           timestamp: Date.now()
         }};
 
         window.__xoxss_telemetry.sinks.push(entry);
         window.__xoxss_sinks.push(entry);
 
-        if (entry.has_canary) {{
+        if (entry.executed) {{
           window.__xoxss_telemetry.hits.push(entry);
         }}
       }} catch (e) {{}}
@@ -246,8 +296,9 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
           configurable: true,
           get: function () {{ return innerDesc.get.call(this); }},
           set: function (val) {{
+            var ret = innerDesc.set.call(this, val);
             recordSink('innerHTML', val, this);
-            return innerDesc.set.call(this, val);
+            return ret;
           }}
         }});
       }}
@@ -260,8 +311,9 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
           configurable: true,
           get: function () {{ return outerDesc.get.call(this); }},
           set: function (val) {{
+            var ret = outerDesc.set.call(this, val);
             recordSink('outerHTML', val, this);
-            return outerDesc.set.call(this, val);
+            return ret;
           }}
         }});
       }}
@@ -270,8 +322,9 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
     try {{
       var origInsert = Element.prototype.insertAdjacentHTML;
       Element.prototype.insertAdjacentHTML = function (pos, markup) {{
+        var ret = origInsert.apply(this, arguments);
         recordSink('insertAdjacentHTML', markup, this);
-        return origInsert.apply(this, arguments);
+        return ret;
       }};
     }} catch (e) {{}}
 
@@ -280,14 +333,16 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
       var origWrite = document.write;
       document.write = function () {{
         var val = Array.prototype.join.call(arguments, '');
+        var ret = origWrite.apply(document, arguments);
         recordSink('document.write', val, document);
-        return origWrite.apply(document, arguments);
+        return ret;
       }};
       var origWriteln = document.writeln;
       document.writeln = function () {{
         var val = Array.prototype.join.call(arguments, '');
+        var ret = origWriteln.apply(document, arguments);
         recordSink('document.writeln', val, document);
-        return origWriteln.apply(document, arguments);
+        return ret;
       }};
     }} catch (e) {{}}
 
@@ -295,21 +350,26 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
     try {{
       var origEval = window.eval;
       window.eval = function (code) {{
-        recordSink('eval', code, null);
-        return origEval(code);
+        try {{
+          return origEval(code);
+        }} finally {{
+          recordSink('eval', code, null);
+        }}
       }};
     }} catch (e) {{}}
 
     try {{
       var origTimeout = window.setTimeout;
       window.setTimeout = function (handler) {{
+        var ret = origTimeout.apply(window, arguments);
         if (typeof handler === 'string') {{ recordSink('setTimeout', handler, null); }}
-        return origTimeout.apply(window, arguments);
+        return ret;
       }};
       var origInterval = window.setInterval;
       window.setInterval = function (handler) {{
+        var ret = origInterval.apply(window, arguments);
         if (typeof handler === 'string') {{ recordSink('setInterval', handler, null); }}
-        return origInterval.apply(window, arguments);
+        return ret;
       }};
     }} catch (e) {{}}
 
@@ -318,10 +378,11 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
       var origSetAttr = Element.prototype.setAttribute;
       Element.prototype.setAttribute = function (name, value) {{
         var attr = String(name || '').toLowerCase();
+        var ret = origSetAttr.apply(this, arguments);
         if (attr === 'srcdoc' || attr === 'href' || attr === 'src' || attr === 'action' || /^on[a-z]+$/.test(attr)) {{
           recordSink('setAttribute:' + attr, value, this);
         }}
-        return origSetAttr.apply(this, arguments);
+        return ret;
       }};
     }} catch (e) {{}}
 
@@ -329,13 +390,15 @@ def build_cdp_instrumentation(canary_prefix: str = "xoxss_canary_") -> str:
     try {{
       var origFragment = Range.prototype.createContextualFragment;
       Range.prototype.createContextualFragment = function (markup) {{
+        var ret = origFragment.apply(this, arguments);
         recordSink('createContextualFragment', markup, this.startContainer || null);
-        return origFragment.apply(this, arguments);
+        return ret;
       }};
       var origParse = DOMParser.prototype.parseFromString;
       DOMParser.prototype.parseFromString = function (source, type) {{
+        var ret = origParse.apply(this, arguments);
         recordSink('DOMParser.parseFromString:' + type, source, null);
-        return origParse.apply(this, arguments);
+        return ret;
       }};
     }} catch (e) {{}}
 

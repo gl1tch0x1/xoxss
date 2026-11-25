@@ -641,7 +641,6 @@ class XSSScanner(CrawlerMixin):
         # so one target's registrations never leak into the next target's pool.
         self.payloads = cached_payloads.clone()
         self.stats.payload_pool = cached_payloads.total_pool_size
-        self.stats.payload_pool = cached_payloads.total_pool_size
         
         # Framework bypass detector
         self.framework_exploiter: Optional[Any] = None
@@ -764,6 +763,7 @@ class XSSScanner(CrawlerMixin):
         self._status_task: Optional[asyncio.Task] = None
         self.screenshot_dir = Path(args.state_dir) / "screenshots"
         self._stored_checked: Set[str] = set()
+        self._stored_attempts: Dict[str, int] = {}
         self._stored_hit_response: Optional[HttpResponse] = None
         self._stored_hit_stable: bool = False
         self.mutation_findings: List[Dict[str, str]] = []
@@ -979,9 +979,21 @@ class XSSScanner(CrawlerMixin):
         return result
 
     def _browser_factory(self) -> Any:
-        use_playwright = (self.args.browser or "").lower() == "playwright" or bool(
+        requested = (self.args.browser or "").lower()
+        from xoxss.core.browser import HAS_PLAYWRIGHT
+
+        use_playwright = requested == "playwright" or bool(
             getattr(self.args, "auth_state", None)
         )
+        # Selenium's Chromium BiDi request continuation cannot enforce the scan
+        # scope reliably, so scoped Chrome/Chromium/Edge runs are routed through
+        # Playwright (which intercepts every request) instead of failing closed.
+        if requested in ("chrome", "chromium", "edge") and HAS_PLAYWRIGHT:
+            use_playwright = True
+            self.console.debug(
+                f"{requested} requested: using Playwright Chromium for scoped "
+                "request interception"
+            )
         engine_class = PlaywrightEngine if use_playwright else BrowserEngine
         return engine_class(
             self.console,
@@ -1246,9 +1258,10 @@ class XSSScanner(CrawlerMixin):
                 with suppress(Exception):
                     await self.http.close()
 
-        self.console.rule("reports & summary")
-        self.print_summary()
-        self.write_reports()
+        if not getattr(self.args, "defer_reports", False):
+            self.console.rule("reports & summary")
+            self.print_summary()
+            self.write_reports()
         self.console.event(
             "target_completed", target=self.target, findings=len(self.findings),
             stats=asdict(self.stats), browser_available=browser_available,
@@ -3205,9 +3218,10 @@ class XSSScanner(CrawlerMixin):
     ) -> bool:
         """Run polyglot candidates when enabled.
 
-        Returns ``True`` when the point was handled (a finding was added, the
-        scan stopped, or polyglots were generated but none confirmed) so the
-        caller must not continue with the standard corpus.
+        Returns ``True`` only when the point was handled: a finding was added or
+        the scan stopped.  When polyglots are generated but none confirms, the
+        caller must continue with the standard corpus instead of treating the
+        point as tested.
         """
         if not (HAS_ADVANCED and getattr(self.args, "polyglot", False)):
             return False
@@ -3251,9 +3265,9 @@ class XSSScanner(CrawlerMixin):
                         self._confirmed_contexts.add(dedup_key)
                         self.add_finding(finding)
                     return True
-        # No polyglots for this context: fall through to the standard loop so
-        # the injection point is never left untested.
-        return bool(polyglots)
+        # No polyglot confirmed: fall through to the standard loop so the
+        # injection point is never left untested.
+        return False
 
     async def _probe_dangling(
         self,
@@ -3335,7 +3349,97 @@ class XSSScanner(CrawlerMixin):
             return True
         return False
 
-    async def test_point(self, point: InjectionPoint) -> None:
+    async def _auto_evasion_pass(
+        self,
+        point: InjectionPoint,
+        info: ReflectionInfo,
+        best: Optional[
+            Tuple[str, str, ReflectionInfo, str, Optional[HttpResponse]]
+        ],
+        location: str,
+    ) -> Tuple[
+        Optional[Finding],
+        Optional[Tuple[str, str, ReflectionInfo, str, Optional[HttpResponse]]],
+    ]:
+        """Mutate the strongest reflected payload and retry it (``--auto`` only).
+
+        The corpus proves the point reflects; the mutation engine then tries
+        the encodings, wrappers and breakouts a fixed list cannot enumerate.
+        Every variant still has to reflect with surviving delimiters and, when
+        a browser is available, execute before it becomes a finding.
+
+        Returns ``(confirmed_finding, improved_candidate)``.  The caller keeps
+        the improved candidate for the HTTP-only evidence path.
+        """
+        try:
+            from xoxss.auto.mutations import MutationEngine
+        except Exception as exc:  # pragma: no cover - optional dependency
+            self.console.debug(f"auto evasion unavailable: {exc}")
+            return None, None
+
+        limit = max(
+            1, min(int(getattr(self.args, "auto_evasion_limit", 48) or 48), 64)
+        )
+        if best is not None:
+            seed, old_token = best[0], best[1]
+        else:
+            templates = self.payloads.payloads_for(info.context, 1)
+            if not templates:
+                return None, None
+            old_token = unique_token()
+            seed = self.transform_payload(
+                self.payloads.render(templates[0], old_token, info.context)
+            )
+
+        engine = MutationEngine()
+        waf_names = list(getattr(self.waf, "names", []) or [])
+        best_mutation: Optional[
+            Tuple[str, str, ReflectionInfo, str, Optional[HttpResponse]]
+        ] = None
+        executable_seen = 0
+        for mutation in engine.mutate(
+            seed, context=info.context, limit=limit, waf=waf_names
+        ):
+            if self._stop.is_set():
+                break
+            new_token = unique_token()
+            payload = (
+                mutation.payload.replace(old_token, new_token)
+                if old_token
+                else mutation.payload
+            )
+            if old_token and new_token not in payload:
+                continue
+            result = await self.send_point(point, payload)
+            if result is None or result.error or not result.text:
+                continue
+            self.stats.payloads += 1
+            content_type = result.header("content-type", "")
+            mutation_info = analyze_reflection(
+                result.text, new_token, payload, content_type
+            )
+            if not mutation_info.reflected or not mutation_info.executable:
+                continue
+            candidate = (payload, new_token, mutation_info, content_type, result)
+            if best_mutation is None:
+                best_mutation = candidate
+            executable_seen += 1
+            if self.pool is not None and self.pool.engines and self.args.confirm != "http":
+                finding = await self.confirm_in_browser(
+                    point, payload, new_token, mutation_info, content_type,
+                    response=result,
+                )
+                if finding:
+                    self.console.info(
+                        f"auto evasion confirmed ({mutation.name}): {location}",
+                        important=False,
+                    )
+                    return finding, candidate
+            if executable_seen >= 2:
+                break
+        return None, best_mutation
+
+    async def test_point(self, point: InjectionPoint) -> None:  # noqa: C901
         self.stats.points += 1
         location = f"{point.method} {point.param} @ {truncate(point.url, 110)}"
 
@@ -3497,6 +3601,7 @@ class XSSScanner(CrawlerMixin):
                 point.method.upper() == "POST"
                 and self.args.stored
                 and point.key() not in self._stored_checked
+                and self._stored_attempts.get(point.key(), 0) < 3
             ):
                 if await self._test_stored_candidate(
                     point, payload, payload_token, result, payload_info
@@ -3531,6 +3636,21 @@ class XSSScanner(CrawlerMixin):
                 )
             # Unconfirmed candidate: do not mark confirmed, continue trying remaining templates
             continue
+
+        # -- auto evasion --------------------------------------------------------
+        # ``--auto`` keeps going after the fixed corpus: mutate the strongest
+        # reflected payload with the deterministic evasion engine and retry.
+        if getattr(self.args, "auto", False) and not self._stop.is_set():
+            evasion_finding, evasion_best = await self._auto_evasion_pass(
+                point, info, best_unconfirmed, location
+            )
+            if evasion_best is not None:
+                best_unconfirmed = evasion_best
+            if evasion_finding is not None:
+                if dedup_key not in self._confirmed_contexts:
+                    self._confirmed_contexts.add(dedup_key)
+                    self.add_finding(evasion_finding)
+                return
 
         # -- HTTP-only evidence --------------------------------------------------
         # Report the strongest executable reflection that the browser did not
@@ -3922,20 +4042,71 @@ class XSSScanner(CrawlerMixin):
             self._record_validation_rejection(val)
             return None
 
+        # A POST payload that is re-rendered and executes on a fresh GET is
+        # stored XSS, even if the earlier stored-candidate pass was skipped or
+        # failed for a different payload.  Only confirmed POST execution pays
+        # for the extra request.
+        stored_page = ""
+        if (
+            point.method.upper() == "POST"
+            and getattr(self.args, "stored", False)
+            and point.key() not in self._stored_checked
+        ):
+            candidate = point.page_url or point.url
+            if candidate and token not in candidate and payload not in candidate:
+                try:
+                    fresh = await self.http.get(candidate, cache=False)
+                    if (
+                        not fresh.error
+                        and fresh.text
+                        and not (fresh.status and fresh.status >= 400)
+                        and (token in fresh.text or payload in fresh.text)
+                    ):
+                        fresh_info = analyze_reflection(
+                            fresh.text, token, payload, fresh.header("content-type", "")
+                        )
+                        if fresh_info.reflected and fresh_info.executable:
+                            stored_page = candidate
+                            self._stored_checked.add(point.key())
+                except Exception as exc:
+                    self.console.debug(
+                        f"Post-confirmation stored check failed: {exc}"
+                    )
+
         poc_url, poc_command = self.poc_for_point(point, payload)
         evidence = val.evidence or f"dialog({val.dialog_text or token})"
-        detail = "JavaScript execution confirmed in browser"
+        if stored_page:
+            evidence = (
+                f"payload persisted and re-rendered on {stored_page}; {evidence}"
+            )
+            detail = "Persistence and execution confirmed in headless browser"
+            rationale = (
+                "Persistence verified on a fresh GET and JavaScript execution "
+                "confirmed in the browser with a unique marker."
+            )
+        else:
+            detail = "JavaScript execution confirmed in browser"
+            rationale = (
+                "Execution confirmed in headless browser: dialog/sink hit "
+                "observed with unique marker."
+            )
         return Finding(
-            kind="Reflected XSS",
-            url=self.build_get_url(point, payload) if point.method.upper() == "GET" else point.url,
+            kind="Stored XSS (confirmed)" if stored_page else "Reflected XSS",
+            url=(
+                stored_page
+                if stored_page
+                else (
+                    self.build_get_url(point, payload)
+                    if point.method.upper() == "GET"
+                    else point.url
+                )
+            ),
             parameter=point.param,
             method=point.method.upper(),
             payload=payload,
             evidence=evidence,
             confidence="confirmed",
-            confidence_rationale=(
-                "Execution confirmed in headless browser: dialog/sink hit observed with unique marker."
-            ),
+            confidence_rationale=rationale,
             context=info.context,
             detail=detail,
             screenshot=val.screenshot,
@@ -3943,7 +4114,7 @@ class XSSScanner(CrawlerMixin):
             poc_command=poc_command,
             poc_html=build_form_html_poc(point, payload),
             char_matrix=dict(point.extra.get("char_matrix") or {}),
-            source=point.source,
+            source="stored" if stored_page else point.source,
             param_source=getattr(point, "param_source", "discovered"),
             **self.evidence_from_response(response, token, point.param),
         )
@@ -5400,7 +5571,10 @@ class XSSScanner(CrawlerMixin):
         testing this point.  A persisted-but-inert payload returns ``False``
         so the normal reflection loop continues.
         """
-        self._stored_checked.add(point.key())
+        # A failed persistence check must not poison later payloads on the same
+        # point: the first candidate can be filtered while a later one is stored
+        # and executed.  Retry a bounded number of times per point.
+        self._stored_attempts[point.key()] = self._stored_attempts.get(point.key(), 0) + 1
         stored_page = await self.check_stored(point, payload_token, payload)
         if not stored_page:
             return False
@@ -5478,7 +5652,7 @@ class XSSScanner(CrawlerMixin):
                     await browser.navigate(stored_page)
                     deadline = time.monotonic() + 3.0
                     while time.monotonic() < deadline:
-                        browser_data = await browser.extract()
+                        browser_data = await browser.collect()
                         raw_dialogs = [
                             str(d)
                             for d in (
@@ -5538,7 +5712,51 @@ class XSSScanner(CrawlerMixin):
                     **evidence_fields,
                 )
             )
+            self._stored_checked.add(point.key())
             return True
+        persistence_is_executable = bool(
+            stored_info is not None and stored_info.executable
+        )
+        if persistence_is_executable and stored_stable:
+            # The payload survived two independent fetches in an executable
+            # HTML context.  That is durable stored input, even when this
+            # browser run did not observe the handler fire (for example a
+            # CSP-blocked inline script).  Report it as stored evidence, never
+            # as "Reflected XSS".
+            self.add_finding(
+                Finding(
+                    kind="Stored XSS (persistence verified)",
+                    url=stored_page,
+                    parameter=point.param,
+                    method="POST",
+                    payload=payload,
+                    evidence=(
+                        f"payload persisted in executable context on {stored_page} "
+                        f"({stability_note}; {session_note}); execution not observed "
+                        "in this browser session"
+                    ),
+                    confidence="medium",
+                    confidence_rationale=(
+                        "Persistence verified over HTTP in executable HTML context "
+                        f"({stability_note}), but browser execution was not observed. "
+                        "Treat as stored-XSS evidence and confirm manually."
+                    ),
+                    context=stored_info.context if stored_info else payload_info.context,
+                    detail=(
+                        "Persistence verified over HTTP; execution not confirmed in "
+                        "browser. Reported as stored evidence, not reflected XSS."
+                    ),
+                    poc_url=stored_page,
+                    poc_command=stored_poc_command,
+                    poc_html=build_form_html_poc(point, payload),
+                    char_matrix=dict(point.extra.get("char_matrix") or {}),
+                    source="stored",
+                    **evidence_fields,
+                )
+            )
+            self._stored_checked.add(point.key())
+            return True
+
         if getattr(self.args, "report_reflections", False):
             # Surface only as a low-confidence lead when explicitly requested.
             self.add_finding(

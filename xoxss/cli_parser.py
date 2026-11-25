@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover - standalone checkout edge case
 
 EXAMPLES = """
 examples:
+  xoxss example.com --auto                          # domain in, full pipeline out
   xoxss https://target.tld --crawl --headless
   xoxss https://target.tld/?q=1 --browser chrome --headless --dom
   xoxss https://target.tld --god
@@ -123,7 +124,11 @@ def build_parser(
         formatter_class=XoxssHelpFormatter,
         epilog=EXAMPLES,
     )
-    parser.add_argument("target", nargs="*", help="target URL(s); http:// is assumed when missing")
+    parser.add_argument(
+        "target",
+        nargs="*",
+        help="target URL(s) or bare domain(s), e.g. example.com; http:// is assumed when missing",
+    )
     parser.add_argument("-l", "--target-list", help="file with one target URL/domain per line")
     parser.add_argument("--version", action="version", version=f"{app_name} {version}")
     parser.add_argument(
@@ -147,6 +152,13 @@ def build_parser(
         help="supreme preset: every scanner, analyser, browser verifier and OOB channel "
         "with maximum budgets and no other flags needed (explicit flags and --no-* "
         "opt-outs still win)",
+    )
+    godmode.add_argument(
+        "--auto",
+        action="store_true",
+        help="autonomous domain-first scan: recon, crawl, surface mapping, creative "
+        "probes, mutation/evasion, browser verification and chain analysis with safe "
+        "budgets; pass a bare domain and nothing else (explicit flags still win)",
     )
     crawl.add_argument("--crawl-depth", type=int, default=3, help="crawl depth (default: 3)")
     crawl.add_argument("--max-urls", type=int, default=500, help="maximum URLs to scan (default: 500)")
@@ -304,8 +316,8 @@ def build_parser(
         "--remote-payloads",
         dest="remote_payloads",
         action="store_true",
-        default=True,
-        help="download XSS payload lists from GitHub into temp storage (default: on)",
+        default=False,
+        help="download XSS payload lists from GitHub into temp storage (default: off; opt in explicitly)",
     )
     injection.add_argument(
         "--no-remote-payloads",

@@ -39,6 +39,36 @@ def test_dom_dedupe_key_ignores_query_string() -> None:
     assert make().dedupe_key() != make(url="https://example.com/other?q=1").dedupe_key()
 
 
+def test_stored_dedupe_key_ignores_query_string() -> None:
+    one = make(
+        kind="Stored XSS (persistence verified)",
+        url="https://example.com/stored?q=1",
+        parameter="comment",
+        method="POST",
+    )
+    two = make(
+        kind="Stored XSS (persistence verified)",
+        url="https://example.com/stored?search=1",
+        parameter="comment",
+        method="POST",
+    )
+    assert one.dedupe_key() == two.dedupe_key()
+    # Different form fields are still different sinks.
+    other = make(
+        kind="Stored XSS (persistence verified)",
+        url="https://example.com/stored?q=1",
+        parameter="bio",
+        method="POST",
+    )
+    assert one.dedupe_key() != other.dedupe_key()
+
+
+def test_template_injection_dedupe_key_ignores_query_string() -> None:
+    one = make(kind="Template injection", url="https://example.com/page?a=1", parameter="name")
+    two = make(kind="Template injection", url="https://example.com/page?b=2", parameter="name")
+    assert one.dedupe_key() == two.dedupe_key()
+
+
 def test_to_dict_round_trips_fields() -> None:
     finding = make()
     payload = finding.to_dict()

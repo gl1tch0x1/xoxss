@@ -52,6 +52,7 @@ def _hermetic(monkeypatch: pytest.MonkeyPatch) -> None:
 OPERATOR_FLAGS = {
     "ai_only",  # replaces the deterministic corpus instead of adding to it
     "allow_scheme_downgrade",  # would send credentials over cleartext
+    "auto",  # mode selector: a curated plan, not a capability flag
     "doctor",
     "deep",  # preset marker; god mode already applies everything it sets
     "fail_on_findings",
@@ -69,6 +70,7 @@ OPERATOR_FLAGS = {
     "no_state",
     "param_audit",
     "quiet",
+    "remote_payloads",  # third-party payload downloads stay opt-in
     "show_browser",
     "show_secrets",  # secret masking stays on
     "verbose",

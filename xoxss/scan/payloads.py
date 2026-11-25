@@ -26,6 +26,7 @@ from xoxss.detection.payload import (
     catalog_counts,
     catalog_total,
 )
+from xoxss.scan.safety import sanitize_payload
 from xoxss.utils.console import Console, js_marker, truncate
 
 _DIALOG_NAME_RE = re.compile(r"\b(?P<fn>alert|confirm|prompt)\b", re.IGNORECASE)
@@ -447,7 +448,10 @@ class PayloadEngine:
         catalog_payloads: bool = True,
     ) -> None:
         self.console = console
-        self.payloads: Dict[str, List[str]] = {key: list(value) for key, value in DEFAULT_PAYLOADS.items()}
+        self.payloads: Dict[str, List[str]] = {
+            key: [sanitize_payload(payload) for payload in value]
+            for key, value in DEFAULT_PAYLOADS.items()
+        }
         self.remote_payloads: List[str] = []
         self.lazy_payloads: List[str] = []
         self.catalog: Dict[str, List[str]] = {}
@@ -466,7 +470,9 @@ class PayloadEngine:
             for context in self.payloads:
                 pool = catalog_by_context(context, auto_only=True, fallback=False)
                 if pool:
-                    self.catalog[context] = pool
+                    self.catalog[context] = [
+                        sanitize_payload(payload) for payload in pool
+                    ]
             if self.catalog:
                 self.console.debug(
                     f"Bundled payload catalog: {catalog_total()} vector(s) in "
@@ -527,7 +533,7 @@ class PayloadEngine:
         try:
             with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
                 for raw in handle:
-                    payload = raw.strip()
+                    payload = sanitize_payload(raw.strip())
                     if not payload or len(payload) > 2048:
                         continue
                     if payload in seen or payload in self._seen:
@@ -603,6 +609,7 @@ class PayloadEngine:
                 context = str(item.get("context") or "generic").lower()
             else:
                 continue
+            payload = sanitize_payload(payload)
             if not payload or payload.startswith("#"):
                 continue
             if context not in self.payloads:
@@ -631,7 +638,7 @@ class PayloadEngine:
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as handle:
                 for line in handle:
-                    payload = line.strip()
+                    payload = sanitize_payload(line.strip())
                     if not payload or payload.startswith("#"):
                         continue
                     if remote:
@@ -663,6 +670,7 @@ class PayloadEngine:
             self.console.ok(f"Loaded {added} {kind} payload(s) from {path}", important=False)
 
     def _register(self, context: str, payload: str) -> bool:
+        payload = sanitize_payload(payload)
         slot = (context, payload)
         if slot in self._seen_slots:
             return False

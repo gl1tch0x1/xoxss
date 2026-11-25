@@ -527,6 +527,10 @@ class BrowserEngine:
                 if key == "verifications":
                     verified = True
                 if key == "sinks" and isinstance(item, dict):
+                    # A sink entry only proves execution when the post-parse
+                    # DOM still contains the marker in an executable construct.
+                    if item.get("executed"):
+                        executed = True
                     if not sink_name and item.get("sink"):
                         sink_name = str(item["sink"])
                     if not dom_path and item.get("dom_path"):
